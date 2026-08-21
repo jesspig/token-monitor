@@ -1,34 +1,38 @@
 ---
 type: sync-design
 title: 同步与去重
-description: 增量游标 + chokidar 监听 + 定时兜底扫描；fork/rewrite 场景用去重账本拦截。
+description: 增量游标 + chokidar 监听 + 定时兜底扫描；主键幂等去重，fork/rewrite 语义去重账本预留。
 tags: [sync, dedup, cursor, chokidar, watcher]
-timestamp: 2026-08-19T20:25:00+08:00
+resource: src/main/services/storage.ts
+timestamp: 2026-08-21T23:41:51+08:00
 ---
 
 # 同步与去重
 
 > [!note] 当前状态
-> 规划阶段，机制为设计描述，尚无实现。
+> **已实现**（2026-08-20）。游标/去重落地于 `storage.ts`，调度与监听于 `scheduler.ts`/`watcher.ts`，采集编排于 `collector.ts`。
 
-## 同步策略
+## 同步策略（已实现）
 
-- **首次**：全量扫描 → 游标记录行数。
-- **增量**：比较 `mtime` 变化后从 `line_offset` 续读；文件被 truncate/替换时重置游标。
-- **兜底**：定时全量 `listFiles + parse`（默认 **5 分钟**），弥补 chokidar 漏事件。
+- **首次**：全量扫描 → 游标记录行数（opencode db 源为 `time_created` 水位）。
+- **增量**：从 `line_offset` 续读；`setCursor` 时发现 `mtime` 变化（文件被 truncate/替换）→ 游标重置 0 全量重读。
+- **触发**：
+  - 插件装载时把会话目录注册进 watcher（chokidar），文件变更触发同步（**500ms 防抖**合并高频事件）；
+  - 定时兜底扫描（默认 **5 分钟**，`syncIntervalMs=300000` 可在设置中调整，修改后即时重启扫描）；
+  - 启动时立即执行一次全量同步。
 
-## 去重策略
+## 去重策略（已实现）
 
-- 以 `(file_path, line)` 为天然唯一键。
-- fork/rewrite 场景用 `semantic_id`（如 `app_type+model+tokens+time` 归一化指纹）查 `dedup_ledger` 拦截重复入库。
-
-## 实时刷新
-
-- 每次同步有新增记录即发 `usage-updated` 事件（**200ms 防抖**），前端自动刷新。
+- 以记录 id = `data_source:file_path:line`（`:` 分隔）为主键，入库用 `INSERT OR IGNORE`；命中即跳过，且**不累计**进日聚合。
+- opencode 新版 db 源的 line 由 `time_created` 水位派生并严格递增，保证跨轮唯一。
+- fork/rewrite 场景的语义去重（`semantic_id` 指纹）**尚未接入**：`dedup_ledger` 表与索引已在 v1 迁移建好（主键 `(data_source, request_id)`、`semantic_id` 索引），DAO 与指纹算法预留后续迭代。
 
 > [!todo] 待补充
-> - semantic_id 的具体指纹组成、防抖/合并窗口数值需在实现时确定。
-> - 去重正确性（fork/rewrite 双算与漏算的平衡）需样本验证。
+> semantic_id 指纹组成与 dedup_ledger 写入时机待后续迭代设计（需 fork/rewrite 真实样本验证双算/漏算平衡）。
+
+## 实时刷新（已实现）
+
+- 一轮同步实际新增记录数 > 0 才发 `usage-updated` 事件（EventBus **200ms 防抖**窗口内合并，addedRecords 累加），经 IPC 推送前端自动刷新。
 
 ## 关联页面
 

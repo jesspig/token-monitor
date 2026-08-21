@@ -3,23 +3,26 @@ type: data-model
 title: 数据模型
 description: SQLite 五张核心表：明细、日聚合、定价、同步游标、去重账本。
 tags: [data-model, sqlite, schema, usage]
-timestamp: 2026-08-19T20:25:00+08:00
+resource: src/main/services/db.ts
+timestamp: 2026-08-21T23:41:51+08:00
 ---
 
 # 数据模型
 
 > [!note] 当前状态
-> 规划阶段，表结构为设计草案，尚无 migrations 实现。
+> **已实现**（2026-08-20）。五张表与迁移（v1，`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
 
 ## 表清单
 
 | 表 | 用途 | 主键/关键字段 |
 |---|---|---|
-| `usage_records` | 用量明细 | `id`（去重 key = data_source + file_path + line） |
+| `usage_records` | 用量明细 | `id`（去重 key = `data_source:file_path:line`） |
 | `usage_daily_rollups` | 日聚合（趋势主数据源） | `(date, app_type, model)` |
 | `model_pricing` | 定价 | `model_id` |
 | `sync_cursors` | 增量同步游标 | `file_path` |
-| `dedup_ledger` | 去重账本（fork/rewrite） | `(data_source, request_id)` |
+| `dedup_ledger` | 去重账本（**已建表、未接入写入路径**） | `(data_source, request_id)` |
+
+索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`。
 
 ## 明细表要点
 
@@ -27,17 +30,17 @@ timestamp: 2026-08-19T20:25:00+08:00
 - `data_source` 与插件 id 对应，标识数据来源插件。
 - `model` 为归一化后模型 ID（计费用）；`raw_model` 保留日志原始名。
 - `input_semantics`：0=未知 / 1=含缓存写 / 2=纯新输入。
-- `cost_usd` 用字符串避免浮点误差（或整数微单位）。
-- `project` / `session_id` 记录会话归属（可选）。
+- 费用精度：`cost_usd` 以字符串存储避免浮点误差，聚合时统一转为整数微美元累加再回写字符串。
+- `project` / `session_id` 记录会话归属（可选）；`status` 默认 `'success'`。
+
+## 保留策略（已落地）
+
+- 默认 **90 天**（`retentionDays=90`，可在设置中修改），清理只删 `usage_records` 明细，**rollups 永不清理**（历史趋势长期保留）；`retentionDays <= 0` 视为不清理。由宿主 `cleanupRetention()` 触发（定时/手动调用方决定，改设置不自动触发）。
 
 ## 与监控插件的扩展关系
 
 - 首版**不引入 provider 维度**（无代理），`app_type` 直接对应插件 id。
 - 新增监控插件时，其 `id` 即新的 `app_type` 取值；`data_source`、`sync_cursors.file_path` 天然按插件隔离，无需改表结构。
-
-> [!todo] 待补充
-> - 明细保留策略（默认保留 N 天）的具体 N 值尚未定。
-> - 定价表默认 seed 数据的具体模型清单尚未落地。
 
 ## 关联页面
 
