@@ -1,37 +1,47 @@
 # AGENTS.md
 
-## 仓库状态
+## 项目定位与设计依据
 
-- 本项目仍处于**规划阶段**：无源码、`package.json`、构建配置或 CI。尚未初始化脚手架。
-- 现有资产：`AGENTS.md`、`docs/`（项目知识库 = 唯一设计依据）。
-- **`docs/` 知识库是唯一的设计依据**：所有架构决策、数据模型、里程碑都在其中。动手写代码前先读 `docs/index.md`，避免与既定设计冲突。
+- Electron + TypeScript 桌面工具：监控多个 AI 编程 CLI 的 Token 用量与费用；采集方式为扫描各 CLI 本地会话日志，**不做代理拦截**。
+- **改代码前先读 `docs/index.md`**：`docs/` 知识库是唯一设计依据，全部概念页已与实现对齐（2026-08-21 审计）。既定技术栈（Electron / electron-vite / React + Tailwind + TanStack Query + Recharts / better-sqlite3 / chokidar）勿擅自更改。
+- 第一阶段已交付：插件宿主 + 5 个内置监控插件（claude / codex / opencode / gemini / grok），typecheck / 156 单测 / 构建 / electron-builder 打包全部通过。
 
-## 既定技术决策（见 docs/ 知识库，勿擅自更改）
+## 命令
 
-- 桌面框架：**Electron**；语言：**TypeScript**；包管理：**pnpm**（workspace 单仓）。
-- 构建：electron-vite；渲染层：**React + Vite** + Tailwind + TanStack Query + Recharts。
-- 数据存储：**better-sqlite3**（仅主进程使用，同步 API）。
-- 文件监听：chokidar + 定时兜底扫描（默认 5 分钟）。
-- **采集方式：仅"扫描各 CLI 本地会话日志"，不做代理拦截**（第一阶段）。
-- **监控架构：一切皆插件（自研）**。每个监控对象（CLI）是一个独立插件，经插件注册表动态装载/卸载；宿主提供服务容器 `ctx`、依赖注入、生命周期与事件总线。设计借鉴了通用插件框架的工作机制，**为自研实现，不依赖第三方插件框架，亦不移植任何既有项目代码**。
+| 命令 | 用途 |
+|---|---|
+| `pnpm dev` | 开发模式（electron-vite dev，热更新） |
+| `pnpm typecheck` | 类型检查（tsconfig.node.json + tsconfig.web.json 两段串行） |
+| `pnpm exec vitest run` | 全部单测（15 文件 / 156 用例）。**package.json 没有 test 脚本，只能这样跑** |
+| `pnpm exec vitest run src/main/services/storage.test.ts` | 单文件测试 |
+| `pnpm build` | 构建到 `out/`（main/preload/renderer 三段） |
+| `pnpm dist` / `pnpm dist:dir` | electron-builder 打包（安装包 / 解包目录），产物在 `release/` |
 
-## 架构要点（不显而易见）
+- 无 lint / format 配置；验证闭环 = typecheck + vitest。
 
-- 数据流：`CLI 会话文件(JSONL) → 插件增量解析(行游标) → 去重 → 费用计算 → usage_records 明细 → usage_daily_rollups 日聚合 → 前端查询`。
-- 主进程承担全部数据逻辑（插件宿主 / 服务 / SQLite / 查询服务）；渲染进程只通过 preload `contextBridge` 的白名单 API 通信，禁止直接暴露 Node 能力。
-- 插件体系核心：`MonitorPlugin` 统一接口（`id / name / version / deps / detect / listFiles / parseFile / dispose`）；插件经 `ctx` 访问服务（storage / pricing / events / scheduler / watcher）。**新增监控对象 = 新增一个插件目录，零改动宿主**。
-- 增量同步游标、去重账本、Token 语义归一化、模型 ID 归一化、定价表这 5 个机制是核心设计，见 docs/concepts/data-flow.md / sync-mechanism.md / pricing.md。
+### 环境坑（本机沙箱）
 
-## 风险与注意
+- pnpm 11 跑任何脚本前会自动执行依赖校验安装；非 TTY 终端下会报 `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` 中止。**先设 `$env:CI='true'` 再跑 pnpm 命令**。
+- 沙箱限制写用户目录：`pnpm install` 需 `--no-frozen-lockfile --cache-dir ./.pnpm-cache --store-dir ./.pnpm-store`；打包时设 `ELECTRON_CACHE`/`electron_config_cache` 指向 `.electron-cache`、`npm_config_cache` 指向 `.npm-cache`。这些缓存目录已在 `.gitignore`。
 
-- **第一阶段范围 = 5 个内置监控插件**（claude / codex / opencode / gemini / grok）；后续可随时新增插件扩展监控对象。
-- 各 CLI 日志格式会随版本漂移：插件必须**宽松解析 + 错误兜底**（单文件解析失败不得阻塞整体同步），并过滤正在写入的半行与临时文件（如 `*.tmp`）。
-- 插件宿主需保证**可逆生命周期**：任何注册（监听/服务/事件）都要在卸载时清理，避免插件热切换产生泄漏。
+## 架构速览（不显而易见）
 
-## 项目知识库
+- 数据流：`CLI 会话文件 → 插件增量解析(行游标) → 去重 → 费用计算 → usage_records 明细 → usage_daily_rollups 日聚合 → 前端查询`。
+- 进程边界：主进程承担全部数据逻辑；渲染进程只经 preload `contextBridge` 白名单 API 通信（契约 = `shared/ipc.ts` 的 RendererApi，15 通道），禁止直接暴露 Node 能力。
+- 插件体系为自研框架（`src/main/core/`：registry/context/lifecycle/event-bus）：**新增监控对象 = 新增 `plugins/<id>.ts` 实现 `MonitorPlugin`，并在 `host.ts` 的 `BUILTIN_PLUGINS` 登记一行**。插件经服务容器 `ctx`（storage/pricing/events/scheduler/watcher）访问能力、用 `deps` 声明依赖，不直接 import 宿主实现。
+- 去重现状：记录 id = `data_source:file_path:line` + INSERT OR IGNORE；`dedup_ledger` 表已建但**未接入写入路径**（fork/rewrite 语义去重预留），不要假设账本在生效。
+- 关键默认值：兜底同步间隔 5 分钟（设置可调）；明细保留 90 天、日聚合永不清理；事件 `usage-updated` 200ms 防抖、watcher 500ms 防抖；seed 定价 10 个模型（USD）。
+- IPC 更新/删除定价后必须调 `pricing.invalidateCache()`，否则费用计算沿用旧内存索引。
+- 各 CLI 数据源差异大（opencode 为 SQLite db 双源、gemini 为单 JSON 对象、grok 靠 summary.json 建 sessionId→模型映射），改插件前先读 `docs/concepts/monitor-plugins.md` 的实际清单。
 
-- 位置：`docs/`。`index.md`（目录）与 `log.md`（按天摘要，仅留 7 天）为保留文件，不含 frontmatter。
-- 概念页面：`docs/concepts/*.md`，每个概念一页，必须含 YAML frontmatter（`type` 必填，同类概念用一致值；`timestamp` 用真实系统时间）。
-- 维护日志：`docs/changelog/YYYY-MM-DD-HH.md` 按小时合并，每次更新后追加；更新页面须同步刷新其 `timestamp`。
-- 内容约束：基于实际实现，禁止推测；无法核实处标 `> [!todo] 待补充`；当前均为「规划中」状态。
-- 若后续落地代码，新增/修改概念时增量更新受影响页面，删除过时描述，保持与 AGENTS.md / docs/ 知识库一致。
+## 行为约束
+
+- 监控插件必须**宽松解析 + 错误兜底**：单文件解析失败不得阻塞整体同步；过滤正在写入的半行与临时文件（`.tmp` / `.swp` / 点前缀 / `~` 后缀）。
+- 插件宿主保证**可逆生命周期**：任何注册（监听/服务/事件）卸载时必须清理，避免插件热切换泄漏。
+- better-sqlite3 仅主进程使用（内部同步 API，对外 Promise 签名）。
+
+## docs/ 知识库维护规则
+
+- 概念页 `docs/concepts/*.md` 必须含 YAML frontmatter（`type` 必填且同类概念一致值；对应具体源码资产加 `resource`；`timestamp` 用真实系统时间）；内容基于实际实现，无法核实处标 `> [!todo] 待补充`。
+- `index.md` / `log.md` 为保留文件不含 frontmatter；`log.md` 仅留最近 7 天。
+- 维护日志 `docs/changelog/YYYY-MM-DD-HH.md` 按小时合并追加；更新页面须同步刷新其 `timestamp`，并增量修订受影响概念页、删除过时描述。
