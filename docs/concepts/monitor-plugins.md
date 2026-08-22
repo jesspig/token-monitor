@@ -4,13 +4,13 @@ title: 监控插件
 description: MonitorPlugin 统一接口与 5 个内置监控插件（claude/codex/opencode/gemini/grok）实现清单。
 tags: [plugin, monitor, cli, claude, codex, opencode, gemini, grok]
 resource: src/main/plugins/
-timestamp: 2026-08-22T06:42:00+08:00
+timestamp: 2026-08-22T15:30:00+08:00
 ---
 
 # 监控插件
 
 > [!note] 当前状态
-> **第一阶段 5 个内置插件已实现**（2026-08-20）：`src/main/plugins/{claude,codex,opencode,gemini,grok}.ts`，各有单测覆盖；解析格式均经联网核实。本页清单已按实际实现核对（2026-08-21）。
+> **第一阶段 5 个内置插件已实现**（2026-08-20）：`src/main/plugins/{claude,codex,opencode,gemini,grok}.ts`，各有单测覆盖；解析格式均经联网核实。本页清单已按实际实现核对（2026-08-21）；CLI 版本探测于 2026-08-22 接入。
 
 ## `MonitorPlugin` 接口（实现于 shared/plugin.ts）
 
@@ -18,7 +18,7 @@ timestamp: 2026-08-22T06:42:00+08:00
 interface MonitorPlugin {
   id: AppType;               // 'claude' | 'codex' | 'opencode' | 'gemini' | 'grok'
   name: string;              // 显示名
-  version: string;
+  version: string;           // 插件适配器版本（非被监控 CLI 的实际版本）
   deps?: ServiceKey[];       // 依赖服务，宿主按依赖解析装载顺序
   detect(ctx): Promise<Detection>;          // CLI 是否安装、会话目录是否存在
   listFiles(ctx): Promise<FileEntry[]>;      // { path, mtime }
@@ -27,7 +27,16 @@ interface MonitorPlugin {
 }
 ```
 
-`ParsedResult` 含 `records`、`nextLine`（游标推进）、`eof`（是否到文件尾）。5 个内置插件的 `deps` 均为 `['storage','pricing','events']`。
+`ParsedResult` 含 `records`、`nextLine`（游标推进）、`eof`（是否到文件尾）。5 个内置插件的 `deps` 均为 `['storage','pricing','events']`。`Detection` 另含可选 `cliVersion?: string | null` 字段（dto 层预留）。
+
+## CLI 版本探测（已实现）
+
+监控源页展示的「CLI 版本」与插件的 `version`（适配器自身版本）是两个概念：实际 CLI 版本由 `collector.getPluginStatus` 对每个插件**并行**调用 `src/main/services/cli-version.ts` 的 `detectCliVersion` 探测——
+
+- 执行 `execFile <cli> --version`（超时 **3000ms**；win32 先经 `where.exe` 定位可执行文件再执行），取 stdout 首个非空行；
+- 失败/超时返回 `null`，不抛错、不影响状态其余字段；
+- 结果按命令名做进程级缓存（`clearCliVersionCache` 可清空），executor 可注入便于测试；
+- 探测成功以可选字段 `PluginStatus.cliVersion` 返回，失败则字段缺省（UI 显示「未知」）。
 
 ## 内置插件清单（第一阶段 5 个，按实际实现）
 

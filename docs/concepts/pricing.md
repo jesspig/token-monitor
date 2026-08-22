@@ -1,16 +1,16 @@
 ---
 type: pricing-design
 title: 定价与费用
-description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 目录同步、零成本回填；费用 = 各类 token × 每百万价格。
+description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填；费用 = 各类 token × 每百万价格。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-08-22T06:42:00+08:00
+timestamp: 2026-08-22T18:15:00+08:00
 ---
 
 # 定价与费用
 
 > [!note] 当前状态
-> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 目录同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地。
+> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）。
 
 ## 定价表（v2，已实现）
 
@@ -20,9 +20,9 @@ timestamp: 2026-08-22T06:42:00+08:00
 |---|---|---|
 | `seed` | 启动时 `seedPricing` 播种 | 可被 sync/user 覆盖 |
 | `sync` | models.dev 全量同步写入 | 可覆盖 seed/sync；被 user 挡住 |
-| `user` | IPC 手动编辑/导入默认来源 | **挡住一切非 user 写入** |
+| `user` | 存量行保护标记（v2 迁移把历史行保守标 'user'；IPC 手动写价入口已下线） | **挡住一切非 user 写入** |
 
-分级覆盖语义：任何非 user 来源的写入对已存在的 user 行不生效；IPC 更新/删除后必须失效 pricing 内存缓存（`invalidateCache`）。
+分级覆盖语义：任何非 user 来源的写入对已存在的 user 行不生效；models.dev 同步完成后必须失效 pricing 内存缓存（`invalidateCache`，宿主同步入口已内置）。
 
 ## 费用计算（已实现）
 
@@ -44,28 +44,28 @@ timestamp: 2026-08-22T06:42:00+08:00
 
 ## 内置 seed 价格清单（已实现）
 
-启动时 `seedPricing` 以 `source='seed'` upsert 写入 **99 个主流模型**（币种 USD，公开参考价；已存在的非 user 行按分级覆盖规则更新）。完整清单以源码为准（`src/main/services/pricing.ts` 的 seed 数据），此处不再逐条罗列。
+启动时 `seedPricing` 以 `source='seed'` upsert 写入 **99 个主流模型**（币种 USD，公开参考价；已存在的非 user 行按分级覆盖规则更新）。**seed 仅作离线兜底**：启动序列在 seed 后立即执行一次 models.dev 全量同步，权威价格以 sync 价为准。完整清单以源码为准（`src/main/services/pricing.ts` 的 seed 数据），此处不再逐条罗列。
 
-## models.dev 目录同步（已实现）
+## models.dev 自动同步（已实现，无启停开关，间隔可配）
 
-落地于 `src/main/services/modelsdev.ts`，提供两个入口：
+落地于 `src/main/services/modelsdev.ts`：拉取 models.dev `api.json` 全量目录并把条目映射为定价行写入（`source='sync'`）。cost 四档（input / output / cache_read / cache_creation）直接映射；**cost 档缺失补 0**；input/output 缺失的条目整条丢弃。目录拉取是同步的内部步骤，不再暴露独立的在线浏览通道。
 
-- **fetchCatalog**：拉取 models.dev `api.json` 全量目录，供前端在线浏览与搜索；
-- **syncPricing**：把目录条目映射为定价行写入（`source='sync'`）。cost 四档（input / output / cache_read / cache_creation）直接映射；**cost 档缺失补 0**；input/output 缺失的条目整条丢弃。
+同步完全自动化（宿主 `host.ts`）：
 
-IPC 三通道：目录查询 / 全量同步 / 勾选导入。前端行为：
+- 启动序列 seed 定价后**立即执行一次**全量同步；
+- 此后经 scheduler 按 `pricingSyncIntervalMs` 周期执行（默认 `300000` = 5 分钟），设置变更时即时重启调度；无启停开关，UI 仅在设置页暴露间隔输入（分钟）；
+- PricingPage 仅保留「立即全量同步」按钮，手动触发同一宿主入口。
 
-- PricingPage：在线目录浏览 + 搜索 + 勾选导入（导入行标记为 **`user`** 来源）+ 全量同步（写入 `sync` 行）；
-- SettingsPage：`autoSyncPricing` 开关（**默认关**），开启后主进程每日自动同步一次。
+IPC 仅两通道：`pricing:list`（只读列表）/ `pricing:modelsdev-sync`（手动全量同步）。`pricing:update` / `pricing:delete` / 目录浏览与勾选导入通道已删除，定价表对 UI **只读**；user 档保护规则不变，历史手动价仍不会被 seed/sync 覆盖。
 
-每次同步/导入完成后执行 `pricing.invalidateCache()` 并触发零成本回填。
+每次同步完成后执行 `pricing.invalidateCache()` 并触发零成本回填。
 
 ## 零成本回填（已实现）
 
 `pricing.backfillZeroCost(db, pricing)`：扫描明细表中 `cost_usd = 0` 或为空的行，用当前定价重算费用并增量修正对应 `usage_daily_rollups.cost_usd`。
 
 - 不变量：rollup 费用 ≡ 组内明细费用之和（增量修正而非重算全桶）；rollup 行缺失时不重建。
-- 触发时机：应用启动、定价 update/delete 之后、models.dev 同步/导入之后。
+- 触发时机：应用启动、每次 models.dev 全量同步之后（自动调度与手动按钮共用同一入口）。
 
 ## 关联页面
 
