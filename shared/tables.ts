@@ -59,6 +59,16 @@ export interface UsageDailyRollupRow {
 }
 
 /**
+ * 定价来源（分级覆盖优先级）：
+ * - 'seed'：内置种子价（应用启动时播种）
+ * - 'sync'：models.dev 在线同步价
+ * - 'user'：用户手动编辑/手动导入价
+ *
+ * 覆盖规则：user 行不可被 seed/sync 写入覆盖；user 写入覆盖一切；其余正常互写。
+ */
+export type PricingSource = 'seed' | 'sync' | 'user'
+
+/**
  * model_pricing 行：内置模型定价（docs/concepts/pricing.md）。
  * 价格为每百万 token（默认 USD），支持自定义/覆盖与 cost_multiplier。
  */
@@ -74,6 +84,11 @@ export interface ModelPricingRow {
   /** 费用叠加系数（默认 1） */
   cost_multiplier: number
   updated_at: number
+  /**
+   * 定价来源；缺省视为 'user'（向后兼容旧调用），
+   * 数据库列 NOT NULL DEFAULT 'user'，查询返回的行必有该字段。
+   */
+  source?: PricingSource
 }
 
 /**

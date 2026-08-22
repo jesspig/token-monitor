@@ -39,10 +39,24 @@ export interface UsageSummary {
   successRate: number
 }
 
-/** 趋势页：按天聚合数据点（今日按小时粒度由前端/后端按时间范围细化） */
+/** 趋势页：按天聚合数据点（小时粒度见 HourlyStats） */
 export interface DailyStats {
   /** YYYY-MM-DD */
   date: string
+  requestCount: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  costUsd: string
+  successCount: number
+  errorCount: number
+}
+
+/** 趋势页/Dashboard：按小时聚合数据点（字段与 DailyStats 对齐，粒度换为小时，由后端分桶） */
+export interface HourlyStats {
+  /** 0–23（本地时区小时） */
+  hour: number
   requestCount: number
   inputTokens: number
   outputTokens: number
@@ -140,4 +154,75 @@ export interface AppSettings {
   retentionDays: number
   /** 数据目录 */
   dataDir: string
+  /** 开启后每 24h 自动同步一次 models.dev 定价目录（默认 false=关闭） */
+  autoSyncPricing?: boolean
+  /** 日预算上限（USD，全局所有 CLI 合计）；null/缺省=不启用告警 */
+  dailyBudgetUsd?: number | null
+  /** 月预算上限（USD，自然月）；null/缺省=不启用告警 */
+  monthlyBudgetUsd?: number | null
+}
+
+/**
+ * Dashboard 预算横幅：全局维度（所有 CLI 合计）的今日/本月费用与上限占比。
+ * 口径与 usageQuery 一致：费用从 usage_daily_rollups 以整数微美元聚合后格式化；
+ * 未设置预算（null 或 <=0）时 ratio=null、exceeded=false，即不告警。
+ */
+export interface BudgetStatus {
+  /** 今日费用（USD，字符串） */
+  dailyCostUsd: string
+  /** 本自然月费用（USD，字符串） */
+  monthlyCostUsd: string
+  dailyBudgetUsd: number | null
+  monthlyBudgetUsd: number | null
+  /** 费用 / 上限；未设置预算为 null */
+  dailyUsageRatio: number | null
+  monthlyUsageRatio: number | null
+  /** 费用 > 上限；未设置预算恒为 false */
+  dailyExceeded: boolean
+  monthlyExceeded: boolean
+}
+
+/**
+ * models.dev 目录候选条目（定价配置页手动导入用）。
+ * 与主进程 src/main/services/modelsdev.ts 的内部类型形状一致（IPC 传输 DTO）。
+ */
+export interface ModelsDevCatalogEntry {
+  /** 供应商标识：provider key 优先，name 回退，均缺失为 null */
+  provider: string | null
+  /** 模型 ID：entry.id 优先，退回所在对象的 key */
+  modelId: string
+  /** 模型显示名（entry.name），缺失为 null */
+  name: string | null
+  inputPerMillion: number
+  outputPerMillion: number
+  cacheReadPerMillion: number
+  cacheCreationPerMillion: number
+}
+
+/** models.dev 在线目录拉取结果；恒有 total === entries.length + skipped */
+export interface ModelsDevCatalogResult {
+  entries: ModelsDevCatalogEntry[]
+  /** 发现的模型条目总数（含被丢弃者）；在线目录可达上万条 */
+  total: number
+  /** 解析阶段丢弃数 */
+  skipped: number
+}
+
+/** models.dev 全量同步结果；恒有 fetched === imported + skipped */
+export interface ModelsDevSyncResult {
+  fetched: number
+  imported: number
+  skipped: number
+}
+
+/** models.dev 手动导入结果 */
+export interface ModelsDevImportResult {
+  /** 成功写入（user 来源）的条目数 */
+  imported: number
+}
+
+/** 请求日志页：筛选维度候选（模型/项目 distinct 非空值，升序），供筛选控件生成选项 */
+export interface FilterOptions {
+  models: string[]
+  projects: string[]
 }
