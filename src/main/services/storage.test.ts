@@ -3,7 +3,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync } from 'node:fs'
 import type { UsageRecord } from '../../../shared/dto'
-import type { ModelPricingRow, UsageDailyRollupRow } from '../../../shared/tables'
+import type {
+  ModelPricingRow,
+  SyncCursorRow,
+  UsageDailyRollupRow
+} from '../../../shared/tables'
 import type { StorageService } from '../../../shared/context'
 import { createDatabase, migrate, type SqliteDatabase } from './db'
 import { SqliteStorage, openStorage } from './storage'
@@ -42,7 +46,7 @@ describe('数据库迁移', () => {
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(2)
+      expect(db.pragma('user_version', { simple: true })).toBe(3)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
@@ -80,6 +84,299 @@ describe('数据库迁移', () => {
   it('内存模式可直接使用', async () => {
     const storage = openStorage(':memory:')
     expect(await storage.getModelPricing()).toEqual([])
+  })
+})
+
+describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
+  const DAY_19 = new Date(2026, 7, 19).getTime()
+  const DAY_20 = new Date(2026, 7, 20).getTime()
+  const dateKeyOf = (ms: number): string => {
+    const d = new Date(ms)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  }
+  const DAY_19_KEY = dateKeyOf(DAY_19)
+  const DAY_20_KEY = dateKeyOf(DAY_20)
+  const ZERO_COND =
+    'input_tokens = 0 AND output_tokens = 0 AND cache_read_tokens = 0 AND cache_creation_tokens = 0'
+
+  interface LegacySeed {
+    id: string
+    app_type: string
+    model: string
+    input_tokens?: number
+    output_tokens?: number
+    cache_read_tokens?: number
+    cache_creation_tokens?: number
+    status?: string
+    cost_usd?: string | null
+    latency_ms?: number | null
+    created_at: number
+  }
+
+  function insertLegacyRecord(db: SqliteDatabase, seed: LegacySeed): void {
+    db.prepare(
+      `INSERT INTO usage_records (
+        id, data_source, app_type, model, raw_model,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+        input_semantics, cost_usd, currency, latency_ms, project, session_id,
+        status, file_path, line, created_at
+      ) VALUES (
+        @id, @data_source, @app_type, @model, NULL,
+        @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens,
+        0, @cost_usd, NULL, @latency_ms, NULL, NULL,
+        @status, '/legacy/sessions.jsonl', @line, @created_at
+      )`
+    ).run({
+      data_source: seed.app_type,
+      input_tokens: seed.input_tokens ?? 0,
+      output_tokens: seed.output_tokens ?? 0,
+      cache_read_tokens: seed.cache_read_tokens ?? 0,
+      cache_creation_tokens: seed.cache_creation_tokens ?? 0,
+      cost_usd: seed.cost_usd ?? null,
+      latency_ms: seed.latency_ms ?? null,
+      status: seed.status ?? 'success',
+      line: Number(seed.id.split(':').pop()),
+      ...seed
+    })
+  }
+
+  function insertLegacyRollup(
+    db: SqliteDatabase,
+    row: {
+      date: string
+      app_type: string
+      model: string
+      request_count?: number
+      success_count?: number
+      error_count?: number
+      input_tokens?: number
+      output_tokens?: number
+      cache_read_tokens?: number
+      cache_creation_tokens?: number
+      cost_usd?: string
+      latency_ms_total?: number
+    }
+  ): void {
+    db.prepare(
+      `INSERT INTO usage_daily_rollups (
+        date, app_type, model, request_count, success_count, error_count,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+        cost_usd, latency_ms_total, updated_at
+      ) VALUES (
+        @date, @app_type, @model, @request_count, @success_count, @error_count,
+        @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens,
+        @cost_usd, @latency_ms_total, 111
+      )`
+    ).run({
+      request_count: 1,
+      success_count: 1,
+      error_count: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      cost_usd: '0',
+      latency_ms_total: 0,
+      ...row
+    })
+  }
+
+  /** 已应用 v2 的库（回拨 user_version），插入存量数据后 migrate 即触发 v3 */
+  function makeDirtyV2Db(): SqliteDatabase {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    db.pragma('user_version = 2')
+    return db
+  }
+
+  function seedDirtyData(db: SqliteDatabase): void {
+    insertLegacyRecord(db, {
+      id: 'claude:/legacy/sessions.jsonl:1',
+      app_type: 'claude',
+      model: 'claude-sonnet-4',
+      cost_usd: '0.001',
+      latency_ms: 500,
+      created_at: DAY_19 + 3_600_000
+    })
+    insertLegacyRecord(db, {
+      id: 'claude:/legacy/sessions.jsonl:2',
+      app_type: 'claude',
+      model: 'claude-sonnet-4',
+      status: 'error',
+      created_at: DAY_19 + 7_200_000
+    })
+    insertLegacyRecord(db, {
+      id: 'claude:/legacy/sessions.jsonl:3',
+      app_type: 'claude',
+      model: 'claude-sonnet-4',
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_read_tokens: 20,
+      cache_creation_tokens: 10,
+      cost_usd: '0.002',
+      latency_ms: 800,
+      created_at: DAY_19 + 10_800_000
+    })
+    insertLegacyRecord(db, {
+      id: 'codex:/legacy/sessions.jsonl:1',
+      app_type: 'codex',
+      model: 'gpt-5',
+      input_tokens: 10,
+      output_tokens: 20,
+      cache_read_tokens: 5,
+      cache_creation_tokens: 2,
+      cost_usd: '0.01',
+      latency_ms: 100,
+      created_at: DAY_19 + 14_400_000
+    })
+    insertLegacyRecord(db, {
+      id: 'claude:/legacy/sessions.jsonl:4',
+      app_type: 'claude',
+      model: 'claude-sonnet-4',
+      input_tokens: 7,
+      output_tokens: 8,
+      cache_read_tokens: 9,
+      cache_creation_tokens: 1,
+      status: 'error',
+      cost_usd: '0.004',
+      latency_ms: 200,
+      created_at: DAY_20 + 3_600_000
+    })
+    // 污染的日聚合：request_count 含脏行、gemini 为纯脏桶
+    insertLegacyRollup(db, {
+      date: DAY_19_KEY,
+      app_type: 'claude',
+      model: 'claude-sonnet-4',
+      request_count: 3,
+      success_count: 1,
+      error_count: 2,
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_read_tokens: 20,
+      cache_creation_tokens: 10,
+      cost_usd: '0.003',
+      latency_ms_total: 1300
+    })
+    insertLegacyRollup(db, {
+      date: DAY_19_KEY,
+      app_type: 'codex',
+      model: 'gpt-5',
+      input_tokens: 10,
+      output_tokens: 20,
+      cache_read_tokens: 5,
+      cache_creation_tokens: 2,
+      cost_usd: '0.01',
+      latency_ms_total: 100
+    })
+    insertLegacyRollup(db, {
+      date: DAY_19_KEY,
+      app_type: 'gemini',
+      model: 'gemini-pro',
+      request_count: 2,
+      success_count: 2
+    })
+    insertLegacyRollup(db, {
+      date: DAY_20_KEY,
+      app_type: 'claude',
+      model: 'claude-sonnet-4',
+      success_count: 0,
+      error_count: 1,
+      input_tokens: 7,
+      output_tokens: 8,
+      cache_read_tokens: 9,
+      cache_creation_tokens: 1,
+      cost_usd: '0.004',
+      latency_ms_total: 200
+    })
+    db.prepare(
+      `INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, updated_at)
+       VALUES ('/legacy/sessions.jsonl', 'claude', 5, 1000, 111)`
+    ).run()
+  }
+
+  it('迁移后不存在四项全 0 明细，正常明细与游标不受影响', () => {
+    const db = makeDirtyV2Db()
+    seedDirtyData(db)
+
+    expect(db.pragma('user_version', { simple: true })).toBe(2)
+    migrate(db)
+    expect(db.pragma('user_version', { simple: true })).toBe(3)
+
+    const zeroCount = db.prepare(`SELECT COUNT(*) AS c FROM usage_records WHERE ${ZERO_COND}`).get() as { c: number }
+    expect(zeroCount.c).toBe(0)
+    const remaining = db.prepare('SELECT id FROM usage_records ORDER BY id').all() as { id: string }[]
+    expect(remaining.map((r) => r.id)).toEqual([
+      'claude:/legacy/sessions.jsonl:3',
+      'claude:/legacy/sessions.jsonl:4',
+      'codex:/legacy/sessions.jsonl:1'
+    ])
+    const cursor = db.prepare('SELECT * FROM sync_cursors WHERE file_path = ?').get('/legacy/sessions.jsonl') as
+      | SyncCursorRow
+      | undefined
+    expect(cursor).toMatchObject({ data_source: 'claude', line_offset: 5 })
+  })
+
+  it('受影响日期的日聚合重建为剩余明细的真实聚合，纯脏桶移除，其他日期不动', () => {
+    const db = makeDirtyV2Db()
+    seedDirtyData(db)
+    migrate(db)
+
+    const claudeD19 = db
+      .prepare("SELECT * FROM usage_daily_rollups WHERE date = ? AND app_type = 'claude' AND model = 'claude-sonnet-4'")
+      .get(DAY_19_KEY) as UsageDailyRollupRow | undefined
+    expect(claudeD19).toBeDefined()
+    expect(claudeD19!.request_count).toBe(1)
+    expect(claudeD19!.success_count).toBe(1)
+    expect(claudeD19!.error_count).toBe(0)
+    expect(claudeD19!.input_tokens).toBe(100)
+    expect(claudeD19!.output_tokens).toBe(50)
+    expect(claudeD19!.cache_read_tokens).toBe(20)
+    expect(claudeD19!.cache_creation_tokens).toBe(10)
+    expect(claudeD19!.cost_usd).toBe('0.002')
+    expect(claudeD19!.latency_ms_total).toBe(800)
+
+    const codexD19 = db
+      .prepare("SELECT * FROM usage_daily_rollups WHERE date = ? AND app_type = 'codex'")
+      .get(DAY_19_KEY) as UsageDailyRollupRow | undefined
+    expect(codexD19).toMatchObject({
+      request_count: 1,
+      success_count: 1,
+      input_tokens: 10,
+      output_tokens: 20,
+      cost_usd: '0.01',
+      latency_ms_total: 100
+    })
+
+    const geminiD19 = db
+      .prepare("SELECT * FROM usage_daily_rollups WHERE date = ? AND app_type = 'gemini'")
+      .get(DAY_19_KEY)
+    expect(geminiD19).toBeUndefined()
+
+    const day20 = db
+      .prepare("SELECT * FROM usage_daily_rollups WHERE date = ?")
+      .all(DAY_20_KEY) as UsageDailyRollupRow[]
+    expect(day20).toHaveLength(1)
+    expect(day20[0].app_type).toBe('claude')
+    expect(day20[0].request_count).toBe(1)
+    expect(day20[0].error_count).toBe(1)
+    expect(day20[0].input_tokens).toBe(7)
+    expect(day20[0].updated_at).toBe(111)
+  })
+
+  it('幂等：回拨版本重跑 v3 后数据不变', () => {
+    const db = makeDirtyV2Db()
+    seedDirtyData(db)
+    migrate(db)
+    const snapshot = () => ({
+      records: db.prepare('SELECT * FROM usage_records ORDER BY id').all(),
+      rollups: db.prepare('SELECT * FROM usage_daily_rollups ORDER BY date, app_type, model').all()
+    })
+    const before = snapshot()
+
+    db.pragma('user_version = 2')
+    migrate(db)
+    expect(db.pragma('user_version', { simple: true })).toBe(3)
+    expect(snapshot()).toEqual(before)
   })
 })
 
