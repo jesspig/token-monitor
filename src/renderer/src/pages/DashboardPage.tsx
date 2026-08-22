@@ -75,12 +75,12 @@ export default function DashboardPage(): ReactElement {
 
   const summaryQuery = useUsageSummary(filters)
   const dailyQuery = useDailyTrends(filters)
-  // 今日迷你趋势改由后端按小时分桶（不再取明细在前端分桶，避免大流量日截断）；
+  // 今日 / 24 小时迷你趋势改由后端按小时分桶（不再取明细在前端分桶，避免大流量日截断）；
   // queryKey 复用 daily-trends 一级前缀，纳入既有 usage-updated 失效清单
   const hourlyQuery = useQuery({
     queryKey: ['daily-trends', 'hourly', filters],
     queryFn: () => api.getHourlyTrends(filters),
-    enabled: range === 'today'
+    enabled: range === 'today' || range === '24h'
   })
   // 预算限额状态（全局维度，staleTime 与页面其他查询一致走全局默认）
   const budgetQuery = useQuery({
@@ -94,9 +94,14 @@ export default function DashboardPage(): ReactElement {
   const rangeLabel = RANGE_OPTIONS.find((o) => o.key === range)?.label ?? ''
 
   const trend = useMemo(() => {
-    if (range === 'today') {
-      return (hourlyQuery.data ?? []).map((h) => ({
-        label: hourLabel(h.hour),
+    if (range === 'today' || range === '24h') {
+      const hourly = hourlyQuery.data ?? []
+      const crossDay = new Set(hourly.map((h) => h.dayKey)).size >= 2
+      return hourly.map((h) => ({
+        label:
+          crossDay && h.dayKey
+            ? `${h.dayKey.slice(5)} ${hourLabel(h.hour)}`
+            : hourLabel(h.hour),
         requests: h.requestCount,
         tokens:
           h.inputTokens + h.outputTokens + h.cacheReadTokens + h.cacheCreationTokens
@@ -171,7 +176,7 @@ export default function DashboardPage(): ReactElement {
       </div>
 
       <Card
-        title={`${rangeLabel} 请求 / Token 趋势（${range === 'today' ? '按小时' : '按天'}）`}
+        title={`${rangeLabel} 请求 / Token 趋势（${range === 'today' || range === '24h' ? '按小时' : '按天'}）`}
       >
         {trend.length > 0 ? (
           <TrendChart data={trend} />
