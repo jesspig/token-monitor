@@ -1,7 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import type { UsageRecord } from '../../../shared/dto'
 import type { ModelPricingRow } from '../../../shared/tables'
-import { normalizeModelId, seedPricing, createPricingService, PricingServiceImpl } from './pricing'
+import {
+  normalizeModelId,
+  seedPricing,
+  SEED_MODELS,
+  createPricingService,
+  PricingServiceImpl
+} from './pricing'
 import { openStorage } from './storage'
 
 /** 构造一条可复用的测试用量记录 */
@@ -71,12 +77,13 @@ describe('normalizeModelId', () => {
 })
 
 describe('seedPricing', () => {
-  it('seed 后可查到全部内置模型（≥10 个），价格为 USD', async () => {
+  it('seed 后可查到全部内置模型，价格与来源均为 seed/USD', async () => {
     const storage = openStorage(':memory:')
     await seedPricing(storage)
     const rows = await storage.getModelPricing()
-    expect(rows.length).toBe(10)
+    expect(rows.length).toBe(SEED_MODELS.length)
     expect(rows.every((r) => r.currency === 'USD')).toBe(true)
+    expect(rows.every((r) => r.source === 'seed')).toBe(true)
 
     const sonnet = rows.find((r) => r.model_id === 'claude-sonnet-4-5')
     expect(sonnet).toMatchObject({
@@ -93,7 +100,40 @@ describe('seedPricing', () => {
     const storage = openStorage(':memory:')
     await seedPricing(storage)
     await seedPricing(storage)
-    expect(await storage.getModelPricing()).toHaveLength(10)
+    expect(await storage.getModelPricing()).toHaveLength(SEED_MODELS.length)
+  })
+
+  it('再次播种：user 手改行保持用户值不被覆盖，其余行照常刷新回 seed 价', async () => {
+    const storage = openStorage(':memory:')
+    await seedPricing(storage)
+
+    // 用户以 'user' 来源手改 sonnet 行
+    const sonnet = (await storage.getModelPricing()).find(
+      (r) => r.model_id === 'claude-sonnet-4-5'
+    ) as ModelPricingRow
+    await storage.updateModelPricing(
+      { ...sonnet, input_per_million: 99, updated_at: 123 },
+      'user'
+    )
+    // grok 行被 models.dev 式 'sync' 写入干扰价（非 user 行可被覆盖）
+    const grok = (await storage.getModelPricing()).find(
+      (r) => r.model_id === 'grok-4'
+    ) as ModelPricingRow
+    await storage.updateModelPricing({ ...grok, input_per_million: 77 }, 'sync')
+
+    await seedPricing(storage)
+
+    const rows = await storage.getModelPricing()
+    expect(rows).toHaveLength(SEED_MODELS.length)
+    expect(rows.find((r) => r.model_id === 'claude-sonnet-4-5')).toMatchObject({
+      input_per_million: 99,
+      updated_at: 123,
+      source: 'user'
+    })
+    expect(rows.find((r) => r.model_id === 'grok-4')).toMatchObject({
+      input_per_million: 1.25,
+      source: 'seed'
+    })
   })
 })
 

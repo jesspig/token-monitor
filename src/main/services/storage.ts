@@ -3,6 +3,7 @@ import type { UsageRecord } from '../../../shared/dto'
 import type { StorageService } from '../../../shared/context'
 import type {
   ModelPricingRow,
+  PricingSource,
   SyncCursorRow,
   UsageDailyRollupRow,
   UsageRecordRow
@@ -166,10 +167,10 @@ export class SqliteStorage implements StorageService {
     this.upsertPricingStmt = db.prepare(`
       INSERT INTO model_pricing (
         model_id, provider, input_per_million, output_per_million,
-        cache_read_per_million, cache_creation_per_million, currency, cost_multiplier, updated_at
+        cache_read_per_million, cache_creation_per_million, currency, cost_multiplier, updated_at, source
       ) VALUES (
         @model_id, @provider, @input_per_million, @output_per_million,
-        @cache_read_per_million, @cache_creation_per_million, @currency, @cost_multiplier, @updated_at
+        @cache_read_per_million, @cache_creation_per_million, @currency, @cost_multiplier, @updated_at, @source
       )
       ON CONFLICT(model_id) DO UPDATE SET
         provider                   = excluded.provider,
@@ -179,7 +180,9 @@ export class SqliteStorage implements StorageService {
         cache_creation_per_million = excluded.cache_creation_per_million,
         currency                   = excluded.currency,
         cost_multiplier            = excluded.cost_multiplier,
-        updated_at                 = excluded.updated_at
+        updated_at                 = excluded.updated_at,
+        source                     = excluded.source
+      WHERE model_pricing.source != 'user' OR excluded.source = 'user'
     `)
 
     this.deletePricingStmt = db.prepare(`
@@ -300,8 +303,29 @@ export class SqliteStorage implements StorageService {
     return Promise.resolve(rows)
   }
 
-  updateModelPricing(entry: ModelPricingRow): Promise<void> {
-    this.upsertPricingStmt.run({ ...entry, updated_at: entry.updated_at ?? Date.now() })
+  /**
+   * 分级 upsert 定价（docs/concepts/pricing.md）：
+   * - source 缺省为 'user'（旧调用向后兼容；手动 IPC 编辑即走此默认值）；
+   * - 新行直接以传入 source 插入；
+   * - 冲突时仅当「现行为非 user 或本次写入为 user」才更新：
+   *   user 行挡住 seed/sync 写入（含 updated_at 在内全不动），user 写入覆盖一切并把行升级为 'user'。
+   * 来源只取调用点显式传入的 source（不信任 entry 载荷携带的 source 字段），
+   * 避免渲染进程回传数据时伪造/遗漏来源导致分级失效。
+   */
+  updateModelPricing(entry: ModelPricingRow, source?: PricingSource): Promise<void> {
+    const resolvedSource = source ?? 'user'
+    this.upsertPricingStmt.run({
+      model_id: entry.model_id,
+      provider: entry.provider,
+      input_per_million: entry.input_per_million,
+      output_per_million: entry.output_per_million,
+      cache_read_per_million: entry.cache_read_per_million,
+      cache_creation_per_million: entry.cache_creation_per_million,
+      currency: entry.currency,
+      cost_multiplier: entry.cost_multiplier,
+      updated_at: entry.updated_at ?? Date.now(),
+      source: resolvedSource
+    })
     return Promise.resolve()
   }
 

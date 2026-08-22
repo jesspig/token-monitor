@@ -27,7 +27,9 @@ interface Migration {
 }
 
 /**
- * 迁移表：v1 = 首次建表（5 张核心表 + 索引）。
+ * 迁移表：v1 = 首次建表（5 张核心表 + 索引）；
+ * v2 = model_pricing 增加 source 列（定价来源分级，存量行保守标 'user'，
+ *      使既有用户可见数据不被后续 seed/sync 同步覆盖）。
  * 字段/主键/索引与 shared/tables.ts 及 docs/concepts/data-model.md 一致。
  */
 const MIGRATIONS: Migration[] = [
@@ -112,12 +114,21 @@ const MIGRATIONS: Migration[] = [
         CREATE INDEX IF NOT EXISTS idx_dedup_ledger_semantic_id ON dedup_ledger (semantic_id);
       `)
     }
+  },
+  {
+    version: 2,
+    up(db) {
+      // 定价来源分级：'seed' 内置种子价 / 'sync' models.dev 同步价 / 'user' 用户手动价。
+      // NOT NULL DEFAULT 'user' 使 ALTER 时存量行一律标 'user'（保守策略，
+      // 用户可见数据不被未来 seed/sync 覆盖），新插入行由写入方显式指定来源。
+      db.exec(`ALTER TABLE model_pricing ADD COLUMN source TEXT NOT NULL DEFAULT 'user'`)
+    }
   }
 ]
 
 /**
- * 幂等迁移：以 PRAGMA user_version 记录已应用版本，逐版本升级。
- * 首次执行建表并置 user_version = 1；再次打开时跳过。
+ * 幂等迁移：以 PRAGMA user_version 记录已应用版本，逐版本升级至最新。
+ * 首次执行建表并逐个应用后续迁移；已应用过的版本自动跳过。
  */
 export function migrate(db: SqliteDatabase): void {
   const current = db.pragma('user_version', { simple: true }) as number
