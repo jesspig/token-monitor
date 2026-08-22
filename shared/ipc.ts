@@ -9,9 +9,6 @@ import type {
   HourlyStats,
   LogFilters,
   ModelStats,
-  ModelsDevCatalogEntry,
-  ModelsDevCatalogResult,
-  ModelsDevImportResult,
   ModelsDevSyncResult,
   PaginatedLogs,
   PluginStatus,
@@ -53,23 +50,11 @@ export interface RendererApi {
   /** 统计页：按应用聚合 */
   getStatsByApp(filters: LogFilters): Promise<AppStats[]>
 
-  /** 定价配置页：价格列表 */
+  /** 定价配置页：价格列表（只读，数据由 models.dev 同步维护） */
   getModelPricing(): Promise<ModelPricingRow[]>
-
-  /** 定价配置页：新增/更新 */
-  updateModelPricing(entry: ModelPricingRow): Promise<void>
-
-  /** 定价配置页：删除 */
-  deleteModelPricing(modelId: string): Promise<void>
 
   /** 定价配置页：手动触发 models.dev 全量定价同步（网络失败向上抛） */
   syncModelsDevPricing(): Promise<ModelsDevSyncResult>
-
-  /** 定价配置页：拉取 models.dev 在线目录（可能上万条，本地 IPC 序列化） */
-  fetchModelsDevCatalog(): Promise<ModelsDevCatalogResult>
-
-  /** 定价配置页：导入勾选条目（以 'user' 来源写入并锁定），返回成功数 */
-  importModelsDevEntries(entries: ModelsDevCatalogEntry[]): Promise<ModelsDevImportResult>
 
   /** 监控源页：插件状态列表 */
   listPlugins(): Promise<PluginStatus[]>

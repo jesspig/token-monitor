@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactElement } from 'react'
 import clsx from 'clsx'
 import {
@@ -12,7 +12,9 @@ import {
   TrendingUp
 } from 'lucide-react'
 import { isMock } from './api'
+import { useSettings } from './hooks/useSettings'
 import { useUsageEvents } from './hooks/useUsageEvents'
+import { setCachedSettings } from './lib/settings-cache'
 import DashboardPage from './pages/DashboardPage'
 import TrendsPage from './pages/TrendsPage'
 import RequestLogsPage from './pages/RequestLogsPage'
@@ -45,11 +47,15 @@ const PAGES: Record<PageKey, () => ReactElement> = {
 
 function App(): ReactElement {
   useUsageEvents()
+  const { data: settings } = useSettings()
+  useEffect(() => {
+    if (settings) setCachedSettings(settings)
+  }, [settings])
   const [page, setPage] = useState<PageKey>('dashboard')
   const ActivePage = PAGES[page]
 
   return (
-    <div className="flex min-h-screen bg-neutral-950 text-neutral-100">
+    <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
       {/* 桌面端侧边导航 */}
       <aside className="hidden w-56 shrink-0 flex-col border-r border-neutral-800 bg-neutral-900/40 lg:flex">
         <div className="flex items-center gap-2.5 border-b border-neutral-800 px-4 py-4">
@@ -87,7 +93,7 @@ function App(): ReactElement {
       </aside>
 
       {/* 内容区 */}
-      <div className="min-w-0 flex-1">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {/* 移动端顶部栏 */}
         <header className="border-b border-neutral-800 px-4 pt-3 lg:hidden">
           <div className="mb-2 flex items-center gap-2">
@@ -121,7 +127,7 @@ function App(): ReactElement {
           </nav>
         </header>
 
-        <main className="mx-auto max-w-6xl p-6">
+        <main className="w-full mx-auto max-w-6xl flex-1 overflow-y-auto p-6">
           <ActivePage />
         </main>
       </div>

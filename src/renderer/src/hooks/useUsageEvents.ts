@@ -8,7 +8,8 @@ const USAGE_QUERY_KEYS = [
   'daily-trends',
   'request-logs',
   'stats-by-model',
-  'stats-by-app'
+  'stats-by-app',
+  'budget-status'
 ] as const
 
 /**

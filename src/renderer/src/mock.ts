@@ -9,7 +9,6 @@ import type {
   LogFilters,
   ModelStats,
   ModelsDevCatalogEntry,
-  ModelsDevImportResult,
   PaginatedLogs,
   PluginStatus,
   RequestLogDetail,
@@ -216,15 +215,18 @@ function filterDaily(filters: LogFilters): DailyStats[] {
   })
 }
 
-/** 按本地时区小时聚合（与后端 getHourlyTrends 同口径：不补零，仅返回有数据的桶） */
+/** 按本地时区 (dayKey, hour) 双维聚合（与后端 getHourlyTrends 同口径：跨天窗口不合并同钟点；不补零，仅返回有数据的桶） */
 function aggregateHourly(records: RequestLogDetail[]): HourlyStats[] {
-  const map = new Map<number, HourlyStats>()
+  const map = new Map<string, HourlyStats>()
   for (const r of records) {
     const hour = new Date(r.createdAt).getHours()
-    let h = map.get(hour)
+    const dayKey = toDateStr(r.createdAt)
+    const key = `${dayKey}T${String(hour).padStart(2, '0')}`
+    let h = map.get(key)
     if (!h) {
       h = {
         hour,
+        dayKey,
         requestCount: 0,
         inputTokens: 0,
         outputTokens: 0,
@@ -234,7 +236,7 @@ function aggregateHourly(records: RequestLogDetail[]): HourlyStats[] {
         successCount: 0,
         errorCount: 0
       }
-      map.set(hour, h)
+      map.set(key, h)
     }
     h.requestCount += 1
     h.inputTokens += r.inputTokens
@@ -247,7 +249,9 @@ function aggregateHourly(records: RequestLogDetail[]): HourlyStats[] {
     if (r.status === 'success') h.successCount += 1
     else h.errorCount += 1
   }
-  return [...map.values()].sort((a, b) => a.hour - b.hour)
+  return [...map.values()].sort(
+    (a, b) => (a.dayKey ?? '').localeCompare(b.dayKey ?? '') || a.hour - b.hour
+  )
 }
 
 function aggregateSummary(records: RequestLogDetail[]): UsageSummary {
@@ -311,12 +315,50 @@ const PLUGIN_DEFS: Array<{
   reason?: string
   lastSyncAt: number | null
   errorCount: number
+  cliVersion?: string | null
 }> = [
-  { id: 'claude', name: 'Claude Code', available: true, lastSyncAt: NOW - 2 * 60 * 1000, errorCount: 0 },
-  { id: 'codex', name: 'OpenAI Codex', available: true, lastSyncAt: NOW - 9 * 60 * 1000, errorCount: 1 },
-  { id: 'opencode', name: 'OpenCode', available: true, lastSyncAt: NOW - 31 * 60 * 1000, errorCount: 0 },
-  { id: 'gemini', name: 'Gemini CLI', available: false, reason: '未检测到 CLI / 会话目录', lastSyncAt: null, errorCount: 0 },
-  { id: 'grok', name: 'Grok CLI', available: false, reason: '未检测到 CLI / 会话目录', lastSyncAt: null, errorCount: 0 }
+  {
+    id: 'claude',
+    name: 'Claude Code',
+    available: true,
+    lastSyncAt: NOW - 2 * 60 * 1000,
+    errorCount: 0,
+    cliVersion: '2.1.14'
+  },
+  {
+    id: 'codex',
+    name: 'OpenAI Codex',
+    available: true,
+    lastSyncAt: NOW - 9 * 60 * 1000,
+    errorCount: 1,
+    cliVersion: '0.52.0'
+  },
+  {
+    id: 'opencode',
+    name: 'OpenCode',
+    available: true,
+    lastSyncAt: NOW - 31 * 60 * 1000,
+    errorCount: 0,
+    cliVersion: '0.6.3'
+  },
+  {
+    id: 'gemini',
+    name: 'Gemini CLI',
+    available: false,
+    reason: '未检测到 CLI / 会话目录',
+    lastSyncAt: null,
+    errorCount: 0,
+    cliVersion: null
+  },
+  {
+    id: 'grok',
+    name: 'Grok CLI',
+    available: false,
+    reason: '未检测到 CLI / 会话目录',
+    lastSyncAt: null,
+    errorCount: 0,
+    cliVersion: null
+  }
 ]
 
 let PLUGINS: PluginStatus[] = PLUGIN_DEFS.map((p, i) => ({
@@ -329,9 +371,10 @@ let SETTINGS: AppSettings = {
   syncIntervalMs: 5 * 60 * 1000,
   retentionDays: 30,
   dataDir: '~/.config/token-monitor',
-  autoSyncPricing: false,
   dailyBudgetUsd: 10,
-  monthlyBudgetUsd: 200
+  monthlyBudgetUsd: 200,
+  statsRefreshIntervalMs: 5000,
+  pricingSyncIntervalMs: 300_000
 }
 
 /** 预算占比与超限判定（与主进程 budget.ts 同口径：null/<=0 视同未设置=不告警，严格大于才判超限） */
@@ -370,7 +413,7 @@ function buildBudgetStatus(): BudgetStatus {
   }
 }
 
-/** models.dev 目录 Mock 小样本（确定性，供手动挑选导入演示） */
+/** models.dev 目录 Mock 小样本（确定性，模拟全量同步导入的条目） */
 const MODELSDEV_MOCK_CATALOG: ModelsDevCatalogEntry[] = [
   {
     provider: 'anthropic',
@@ -544,34 +587,9 @@ export function createMockApi(): RendererApi {
 
     getModelPricing: async () => PRICING,
 
-    updateModelPricing: async (entry) => {
-      const idx = PRICING.findIndex((p) => p.model_id === entry.model_id)
-      const next = { ...entry, updated_at: Date.now() }
-      PRICING = idx >= 0 ? PRICING.map((p, i) => (i === idx ? next : p)) : [...PRICING, next]
-    },
-
-    deleteModelPricing: async (modelId) => {
-      PRICING = PRICING.filter((p) => p.model_id !== modelId)
-    },
-
     syncModelsDevPricing: async () => {
       for (const entry of MODELSDEV_MOCK_CATALOG) upsertCatalogEntry(entry)
       return { fetched: 5, imported: MODELSDEV_MOCK_CATALOG.length, skipped: 1 }
-    },
-
-    fetchModelsDevCatalog: async () => ({
-      entries: MODELSDEV_MOCK_CATALOG,
-      total: MODELSDEV_MOCK_CATALOG.length + 1,
-      skipped: 1
-    }),
-
-    importModelsDevEntries: async (entries): Promise<ModelsDevImportResult> => {
-      let imported = 0
-      for (const entry of entries) {
-        upsertCatalogEntry(entry)
-        imported += 1
-      }
-      return { imported }
     },
 
     listPlugins: async () => PLUGINS,

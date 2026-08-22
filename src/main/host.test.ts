@@ -9,6 +9,17 @@ import { createCollector } from './collector'
 import { createHost } from './host'
 import { registerIpcHandlers, type IpcMainLike } from './ipc/register'
 
+vi.mock('./services/cli-version', () => ({
+  CLI_VERSION_COMMANDS: {
+    claude: 'claude',
+    codex: 'codex',
+    opencode: 'opencode',
+    gemini: 'gemini',
+    grok: 'grok'
+  },
+  detectCliVersion: vi.fn(async (command: string) => (command === 'claude' ? '9.9.9' : null))
+}))
+
 /**
  * 集成测试：宿主装配（createHost）+ 采集（collector.syncAll）+ IPC（registerIpcHandlers）。
  * 不依赖真实 ~/.claude：beforeEach 用 vi.spyOn 把 os.homedir 指向临时目录，
@@ -66,11 +77,13 @@ let homeSpy: MockInstance<() => string>
 beforeEach(() => {
   tempHome = mkdtempSync(path.join(os.tmpdir(), 'token-monitor-home-'))
   homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(tempHome)
+  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({}) })))
 })
 
 afterEach(() => {
   homeSpy.mockRestore()
   rmSync(tempHome, { recursive: true, force: true })
+  vi.unstubAllGlobals()
 })
 
 describe('createHost 装配', () => {
@@ -87,6 +100,8 @@ describe('createHost 装配', () => {
       expect(claude?.available).toBe(true)
       expect(claude?.lastSyncAt).toBeNull()
       expect(claude?.errorCount).toBe(0)
+      expect(claude?.cliVersion).toBe('9.9.9')
+      expect(statuses.find((s) => s.id === 'codex')?.cliVersion).toBeUndefined()
     } finally {
       host.dispose()
     }
@@ -423,32 +438,39 @@ function stubModelsDevFetch(): ReturnType<typeof vi.fn> {
   return fetchMock
 }
 
-const HOUR_MS = 60 * 60 * 1000
+const MINUTE_MS = 60 * 1000
 
 describe('models.dev 定价目录（T8 主进程侧）', () => {
-  it('autoSyncPricing 开关切换每日自动同步调度；dispose 清理', async () => {
+  it('默认无条件自动同步：启动即触发一次并入库；retentionDays/syncIntervalMs 不影响调度，pricingSyncIntervalMs 变化以新间隔重启', async () => {
     vi.useFakeTimers()
     const fetchMock = stubModelsDevFetch()
     const host = await createHost({ dataDir: ':memory:' })
     try {
-      // 默认关闭（undefined）：推进 25h 不触发同步
-      await vi.advanceTimersByTimeAsync(25 * HOUR_MS)
-      expect(fetchMock).not.toHaveBeenCalled()
-
-      // 开启：注册调度，推进满一个周期（24h）触发一次并入库（sync 来源）
-      host.updateSettings({ autoSyncPricing: true })
-      expect(host.getSettings().autoSyncPricing).toBe(true)
-      await vi.advanceTimersByTimeAsync(24 * HOUR_MS)
+      // 启动序列立即同步一次并入库（sync 来源），覆盖 seed 兜底价
+      await vi.advanceTimersByTimeAsync(0)
       expect(fetchMock).toHaveBeenCalledTimes(1)
       expect(
         (await host.storage.getModelPricing()).find((r) => r.model_id === 'claude-test-model')
       ).toMatchObject({ source: 'sync' })
 
-      // 关闭：再推进 48h 无新调用
-      host.updateSettings({ autoSyncPricing: false })
-      expect(host.getSettings().autoSyncPricing).toBe(false)
-      await vi.advanceTimersByTimeAsync(48 * HOUR_MS)
+      // 未满一个周期不触发；此时更新 retentionDays/syncIntervalMs 均不应重置/启停 pricing 调度
+      await vi.advanceTimersByTimeAsync(MINUTE_MS)
       expect(fetchMock).toHaveBeenCalledTimes(1)
+      host.updateSettings({ retentionDays: 30 })
+      host.updateSettings({ syncIntervalMs: 60_000 })
+
+      // 自注册起满一个周期（5 分钟）：周期同步触发，且未被设置更新重置
+      await vi.advanceTimersByTimeAsync(MINUTE_MS * 4)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+
+      // 改定价同步间隔为 1 分钟：stop+重启，从变更时刻起按新周期触发
+      host.updateSettings({ pricingSyncIntervalMs: MINUTE_MS })
+      await vi.advanceTimersByTimeAsync(MINUTE_MS)
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+
+      // 继续按新周期（1 分钟）触发，而非原 5 分钟节奏
+      await vi.advanceTimersByTimeAsync(MINUTE_MS)
+      expect(fetchMock).toHaveBeenCalledTimes(4)
     } finally {
       host.dispose()
       vi.unstubAllGlobals()
@@ -456,7 +478,7 @@ describe('models.dev 定价目录（T8 主进程侧）', () => {
     }
   })
 
-  it('IPC 冒烟：modelsdev-sync/catalog/import 三通道贯通', async () => {
+  it('IPC 冒烟：modelsdev-sync 手动全量同步入库且 pricing:list 可见', async () => {
     stubModelsDevFetch()
     const host = await createHost({ dataDir: ':memory:' })
     const ipc = makeFakeIpcMain()
@@ -469,27 +491,8 @@ describe('models.dev 定价目录（T8 主进程侧）', () => {
         skipped: 1
       })
 
-      // 在线目录：供前端勾选的条目数组
-      const catalog = (await ipc.invoke('pricing:modelsdev-catalog')) as {
-        entries: Array<{ modelId: string; inputPerMillion: number }>
-        total: number
-        skipped: number
-      }
-      expect(catalog.total).toBe(2)
-      expect(catalog.skipped).toBe(1)
-      const picked = catalog.entries.find((e) => e.modelId === 'claude-test-model')
-      expect(picked).toMatchObject({ inputPerMillion: 3 })
-
-      // 导入勾选子集：user 来源写入；非法条目跳过；非数组抛错
-      await expect(ipc.invoke('pricing:modelsdev-import', [picked, { nope: true }])).resolves.toEqual({
-        imported: 1
-      })
-      expect(
-        (await host.storage.getModelPricing()).find((r) => r.model_id === 'claude-test-model')
-      ).toMatchObject({ source: 'user' })
-      await expect(ipc.invoke('pricing:modelsdev-import', 'nope')).rejects.toThrow(
-        /必须为条目数组/
-      )
+      const list = (await ipc.invoke('pricing:list')) as Array<{ model_id: string; source: string }>
+      expect(list.find((r) => r.model_id === 'claude-test-model')).toMatchObject({ source: 'sync' })
     } finally {
       host.dispose()
       vi.unstubAllGlobals()

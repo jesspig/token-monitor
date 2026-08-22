@@ -121,6 +121,8 @@ interface AppRow extends GroupRow {
 interface HourlyRow {
   /** strftime('%H') 输出的两位字符串（'00'–'23'） */
   hour: string
+  /** strftime('%Y-%m-%d') 输出的本地日期，跨天窗口区分同钟点 */
+  day_key: string
   request_count: number
   success_count: number
   error_count: number
@@ -368,12 +370,13 @@ function queryAppRows(db: SqliteDatabase, filters: LogFilters): AppRow[] {
     .all(...params) as AppRow[]
 }
 
-/** 按小时趋势行：rollup 表无小时粒度，恒走明细表按本地时区小时归桶 */
+/** 按小时趋势行：rollup 表无小时粒度，恒走明细表按本地时区 (day_key, hour) 双维归桶（跨天窗口不合并同钟点） */
 function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
   const { sql, params } = buildWhere(filters)
   return db
     .prepare(
-      `SELECT strftime('%H', created_at / 1000, 'unixepoch', 'localtime') AS hour,
+      `SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS day_key,
+              strftime('%H', created_at / 1000, 'unixepoch', 'localtime') AS hour,
               COUNT(*) AS request_count,
               ${SUM_SUCCESS} AS success_count,
               ${SUM_ERROR} AS error_count,
@@ -384,8 +387,8 @@ function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
               COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
        FROM usage_records
        ${sql}
-       GROUP BY hour
-       ORDER BY hour ASC`
+       GROUP BY day_key, hour
+       ORDER BY day_key ASC, hour ASC`
     )
     .all(...params) as HourlyRow[]
 }
@@ -420,7 +423,7 @@ export interface UsageQueryService {
   getUsageSummary(filters: LogFilters): Promise<UsageSummary>
   /** 按天（本地时区 YYYY-MM-DD）趋势序列 */
   getDailyTrends(filters: LogFilters): Promise<DailyStats[]>
-  /** 按小时（本地时区 0–23）趋势序列：默认限定今天，filters 显式给 startTime/endTime 时尊重之 */
+  /** 按小时（本地时区 0–23）趋势序列：默认限定今天，filters 显式给 startTime/endTime 时尊重之；桶含日期维度（dayKey），跨天窗口不合并同钟点 */
   getHourlyTrends(filters: LogFilters): Promise<HourlyStats[]>
   /** 按归一化模型分组统计 */
   getModelStats(filters: LogFilters): Promise<ModelStats[]>
@@ -511,6 +514,7 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
       return Promise.resolve(
         rows.map((r) => ({
           hour: Number.parseInt(r.hour, 10),
+          dayKey: r.day_key,
           requestCount: r.request_count,
           inputTokens: r.input_tokens,
           outputTokens: r.output_tokens,

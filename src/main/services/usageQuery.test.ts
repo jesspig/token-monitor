@@ -496,6 +496,23 @@ describe('getHourlyTrends', () => {
     expect(hourly[0]).toMatchObject({ hour: 23, requestCount: 1, successCount: 1, errorCount: 0 })
   })
 
+  it('跨天滚动窗口：不同日期同钟点分属两个独立桶（dayKey 区分）', async () => {
+    const { query, db } = makeQuery()
+    // 本地 Date 构造器直接指定两天各自的 09:08，模拟 24h 滚动窗口横跨两个自然日
+    const yesterday = new Date(2026, 7, 18, 9, 8).getTime()
+    const today = new Date(2026, 7, 19, 9, 8).getTime()
+    insert(db, { id: 'D1H9', created_at: yesterday })
+    insert(db, { id: 'D2H9', created_at: today })
+
+    const hourly = await query.getHourlyTrends({ startTime: yesterday, endTime: today })
+
+    expect(hourly).toHaveLength(2)
+    expect(hourly.map((h) => h.dayKey)).toEqual([toDateKey(yesterday), toDateKey(today)])
+    const hour = new Date(yesterday).getHours()
+    expect(hourly.map((h) => h.hour)).toEqual([hour, hour])
+    expect(hourly.map((h) => h.requestCount)).toEqual([1, 1])
+  })
+
   it('filters 时间范围生效：范围外记录不入桶', async () => {
     const { query, db } = makeQuery()
     seed(db)

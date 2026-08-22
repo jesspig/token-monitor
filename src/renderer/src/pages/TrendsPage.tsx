@@ -47,10 +47,14 @@ function hourLabel(hour: number): string {
   return `${String(hour).padStart(2, '0')}:00`
 }
 
-/** 今日：映射后端按小时分桶序列（原前端分桶已移除，不再受明细分页截断影响） */
+/** 今日 / 24 小时：映射后端按小时分桶序列（原前端分桶已移除，不再受明细分页截断影响）；
+ * 跨天窗口（≥2 个不同 dayKey）时标签带日期 'MM-DD HH:00'，单一日期维持 'HH:00' */
 function buildHourlyRows(data: HourlyStats[]): TrendRow[] {
-  return (data ?? []).map((h) => ({
-    label: hourLabel(h.hour),
+  const rows = data ?? []
+  const crossDay = new Set(rows.map((h) => h.dayKey)).size >= 2
+  return rows.map((h) => ({
+    label:
+      crossDay && h.dayKey ? `${h.dayKey.slice(5)} ${hourLabel(h.hour)}` : hourLabel(h.hour),
     requestCount: h.requestCount,
     inputTokens: h.inputTokens,
     outputTokens: h.outputTokens,
@@ -60,7 +64,7 @@ function buildHourlyRows(data: HourlyStats[]): TrendRow[] {
   }))
 }
 
-/** 7 / 30 天：映射按天聚合序列 */
+/** 其余范围：映射按天聚合序列 */
 function buildDailyRows(data: DailyStats[]): TrendRow[] {
   return (data ?? []).map((d) => ({
     label: d.date.slice(5),
@@ -73,7 +77,7 @@ function buildDailyRows(data: DailyStats[]): TrendRow[] {
   }))
 }
 
-/** 趋势页：请求 / Token / 成本 时间趋势（今日按小时，7/30 天按天） */
+/** 趋势页：请求 / Token / 成本 时间趋势（今日与 24 小时按小时，其余按天） */
 export default function TrendsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('7d')
   const filters = useMemo(() => rangeToFilters(range), [range])
@@ -83,15 +87,16 @@ export default function TrendsPage(): ReactElement {
   const hourlyQuery = useQuery({
     queryKey: ['daily-trends', 'hourly', filters],
     queryFn: () => api.getHourlyTrends(filters),
-    enabled: range === 'today'
+    enabled: range === 'today' || range === '24h'
   })
 
   const rows = useMemo(() => {
-    if (range === 'today') return buildHourlyRows(hourlyQuery.data ?? [])
+    if (range === 'today' || range === '24h') return buildHourlyRows(hourlyQuery.data ?? [])
     return buildDailyRows(dailyQuery.data ?? [])
   }, [range, dailyQuery.data, hourlyQuery.data])
 
-  const granularity = range === 'today' ? '按小时' : '按天'
+  const granularity =
+    range === 'today' || range === '24h' ? '按小时' : '按天'
   const loading = rows.length === 0 && (dailyQuery.isLoading || hourlyQuery.isLoading)
 
   if (loading) {

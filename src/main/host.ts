@@ -37,11 +37,13 @@ import { watcherService } from './services/watcher'
 
 const DEFAULT_SYNC_INTERVAL_MS = 300_000
 const DEFAULT_RETENTION_DAYS = 90
+/** 统计自动刷新间隔默认值（ms），渲染端查询轮询用 */
+const DEFAULT_STATS_REFRESH_INTERVAL_MS = 5_000
+/** models.dev 定价自动同步默认周期（ms）：默认权威数据源，每 5 分钟全量同步一次 */
+const DEFAULT_PRICING_SYNC_INTERVAL_MS = 300_000
 const SETTINGS_FILENAME = 'settings.json'
 /** 启动后延迟执行的首次过期明细清理（ms） */
 const RETENTION_SWEEP_DELAY_MS = 30_000
-/** models.dev 定价自动同步周期（ms）：开启后每 24h 全量同步一次 */
-const PRICING_AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 export interface HostOptions {
   /** 数据目录；省略则用内存库（:memory:），适合测试 */
@@ -60,11 +62,11 @@ export interface Host {
   pricing: PricingServiceImpl
   usageQuery: UsageQueryService
   events: EventBus
-  /** 读取设置（syncIntervalMs/retentionDays/dataDir/autoSyncPricing） */
+  /** 读取设置（syncIntervalMs/retentionDays/dataDir/预算限额/统计刷新与定价同步间隔） */
   getSettings(): AppSettings
   /**
    * 更新设置（持久化到 dataDir/settings.json）；同步间隔变化时重启兜底扫描，
-   * autoSyncPricing 变化时启停 models.dev 每日同步调度。
+   * 定价同步间隔变化时重启 models.dev 自动同步调度。
    */
   updateSettings(patch: Partial<AppSettings>): void
   /**
@@ -107,7 +109,9 @@ function createSettingsStore(
   let current: AppSettings = {
     syncIntervalMs: syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS,
     retentionDays: DEFAULT_RETENTION_DAYS,
-    dataDir: dir
+    dataDir: dir,
+    statsRefreshIntervalMs: DEFAULT_STATS_REFRESH_INTERVAL_MS,
+    pricingSyncIntervalMs: DEFAULT_PRICING_SYNC_INTERVAL_MS
   }
   if (file) {
     try {
@@ -194,6 +198,7 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
 
   const usageQuery = createUsageQuery(db)
   let currentSyncIntervalMs = settings.get().syncIntervalMs
+  let currentPricingSyncIntervalMs = settings.get().pricingSyncIntervalMs
 
   // —— 过期明细清理调度（docs/concepts/data-model.md → 保留策略）——
   // collector 内部定时回调无法从外部挂钩，宿主经同一 scheduler 以相同间隔独立触发，
@@ -242,22 +247,22 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
     return result
   }
 
-  let currentAutoSyncPricing = settings.get().autoSyncPricing === true
   let stopPricingAutoSync: (() => void) | null = null
 
   function startPricingAutoSync(): void {
     stopPricingAutoSync?.()
-    stopPricingAutoSync = null
-    if (currentAutoSyncPricing) {
-      stopPricingAutoSync = scheduler.schedule(PRICING_AUTO_SYNC_INTERVAL_MS, () => {
-        syncModelsDevPricing().catch((err) => {
-          console.error('[host] models.dev 定价自动同步失败:', err)
-        })
+    const intervalMs = settings.get().pricingSyncIntervalMs ?? DEFAULT_PRICING_SYNC_INTERVAL_MS
+    stopPricingAutoSync = scheduler.schedule(intervalMs, () => {
+      syncModelsDevPricing().catch((err) => {
+        console.error('[host] models.dev 定价自动同步失败:', err)
       })
-    }
+    })
   }
 
   startPricingAutoSync()
+  void syncModelsDevPricing().catch((err) => {
+    console.error('[host] 启动 models.dev 定价同步失败:', err)
+  })
   void runZeroCostBackfill().catch((err) => {
     console.error('[host] 启动零成本回填失败:', err)
   })
@@ -282,9 +287,9 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
         collector.start(nextSyncIntervalMs)
         startRetentionSweepLoop(nextSyncIntervalMs)
       }
-      const nextAutoSyncPricing = next.autoSyncPricing === true
-      if (nextAutoSyncPricing !== currentAutoSyncPricing) {
-        currentAutoSyncPricing = nextAutoSyncPricing
+      const nextPricingSyncIntervalMs = next.pricingSyncIntervalMs
+      if (nextPricingSyncIntervalMs !== currentPricingSyncIntervalMs) {
+        currentPricingSyncIntervalMs = nextPricingSyncIntervalMs
         startPricingAutoSync()
       }
     },

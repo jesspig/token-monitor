@@ -10,6 +10,8 @@ export interface Detection {
   reason?: string
   /** 探测到的会话目录 */
   sessionDir?: string
+  /** 探测到的 CLI 版本号；null 表示探测失败或未探测 */
+  cliVersion?: string | null
 }
 
 /**
