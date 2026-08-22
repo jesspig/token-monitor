@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { ReactElement } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   Area,
   AreaChart,
@@ -11,14 +12,14 @@ import {
   XAxis,
   YAxis
 } from 'recharts'
-import type { DailyStats, RequestLogDetail } from '../../../../shared/query'
+import type { DailyStats, HourlyStats } from '../../../../shared/query'
+import { api } from '../api'
 import { Card } from '../components/Card'
 import { EmptyState } from '../components/EmptyState'
 import { PageHeader } from '../components/PageHeader'
 import { RangeSelector } from '../components/RangeSelector'
 import { useDailyTrends } from '../hooks/useDailyTrends'
-import { useRequestLogs } from '../hooks/useRequestLogs'
-import { formatHour, formatUsd } from '../lib/format'
+import { formatUsd } from '../lib/format'
 import { RANGE_OPTIONS, rangeToFilters, type RangeKey } from '../lib/range'
 
 const tooltipStyle = {
@@ -41,32 +42,22 @@ interface TrendRow {
   cost: number
 }
 
-/** 今日：从请求日志明细按小时分桶聚合 */
-function buildHourlyRows(logs: RequestLogDetail[]): TrendRow[] {
-  const buckets = new Map<string, TrendRow>()
-  for (const r of logs) {
-    const label = formatHour(r.createdAt)
-    const b = buckets.get(label)
-    if (b) {
-      b.requestCount += 1
-      b.inputTokens += r.inputTokens
-      b.outputTokens += r.outputTokens
-      b.cacheReadTokens += r.cacheReadTokens
-      b.cacheCreationTokens += r.cacheCreationTokens
-      b.cost += r.costUsd ? Number.parseFloat(r.costUsd) : 0
-    } else {
-      buckets.set(label, {
-        label,
-        requestCount: 1,
-        inputTokens: r.inputTokens,
-        outputTokens: r.outputTokens,
-        cacheReadTokens: r.cacheReadTokens,
-        cacheCreationTokens: r.cacheCreationTokens,
-        cost: r.costUsd ? Number.parseFloat(r.costUsd) : 0
-      })
-    }
-  }
-  return Array.from(buckets.values()).sort((a, b) => a.label.localeCompare(b.label))
+/** HourlyStats.hour（0–23）→ 'HH:00' 横轴标签，与原 formatHour 视觉一致 */
+function hourLabel(hour: number): string {
+  return `${String(hour).padStart(2, '0')}:00`
+}
+
+/** 今日：映射后端按小时分桶序列（原前端分桶已移除，不再受明细分页截断影响） */
+function buildHourlyRows(data: HourlyStats[]): TrendRow[] {
+  return (data ?? []).map((h) => ({
+    label: hourLabel(h.hour),
+    requestCount: h.requestCount,
+    inputTokens: h.inputTokens,
+    outputTokens: h.outputTokens,
+    cacheReadTokens: h.cacheReadTokens,
+    cacheCreationTokens: h.cacheCreationTokens,
+    cost: Number.parseFloat(h.costUsd)
+  }))
 }
 
 /** 7 / 30 天：映射按天聚合序列 */
@@ -87,17 +78,21 @@ export default function TrendsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('7d')
   const filters = useMemo(() => rangeToFilters(range), [range])
   const dailyQuery = useDailyTrends(filters)
-  // 今日请求趋势需按小时分桶，取请求日志明细（与 Dashboard 一致的取数方式）
-  const logsFilters = useMemo(() => rangeToFilters(range, { page: 1, pageSize: 500 }), [range])
-  const logsQuery = useRequestLogs(logsFilters)
+  // 今日小时趋势改由后端分桶（原 pageSize:500 明细截断问题随之消除）；
+  // queryKey 复用 daily-trends 一级前缀，纳入既有 usage-updated 失效清单
+  const hourlyQuery = useQuery({
+    queryKey: ['daily-trends', 'hourly', filters],
+    queryFn: () => api.getHourlyTrends(filters),
+    enabled: range === 'today'
+  })
 
   const rows = useMemo(() => {
-    if (range === 'today') return buildHourlyRows(logsQuery.data?.items ?? [])
+    if (range === 'today') return buildHourlyRows(hourlyQuery.data ?? [])
     return buildDailyRows(dailyQuery.data ?? [])
-  }, [range, dailyQuery.data, logsQuery.data])
+  }, [range, dailyQuery.data, hourlyQuery.data])
 
   const granularity = range === 'today' ? '按小时' : '按天'
-  const loading = rows.length === 0 && (dailyQuery.isLoading || logsQuery.isLoading)
+  const loading = rows.length === 0 && (dailyQuery.isLoading || hourlyQuery.isLoading)
 
   if (loading) {
     return (

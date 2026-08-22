@@ -62,6 +62,7 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
+  delete process.env.GROK_HOME
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
 
@@ -358,5 +359,54 @@ describe('listFilesFromRoot 收集范围', () => {
   it('无 unified.jsonl / sessions 时返回空列表', () => {
     const entries = listFilesFromRoot(tmpDir)
     expect(entries).toHaveLength(0)
+  })
+})
+
+describe('每轮同步重建模型映射（listFiles 入口）', () => {
+  it('第一轮 summary 缺失时记录被跳过；summary 新增后第二轮同 sessionId 正常产出模型', async () => {
+    process.env.GROK_HOME = tmpDir
+    makeSessions(tmpDir, { 'sess-old': 'grok-3' })
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, inferenceLine({ sessionId: 'sess-new' }), 'utf8')
+
+    // 第一轮：sess-new 尚无 summary.json → 映射缺失，该行被静默跳过
+    await grokPlugin.listFiles(ctx)
+    const r1 = await grokPlugin.parseFile(ctx, file, 0)
+    expect(r1.records).toHaveLength(0)
+    expect(r1.nextLine).toBe(2)
+
+    // summary 新增 sess-new 映射后进入第二轮
+    makeSessions(tmpDir, { 'sess-new': 'grok-4' })
+
+    // 第二轮：listFiles 无条件重建映射 → 同一 sessionId 的行正常产出
+    const files = await grokPlugin.listFiles(ctx)
+    expect(files.some((e) => e.path.endsWith(path.join('sessions', 'sess-new', 'summary.json')))).toBe(true)
+    const r2 = await grokPlugin.parseFile(ctx, file, 0)
+    expect(r2.records).toHaveLength(1)
+    expect(r2.records[0]).toMatchObject({
+      sessionId: 'sess-new',
+      model: 'grok-4',
+      rawModel: 'grok-4',
+      inputTokens: 120,
+      outputTokens: 60
+    })
+  })
+
+  it('单个损坏的 summary.json 不阻塞重建，其余映射照常生效', async () => {
+    process.env.GROK_HOME = tmpDir
+    makeSessions(tmpDir, { 'sess-ok': 'grok-3-fast' })
+    const bad = path.join(tmpDir, 'sessions', 'sess-bad')
+    fs.mkdirSync(bad, { recursive: true })
+    fs.writeFileSync(path.join(bad, 'summary.json'), '{broken', 'utf8')
+
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, inferenceLine({ sessionId: 'sess-ok' }), 'utf8')
+
+    await grokPlugin.listFiles(ctx)
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0]).toMatchObject({ sessionId: 'sess-ok', model: 'grok-3-fast' })
   })
 })

@@ -36,13 +36,13 @@ function makeStorage(): { storage: StorageService; db: SqliteDatabase } {
 }
 
 describe('数据库迁移', () => {
-  it('首次建 v1，重复迁移幂等，五张表齐全', () => {
+  it('首次建库升至最新版，重复迁移幂等，五张表齐全', () => {
     const dir = mkdtempSync(join(tmpdir(), 'token-monitor-'))
     const db = createDatabase(dir)
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(1)
+      expect(db.pragma('user_version', { simple: true })).toBe(2)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")

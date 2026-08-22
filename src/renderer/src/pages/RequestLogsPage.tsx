@@ -1,9 +1,11 @@
 import { useMemo, useState } from 'react'
 import type { ReactElement, ReactNode } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import clsx from 'clsx'
-import { ChevronLeft, ChevronRight, Search, X } from 'lucide-react'
+import { ChevronDown, ChevronLeft, ChevronRight, Search, X } from 'lucide-react'
 import type { AppType, RequestStatus } from '../../../../shared/app'
 import type { LogFilters, RequestLogDetail } from '../../../../shared/query'
+import { api } from '../api'
 import { EmptyState } from '../components/EmptyState'
 import { PageHeader } from '../components/PageHeader'
 import { RangeSelector } from '../components/RangeSelector'
@@ -35,21 +37,35 @@ const TD = 'px-3 py-2 text-sm text-neutral-300'
 export default function RequestLogsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('30d')
   const [appTypes, setAppTypes] = useState<AppType[]>([])
+  const [models, setModels] = useState<string[]>([])
+  const [project, setProject] = useState('')
   const [status, setStatus] = useState<StatusFilter>('all')
   const [keyword, setKeyword] = useState('')
   const [page, setPage] = useState(1)
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
+  // 筛选候选随数据同步缓慢变化，长 staleTime 避免每次进入页面都重复查询
+  const { data: filterOptions } = useQuery({
+    queryKey: ['filter-options'],
+    queryFn: () => api.getFilterOptions(),
+    staleTime: 10 * 60 * 1000
+  })
+  const projectOptions = filterOptions?.projects ?? []
+  // 候选未加载或已不含当前选择（数据被清理）时视为未选，避免筛出恒空结果
+  const knownProject = projectOptions.includes(project) ? project : undefined
+
   const filters = useMemo<LogFilters>(
     () => ({
       ...rangeToFilters(range),
       appTypes: appTypes.length > 0 ? appTypes : undefined,
+      models: models.length > 0 ? models : undefined,
       status: status === 'all' ? undefined : status,
       keyword: keyword.trim() ? keyword.trim() : undefined,
+      project: knownProject,
       page,
       pageSize: 15
     }),
-    [range, appTypes, status, keyword, page]
+    [range, appTypes, models, status, keyword, knownProject, page]
   )
 
   const { data, isLoading } = useRequestLogs(filters)
@@ -76,11 +92,26 @@ export default function RequestLogsPage(): ReactElement {
     setPage(1)
   }
 
+  const toggleModel = (m: string): void => {
+    setModels((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]))
+    setPage(1)
+  }
+
+  const clearModels = (): void => {
+    setModels([])
+    setPage(1)
+  }
+
+  const changeProject = (p: string): void => {
+    setProject(p)
+    setPage(1)
+  }
+
   return (
     <div className="space-y-6">
-      <PageHeader title="请求日志" description="按应用 / 模型 / 时间 / 状态筛选的用量明细" />
+      <PageHeader title="请求日志" description="按应用 / 模型 / 项目 / 时间 / 状态筛选的用量明细" />
 
-      {/* 筛选栏：时间范围 + 应用 + 模型关键字 + 状态 */}
+      {/* 筛选栏：时间范围 + 应用 + 关键字 + 状态 + 模型多选 + 项目 */}
       <div className="flex flex-wrap items-center gap-2">
         <RangeSelector value={range} onChange={changeRange} options={RANGE_OPTIONS} />
 
@@ -139,6 +170,27 @@ export default function RequestLogsPage(): ReactElement {
           <option value="all">全部状态</option>
           <option value="success">成功</option>
           <option value="error">失败</option>
+        </select>
+
+        <ModelFilter
+          options={filterOptions?.models ?? []}
+          selected={models}
+          onToggle={toggleModel}
+          onClear={clearModels}
+        />
+
+        <select
+          value={knownProject ?? ''}
+          onChange={(e) => changeProject(e.target.value)}
+          aria-label="按项目筛选"
+          className="max-w-44 rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-1.5 text-xs text-neutral-200 focus:border-neutral-600 focus:outline-none"
+        >
+          <option value="">全部项目</option>
+          {projectOptions.map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
         </select>
       </div>
 
@@ -228,6 +280,90 @@ export default function RequestLogsPage(): ReactElement {
             </button>
           </div>
         </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 模型多选下拉：按钮 + 弹出勾选面板（点击面板外关闭）。
+ * 模型候选可达数百个，原生 multiple select 需 Ctrl 点选且占高，
+ * 故用无依赖的轻量弹层；列表限高滚动。
+ */
+function ModelFilter({
+  options,
+  selected,
+  onToggle,
+  onClear
+}: {
+  options: string[]
+  selected: string[]
+  onToggle: (model: string) => void
+  onClear: () => void
+}): ReactElement {
+  const [open, setOpen] = useState(false)
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className={clsx(
+          'inline-flex items-center gap-1 rounded-lg border px-3 py-1.5 text-xs transition-colors',
+          selected.length > 0
+            ? 'border-neutral-600 bg-neutral-700 text-white'
+            : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+        )}
+      >
+        模型{selected.length > 0 ? ` · ${selected.length}` : ''}
+        <ChevronDown className="h-3 w-3" />
+      </button>
+
+      {open && (
+        <>
+          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+          <div className="absolute left-0 top-full z-40 mt-1 w-64 rounded-lg border border-neutral-800 bg-neutral-950 shadow-xl">
+            <header className="flex items-center justify-between border-b border-neutral-800 px-3 py-2">
+              <span className="text-[11px] uppercase tracking-wide text-neutral-500">
+                模型筛选
+              </span>
+              <button
+                type="button"
+                disabled={selected.length === 0}
+                onClick={onClear}
+                className="text-[11px] text-neutral-400 transition-colors hover:text-neutral-200 disabled:opacity-40"
+              >
+                清空
+              </button>
+            </header>
+            <div className="max-h-64 overflow-y-auto p-1">
+              {options.length === 0 ? (
+                <p className="px-2 py-3 text-xs text-neutral-600">暂无模型数据</p>
+              ) : (
+                options.map((m) => {
+                  const active = selected.includes(m)
+                  return (
+                    <label
+                      key={m}
+                      className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-xs text-neutral-300 hover:bg-neutral-800/60"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={active}
+                        onChange={() => onToggle(m)}
+                        className="h-3 w-3 accent-emerald-500"
+                      />
+                      <span className="truncate font-mono" title={m}>
+                        {m}
+                      </span>
+                    </label>
+                  )
+                })
+              )}
+            </div>
+          </div>
+        </>
       )}
     </div>
   )

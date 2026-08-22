@@ -1,20 +1,28 @@
 ---
 type: pricing-design
 title: 定价与费用
-description: 内置模型定价表，费用 = 各类 token × 每百万价格；模型 ID 需先归一化再查价。
-tags: [pricing, cost, token, model]
+description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 目录同步、零成本回填；费用 = 各类 token × 每百万价格。
+tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-08-21T23:41:51+08:00
+timestamp: 2026-08-22T06:42:00+08:00
 ---
 
 # 定价与费用
 
 > [!note] 当前状态
-> **已实现**（2026-08-20）。归一化与费用计算落地于 `src/main/services/pricing.ts`（含内置 seed 定价），单测见 `pricing.test.ts`。
+> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 目录同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地。
 
-## 定价表（已实现）
+## 定价表（v2，已实现）
 
-`model_pricing` 记录每百万 token 价格：input / output / cache_read / cache_creation，含 `currency`（默认 USD）与 `cost_multiplier`（默认 1），支持自定义/覆盖（IPC 更新/删除后失效 pricing 内存缓存）。
+`model_pricing` 记录每百万 token 价格：input / output / cache_read / cache_creation，含 `currency`（默认 USD）与 `cost_multiplier`（默认 1）；v2 迁移新增 **`source`** 列标记行来源，三态为：
+
+| source | 写入方 | 覆盖规则 |
+|---|---|---|
+| `seed` | 启动时 `seedPricing` 播种 | 可被 sync/user 覆盖 |
+| `sync` | models.dev 全量同步写入 | 可覆盖 seed/sync；被 user 挡住 |
+| `user` | IPC 手动编辑/导入默认来源 | **挡住一切非 user 写入** |
+
+分级覆盖语义：任何非 user 来源的写入对已存在的 user 行不生效；IPC 更新/删除后必须失效 pricing 内存缓存（`invalidateCache`）。
 
 ## 费用计算（已实现）
 
@@ -34,24 +42,30 @@ timestamp: 2026-08-21T23:41:51+08:00
 
 匹配策略：先精确匹配归一化 ID；未命中按「短 ID 匹配带版本项」兜底——请求 ID 以定价 key 为前缀且后继为边界字符（`-`、`.`、数字）时命中，取最长 key，避免家族误配（如 `gpt-4o-latest → gpt-4o`）。
 
-## 内置 seed 价格清单（已落地）
+## 内置 seed 价格清单（已实现）
 
-启动时经 `seedPricing` upsert 写入 **10 个模型**（币种 USD，公开参考价，已存在 model_id 则覆盖更新）：
+启动时 `seedPricing` 以 `source='seed'` upsert 写入 **99 个主流模型**（币种 USD，公开参考价；已存在的非 user 行按分级覆盖规则更新）。完整清单以源码为准（`src/main/services/pricing.ts` 的 seed 数据），此处不再逐条罗列。
 
-| model_id | provider | input | output | cache_read | cache_creation |
-|---|---|---|---|---|---|
-| claude-opus-4-1 | anthropic | 15 | 75 | 1.5 | 18.75 |
-| claude-sonnet-4-5 | anthropic | 3 | 15 | 0.3 | 3.75 |
-| claude-3-5-haiku | anthropic | 0.8 | 4 | 0.08 | 1 |
-| gpt-4.1 | openai | 2 | 8 | 0.5 | 2 |
-| gpt-4o | openai | 2.5 | 10 | 1.25 | 2.5 |
-| gpt-4o-mini | openai | 0.15 | 0.6 | 0.075 | 0.15 |
-| gemini-2-5-pro | google | 1.25 | 10 | 0.3125 | 1.25 |
-| gemini-2-5-flash | google | 0.3 | 2.5 | 0.075 | 0.3 |
-| grok-4 | x-ai | 3 | 15 | 0.3 | 3 |
-| deepseek-chat | deepseek | 0.27 | 1.1 | 0.07 | 0.27 |
+## models.dev 目录同步（已实现）
 
-> 单位：USD / 每百万 token。可选后续接 models.dev 自动同步。
+落地于 `src/main/services/modelsdev.ts`，提供两个入口：
+
+- **fetchCatalog**：拉取 models.dev `api.json` 全量目录，供前端在线浏览与搜索；
+- **syncPricing**：把目录条目映射为定价行写入（`source='sync'`）。cost 四档（input / output / cache_read / cache_creation）直接映射；**cost 档缺失补 0**；input/output 缺失的条目整条丢弃。
+
+IPC 三通道：目录查询 / 全量同步 / 勾选导入。前端行为：
+
+- PricingPage：在线目录浏览 + 搜索 + 勾选导入（导入行标记为 **`user`** 来源）+ 全量同步（写入 `sync` 行）；
+- SettingsPage：`autoSyncPricing` 开关（**默认关**），开启后主进程每日自动同步一次。
+
+每次同步/导入完成后执行 `pricing.invalidateCache()` 并触发零成本回填。
+
+## 零成本回填（已实现）
+
+`pricing.backfillZeroCost(db, pricing)`：扫描明细表中 `cost_usd = 0` 或为空的行，用当前定价重算费用并增量修正对应 `usage_daily_rollups.cost_usd`。
+
+- 不变量：rollup 费用 ≡ 组内明细费用之和（增量修正而非重算全桶）；rollup 行缺失时不重建。
+- 触发时机：应用启动、定价 update/delete 之后、models.dev 同步/导入之后。
 
 ## 关联页面
 

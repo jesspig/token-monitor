@@ -2,6 +2,8 @@ import type { AppType, RequestStatus } from '../../../shared/app'
 import type {
   AppStats,
   DailyStats,
+  FilterOptions,
+  HourlyStats,
   LogFilters,
   ModelStats,
   PaginatedLogs,
@@ -13,7 +15,9 @@ import type { SqliteDatabase } from './db'
 
 /**
  * 用量查询服务：只读聚合/明细查询（better-sqlite3，仅主进程，同步 API 内部实现 + Promise 签名）。
- * 数据源为 usage_records 明细表；费用统一转整数微美元聚合后格式化，与 storage.ts 的金额处理一致。
+ * 聚合类查询优先走 usage_daily_rollups（recordUsage 实时维护的日聚合镜像，明细过期清理后历史趋势不丢）；
+ * 筛选含 rollup 不支持的维度（status/project/sessionId/keyword）时回退 usage_records 明细表。
+ * 费用统一转整数微美元聚合后格式化，与 storage.ts 的金额处理一致。
  * 渲染进程经 IPC 调用，DTO 契约见 shared/query.ts。
  */
 
@@ -25,12 +29,44 @@ function fromMicroUsd(micro: number): string {
   return (micro / MICRO_PER_USD).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0'
 }
 
-/** SQL 片段：cost_usd(TEXT) → 整数微美元求和（无匹配行时 SUM 为 NULL，调用处需 COALESCE） */
+/** epoch ms → YYYY-MM-DD（本地时区）；与 storage.ts 的 toDateKey 同口径（日聚合按本地日归桶） */
+function toDateKey(ms: number): string {
+  const d = new Date(ms)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+/** 本地时区今日 00:00（epoch ms）：小时级趋势的默认范围起点 */
+function startOfTodayMs(): number {
+  const n = new Date()
+  return new Date(n.getFullYear(), n.getMonth(), n.getDate()).getTime()
+}
+
+/**
+ * 聚合查询能否下推到 usage_daily_rollups：rollup 只保留 (date, app_type, model) 维度，
+ * status / project / sessionId / keyword 任一启用时必须回退明细表。
+ */
+function canUseRollups(filters: LogFilters): boolean {
+  return (
+    filters.status == null &&
+    (filters.project == null || filters.project === '') &&
+    (filters.sessionId == null || filters.sessionId === '') &&
+    (filters.keyword == null || filters.keyword === '')
+  )
+}
+
+/** SQL 片段：cost_usd(TEXT) → 整数微美元求和（无匹配行时 SUM 为 NULL，调用处需 COALESCE；两表列名一致可复用） */
 const SUM_COST_MICRO = "SUM(CAST(ROUND(COALESCE(cost_usd, '0') * 1000000) AS INTEGER))"
-/** SQL 片段：success / error 计数 */
+/** SQL 片段：success / error 计数（仅明细表有 status 列） */
 const SUM_SUCCESS = "COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0)"
 const SUM_ERROR = "COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0)"
-/** SQL 片段：各类 token 求和（无匹配行时 SUM 为 NULL，用 COALESCE 归零） */
+/** SQL 片段：rollup 表自带 success/error 计数列，直接求和 */
+const SUM_ROLLUP_REQUESTS = 'COALESCE(SUM(request_count), 0)'
+const SUM_ROLLUP_SUCCESS = 'COALESCE(SUM(success_count), 0)'
+const SUM_ROLLUP_ERROR = 'COALESCE(SUM(error_count), 0)'
+/** SQL 片段：各类 token 求和（无匹配行时 SUM 为 NULL，用 COALESCE 归零；两表列名一致可复用） */
 const SUM_TOKENS = {
   input: 'COALESCE(SUM(input_tokens), 0)',
   output: 'COALESCE(SUM(output_tokens), 0)',
@@ -82,7 +118,20 @@ interface AppRow extends GroupRow {
   app_type: string
 }
 
-/** 把 LogFilters 翻译成 WHERE 子句与参数（page/pageSize 不参与，由分页方法单独处理） */
+interface HourlyRow {
+  /** strftime('%H') 输出的两位字符串（'00'–'23'） */
+  hour: string
+  request_count: number
+  success_count: number
+  error_count: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  cost_micro_usd: number
+}
+
+/** 把 LogFilters 翻译成明细表 WHERE 子句与参数（page/pageSize 不参与，由分页方法单独处理） */
 function buildWhere(filters: LogFilters): { sql: string; params: unknown[] } {
   const clauses: string[] = []
   const params: unknown[] = []
@@ -124,6 +173,223 @@ function buildWhere(filters: LogFilters): { sql: string; params: unknown[] } {
   return { sql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '', params }
 }
 
+/**
+ * rollup 下推路径的 WHERE：appTypes/models 直接对应列；
+ * 时间范围映射为本地日期区间（date >= start 所在日、date <= end 所在日），边界整天计入。
+ */
+function buildRollupWhere(filters: LogFilters): { sql: string; params: unknown[] } {
+  const clauses: string[] = []
+  const params: unknown[] = []
+
+  if (filters.appTypes && filters.appTypes.length > 0) {
+    clauses.push(`app_type IN (${filters.appTypes.map(() => '?').join(', ')})`)
+    params.push(...filters.appTypes)
+  }
+  if (filters.models && filters.models.length > 0) {
+    clauses.push(`model IN (${filters.models.map(() => '?').join(', ')})`)
+    params.push(...filters.models)
+  }
+  if (filters.startTime != null) {
+    clauses.push('date >= ?')
+    params.push(toDateKey(filters.startTime))
+  }
+  if (filters.endTime != null) {
+    clauses.push('date <= ?')
+    params.push(toDateKey(filters.endTime))
+  }
+
+  return { sql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '', params }
+}
+
+/** Hero 汇总行：可下推走 rollups，否则回退明细表（行列结构一致） */
+function querySummaryRow(db: SqliteDatabase, filters: LogFilters): SummaryRow {
+  if (canUseRollups(filters)) {
+    const { sql, params } = buildRollupWhere(filters)
+    return db
+      .prepare(
+        `SELECT ${SUM_ROLLUP_REQUESTS} AS total_requests,
+                ${SUM_ROLLUP_SUCCESS} AS success_count,
+                ${SUM_ROLLUP_ERROR} AS error_count,
+                ${SUM_TOKENS.input} AS input_tokens,
+                ${SUM_TOKENS.output} AS output_tokens,
+                ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+                ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+                COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
+         FROM usage_daily_rollups
+         ${sql}`
+      )
+      .get(...params) as SummaryRow
+  }
+  const { sql, params } = buildWhere(filters)
+  return db
+    .prepare(
+      `SELECT COUNT(*) AS total_requests,
+              ${SUM_SUCCESS} AS success_count,
+              ${SUM_ERROR} AS error_count,
+              ${SUM_TOKENS.input} AS input_tokens,
+              ${SUM_TOKENS.output} AS output_tokens,
+              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
+       FROM usage_records
+       ${sql}`
+    )
+    .get(...params) as SummaryRow
+}
+
+/** 按天趋势行：可下推时 rollup 已按本地日归桶，直接对桶求和再按 date 分组 */
+function queryDailyRows(db: SqliteDatabase, filters: LogFilters): DailyRow[] {
+  if (canUseRollups(filters)) {
+    const { sql, params } = buildRollupWhere(filters)
+    return db
+      .prepare(
+        `SELECT date,
+                ${SUM_ROLLUP_REQUESTS} AS request_count,
+                ${SUM_ROLLUP_SUCCESS} AS success_count,
+                ${SUM_ROLLUP_ERROR} AS error_count,
+                ${SUM_TOKENS.input} AS input_tokens,
+                ${SUM_TOKENS.output} AS output_tokens,
+                ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+                ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+                COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
+         FROM usage_daily_rollups
+         ${sql}
+         GROUP BY date
+         ORDER BY date ASC`
+      )
+      .all(...params) as DailyRow[]
+  }
+  const { sql, params } = buildWhere(filters)
+  return db
+    .prepare(
+      `SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS date,
+              COUNT(*) AS request_count,
+              ${SUM_SUCCESS} AS success_count,
+              ${SUM_ERROR} AS error_count,
+              ${SUM_TOKENS.input} AS input_tokens,
+              ${SUM_TOKENS.output} AS output_tokens,
+              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
+       FROM usage_records
+       ${sql}
+       GROUP BY date
+       ORDER BY date ASC`
+    )
+    .all(...params) as DailyRow[]
+}
+
+/**
+ * 按模型统计行：可下推时平均延迟 = Σlatency_ms_total / Σrequest_count（rollup 不存单条耗时，
+ * NULL 计 0，与明细 AVG(latency_ms) 忽略 NULL 口径略有差异）；防除零返回 NULL。
+ */
+function queryModelRows(db: SqliteDatabase, filters: LogFilters): ModelRow[] {
+  if (canUseRollups(filters)) {
+    const { sql, params } = buildRollupWhere(filters)
+    return db
+      .prepare(
+        `SELECT model,
+                MIN(app_type) AS app_type,
+                ${SUM_ROLLUP_REQUESTS} AS request_count,
+                ${SUM_ROLLUP_SUCCESS} AS success_count,
+                ${SUM_TOKENS.input} AS input_tokens,
+                ${SUM_TOKENS.output} AS output_tokens,
+                ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+                ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+                COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd,
+                CASE WHEN COALESCE(SUM(request_count), 0) > 0
+                     THEN SUM(latency_ms_total) * 1.0 / SUM(request_count)
+                     ELSE NULL END AS avg_latency_ms
+         FROM usage_daily_rollups
+         ${sql}
+         GROUP BY model
+         ORDER BY request_count DESC, model ASC`
+      )
+      .all(...params) as ModelRow[]
+  }
+  const { sql, params } = buildWhere(filters)
+  return db
+    .prepare(
+      `SELECT model,
+              MIN(app_type) AS app_type,
+              COUNT(*) AS request_count,
+              ${SUM_SUCCESS} AS success_count,
+              ${SUM_TOKENS.input} AS input_tokens,
+              ${SUM_TOKENS.output} AS output_tokens,
+              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd,
+              AVG(latency_ms) AS avg_latency_ms
+       FROM usage_records
+       ${sql}
+       GROUP BY model
+       ORDER BY request_count DESC, model ASC`
+    )
+    .all(...params) as ModelRow[]
+}
+
+/** 按应用统计行：可下推走 rollups 按 app_type 分组 */
+function queryAppRows(db: SqliteDatabase, filters: LogFilters): AppRow[] {
+  if (canUseRollups(filters)) {
+    const { sql, params } = buildRollupWhere(filters)
+    return db
+      .prepare(
+        `SELECT app_type,
+                ${SUM_ROLLUP_REQUESTS} AS request_count,
+                ${SUM_ROLLUP_SUCCESS} AS success_count,
+                ${SUM_TOKENS.input} AS input_tokens,
+                ${SUM_TOKENS.output} AS output_tokens,
+                ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+                ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+                COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
+         FROM usage_daily_rollups
+         ${sql}
+         GROUP BY app_type
+         ORDER BY request_count DESC, app_type ASC`
+      )
+      .all(...params) as AppRow[]
+  }
+  const { sql, params } = buildWhere(filters)
+  return db
+    .prepare(
+      `SELECT app_type,
+              COUNT(*) AS request_count,
+              ${SUM_SUCCESS} AS success_count,
+              ${SUM_TOKENS.input} AS input_tokens,
+              ${SUM_TOKENS.output} AS output_tokens,
+              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
+       FROM usage_records
+       ${sql}
+       GROUP BY app_type
+       ORDER BY request_count DESC, app_type ASC`
+    )
+    .all(...params) as AppRow[]
+}
+
+/** 按小时趋势行：rollup 表无小时粒度，恒走明细表按本地时区小时归桶 */
+function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
+  const { sql, params } = buildWhere(filters)
+  return db
+    .prepare(
+      `SELECT strftime('%H', created_at / 1000, 'unixepoch', 'localtime') AS hour,
+              COUNT(*) AS request_count,
+              ${SUM_SUCCESS} AS success_count,
+              ${SUM_ERROR} AS error_count,
+              ${SUM_TOKENS.input} AS input_tokens,
+              ${SUM_TOKENS.output} AS output_tokens,
+              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
+       FROM usage_records
+       ${sql}
+       GROUP BY hour
+       ORDER BY hour ASC`
+    )
+    .all(...params) as HourlyRow[]
+}
+
 /** usage_records 行 → RequestLogDetail（snake_case → camelCase） */
 function toDetail(row: UsageRecordRow): RequestLogDetail {
   return {
@@ -154,6 +420,8 @@ export interface UsageQueryService {
   getUsageSummary(filters: LogFilters): Promise<UsageSummary>
   /** 按天（本地时区 YYYY-MM-DD）趋势序列 */
   getDailyTrends(filters: LogFilters): Promise<DailyStats[]>
+  /** 按小时（本地时区 0–23）趋势序列：默认限定今天，filters 显式给 startTime/endTime 时尊重之 */
+  getHourlyTrends(filters: LogFilters): Promise<HourlyStats[]>
   /** 按归一化模型分组统计 */
   getModelStats(filters: LogFilters): Promise<ModelStats[]>
   /** 按应用（监控对象 app_type）分组统计 */
@@ -162,6 +430,25 @@ export interface UsageQueryService {
   getRequestLogs(filters: LogFilters): Promise<PaginatedLogs>
   /** 单条明细（无则 null） */
   getRequestLogDetail(id: string): Promise<RequestLogDetail | null>
+  /** 筛选候选：模型/项目 distinct 非空值（升序，各截断至 FILTER_OPTIONS_LIMIT） */
+  getFilterOptions(): Promise<FilterOptions>
+}
+
+/** 筛选候选各维度返回上限：极端日志量下防止候选列表无限膨胀，拖垮 IPC 序列化与下拉渲染 */
+export const FILTER_OPTIONS_LIMIT = 500
+
+/** usage_records 单列 distinct 非空值升序（column 仅接受白名单字面量，无注入面） */
+function queryDistinctColumn(db: SqliteDatabase, column: 'model' | 'project'): string[] {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT ${column} AS value
+       FROM usage_records
+       WHERE ${column} IS NOT NULL AND ${column} <> ''
+       ORDER BY value ASC
+       LIMIT ?`
+    )
+    .all(FILTER_OPTIONS_LIMIT) as Array<{ value: string }>
+  return rows.map((r) => r.value)
 }
 
 /**
@@ -171,21 +458,7 @@ export interface UsageQueryService {
 export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
   return {
     getUsageSummary(filters): Promise<UsageSummary> {
-      const { sql, params } = buildWhere(filters)
-      const row = db
-        .prepare(
-          `SELECT COUNT(*) AS total_requests,
-                  ${SUM_SUCCESS} AS success_count,
-                  ${SUM_ERROR} AS error_count,
-                  ${SUM_TOKENS.input} AS input_tokens,
-                  ${SUM_TOKENS.output} AS output_tokens,
-                  ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-                  ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-                  COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-           FROM usage_records
-           ${sql}`
-        )
-        .get(...params) as SummaryRow
+      const row = querySummaryRow(db, filters)
 
       const input = row.input_tokens
       const cacheRead = row.cache_read_tokens
@@ -206,24 +479,7 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
     },
 
     getDailyTrends(filters): Promise<DailyStats[]> {
-      const { sql, params } = buildWhere(filters)
-      const rows = db
-        .prepare(
-          `SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS date,
-                  COUNT(*) AS request_count,
-                  ${SUM_SUCCESS} AS success_count,
-                  ${SUM_ERROR} AS error_count,
-                  ${SUM_TOKENS.input} AS input_tokens,
-                  ${SUM_TOKENS.output} AS output_tokens,
-                  ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-                  ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-                  COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-           FROM usage_records
-           ${sql}
-           GROUP BY date
-           ORDER BY date ASC`
-        )
-        .all(...params) as DailyRow[]
+      const rows = queryDailyRows(db, filters)
 
       return Promise.resolve(
         rows.map((r) => ({
@@ -240,26 +496,35 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
       )
     },
 
+    getHourlyTrends(filters): Promise<HourlyStats[]> {
+      // 默认限定「今天」（本地时区 00:00 起），只补缺失的一侧；显式给了时间范围则完全尊重调用方
+      const effective =
+        filters.startTime != null && filters.endTime != null
+          ? filters
+          : {
+              ...filters,
+              startTime: filters.startTime ?? startOfTodayMs(),
+              endTime: filters.endTime ?? Date.now()
+            }
+      const rows = queryHourlyRows(db, effective)
+
+      return Promise.resolve(
+        rows.map((r) => ({
+          hour: Number.parseInt(r.hour, 10),
+          requestCount: r.request_count,
+          inputTokens: r.input_tokens,
+          outputTokens: r.output_tokens,
+          cacheReadTokens: r.cache_read_tokens,
+          cacheCreationTokens: r.cache_creation_tokens,
+          costUsd: fromMicroUsd(r.cost_micro_usd),
+          successCount: r.success_count,
+          errorCount: r.error_count
+        }))
+      )
+    },
+
     getModelStats(filters): Promise<ModelStats[]> {
-      const { sql, params } = buildWhere(filters)
-      const rows = db
-        .prepare(
-          `SELECT model,
-                  MIN(app_type) AS app_type,
-                  COUNT(*) AS request_count,
-                  ${SUM_SUCCESS} AS success_count,
-                  ${SUM_TOKENS.input} AS input_tokens,
-                  ${SUM_TOKENS.output} AS output_tokens,
-                  ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-                  ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-                  COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd,
-                  AVG(latency_ms) AS avg_latency_ms
-           FROM usage_records
-           ${sql}
-           GROUP BY model
-           ORDER BY request_count DESC, model ASC`
-        )
-        .all(...params) as ModelRow[]
+      const rows = queryModelRows(db, filters)
 
       return Promise.resolve(
         rows.map((r) => ({
@@ -278,23 +543,7 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
     },
 
     getAppStats(filters): Promise<AppStats[]> {
-      const { sql, params } = buildWhere(filters)
-      const rows = db
-        .prepare(
-          `SELECT app_type,
-                  COUNT(*) AS request_count,
-                  ${SUM_SUCCESS} AS success_count,
-                  ${SUM_TOKENS.input} AS input_tokens,
-                  ${SUM_TOKENS.output} AS output_tokens,
-                  ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-                  ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-                  COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-           FROM usage_records
-           ${sql}
-           GROUP BY app_type
-           ORDER BY request_count DESC, app_type ASC`
-        )
-        .all(...params) as AppRow[]
+      const rows = queryAppRows(db, filters)
 
       return Promise.resolve(
         rows.map((r) => ({
@@ -341,6 +590,13 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
         .prepare('SELECT * FROM usage_records WHERE id = ?')
         .get(id) as UsageRecordRow | undefined
       return Promise.resolve(row ? toDetail(row) : null)
+    },
+
+    getFilterOptions(): Promise<FilterOptions> {
+      return Promise.resolve({
+        models: queryDistinctColumn(db, 'model'),
+        projects: queryDistinctColumn(db, 'project')
+      })
     }
   }
 }

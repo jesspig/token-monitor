@@ -3,13 +3,13 @@ type: project-overview
 title: Token Monitor 项目总览
 description: 插件化架构的跨 CLI 用量监控桌面工具，第一阶段内置 5 个监控插件。
 tags: [token-monitor, overview, electron, ai-coding-cli, plugin]
-timestamp: 2026-08-20T01:15:00+08:00
+timestamp: 2026-08-22T06:42:00+08:00
 ---
 
 # 项目总览
 
 > [!note] 当前状态
-> **第一阶段已实现**（2026-08-20）：插件化监控宿主 + 5 个内置监控插件端到端落地于 `src/`，typecheck / 156 项单测 / 构建 / electron-builder 打包全部通过。本页描述与实现一致。
+> **第一阶段已实现**（2026-08-20）：插件化监控宿主 + 5 个内置监控插件端到端落地于 `src/`。**2026-08-22 第二轮迭代**：聚合查询镜像优化、保留清理接线、实时刷新、定价表 v2 + models.dev 同步、预算告警等（详见 [index](../index.md)）。当前 typecheck / 206 项单测全部通过。本页描述与实现一致。
 
 ## 定位
 

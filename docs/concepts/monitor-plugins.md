@@ -4,7 +4,7 @@ title: 监控插件
 description: MonitorPlugin 统一接口与 5 个内置监控插件（claude/codex/opencode/gemini/grok）实现清单。
 tags: [plugin, monitor, cli, claude, codex, opencode, gemini, grok]
 resource: src/main/plugins/
-timestamp: 2026-08-21T23:41:51+08:00
+timestamp: 2026-08-22T06:42:00+08:00
 ---
 
 # 监控插件
@@ -37,7 +37,7 @@ interface MonitorPlugin {
 | codex | `~/.codex/sessions` | 全子树递归 `*.jsonl`（日期分区 `YYYY/MM/DD/` + `archived_sessions/`） | rollout JSONL 状态机解析：模型取 `turn_context.payload.model`，用量取 `event_msg(token_count).payload.info.last_token_usage`，cwd/sessionId 取 `session_meta`；`input_semantics=1` |
 | opencode | `~/.local/share/opencode`（`$OPENCODE_HOME`） | 双源二选一：新版 `opencode.db`(SQLite) 单条目；否则旧版 `storage/message/*.json` + `storage/session/**/*.json` | 新版读 `message` 表（join `session.directory`），游标 = `time_created` 水位，data 列 `role=="assistant"` 的 `modelID / tokens{input,output,cache.read,cache.write}`；旧版每文件一条消息 JSON 同构解析；`input_semantics=1` |
 | gemini | `~/.gemini/tmp` | `<project_hash>/chats/session-*.json`（单个 JSON 对象，非 JSONL） | `messages[]` 中 `type=="gemini"` 且含 `model/tokens` 的消息；tokens 键名多组宽松兼容（`input/input_tokens/inputTokens` 等）；游标 = 消息序号；`input_semantics=1` |
-| grok | `~/.grok`（`GROK_HOME`） | `logs/unified.jsonl` + `sessions/**/summary.json` | unified.jsonl 行 `msg=="shell.turn.inference_done"`：`ctx.prompt_tokens / completion_tokens / cached_prompt_tokens`（prompt 含缓存读，`input_semantics=1`）；模型来自 summary.json `current_model_id` 建立的 sessionId→模型映射 |
+| grok | `~/.grok`（`GROK_HOME`） | `logs/unified.jsonl` + `sessions/**/summary.json` | unified.jsonl 行 `msg=="shell.turn.inference_done"`：`ctx.prompt_tokens / completion_tokens / cached_prompt_tokens`（prompt 含缓存读，`input_semantics=1`）；模型来自 summary.json `current_model_id` 建立的 sessionId→模型映射，**listFiles 每轮无条件重建映射**（新增 summary.json 当轮即生效） |
 
 各插件共同行为：
 

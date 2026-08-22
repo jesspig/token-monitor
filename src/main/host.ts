@@ -3,7 +3,8 @@ import { join } from 'node:path'
 import type { PluginContext, StorageService } from '../../shared/context'
 import type { Detection } from '../../shared/dto'
 import type { MonitorPlugin } from '../../shared/plugin'
-import type { AppSettings } from '../../shared/query'
+import type { AppSettings, BudgetStatus } from '../../shared/query'
+import { getBudgetStatus as computeBudgetStatus } from './services/budget'
 import { createCollector, type Collector } from './collector'
 import { createPluginContext } from './core/context'
 import { EventBus } from './core/event-bus'
@@ -15,7 +16,13 @@ import { geminiPlugin } from './plugins/gemini'
 import { grokPlugin } from './plugins/grok'
 import { opencodePlugin } from './plugins/opencode'
 import { createDatabase, migrate } from './services/db'
-import { PricingServiceImpl, seedPricing } from './services/pricing'
+import { syncPricing, type SyncResult } from './services/modelsdev'
+import {
+  backfillZeroCost,
+  PricingServiceImpl,
+  seedPricing,
+  type BackfillResult
+} from './services/pricing'
 import { cleanupOldRecords } from './services/retention'
 import { schedulerService } from './services/scheduler'
 import { SqliteStorage } from './services/storage'
@@ -31,6 +38,10 @@ import { watcherService } from './services/watcher'
 const DEFAULT_SYNC_INTERVAL_MS = 300_000
 const DEFAULT_RETENTION_DAYS = 90
 const SETTINGS_FILENAME = 'settings.json'
+/** 启动后延迟执行的首次过期明细清理（ms） */
+const RETENTION_SWEEP_DELAY_MS = 30_000
+/** models.dev 定价自动同步周期（ms）：开启后每 24h 全量同步一次 */
+const PRICING_AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 export interface HostOptions {
   /** 数据目录；省略则用内存库（:memory:），适合测试 */
@@ -49,16 +60,34 @@ export interface Host {
   pricing: PricingServiceImpl
   usageQuery: UsageQueryService
   events: EventBus
-  /** 读取设置（syncIntervalMs/retentionDays/dataDir） */
+  /** 读取设置（syncIntervalMs/retentionDays/dataDir/autoSyncPricing） */
   getSettings(): AppSettings
-  /** 更新设置（持久化到 dataDir/settings.json）；同步间隔变化时重启兜底扫描 */
+  /**
+   * 更新设置（持久化到 dataDir/settings.json）；同步间隔变化时重启兜底扫描，
+   * autoSyncPricing 变化时启停 models.dev 每日同步调度。
+   */
   updateSettings(patch: Partial<AppSettings>): void
   /**
+   * 预算限额状态（全局维度）：今日/本月费用与上限占比，读 usage_daily_rollups
+   * 与当前设置；未设置预算=不告警。失败向上抛由 IPC 层兜底。
+   */
+  getBudgetStatus(): Promise<BudgetStatus>
+  /**
    * 清理超过保留天数的明细（同步方法，返回删除条数）。
-   * 内部调 cleanupOldRecords(db, settings.get().retentionDays)；由调用方（定时/手动）触发，
-   * updateSettings 更新 retentionDays 时不自动触发清理。
+   * 内部调 cleanupOldRecords(db, settings.get().retentionDays)；
+   * 宿主已内置调度：启动后延迟 RETENTION_SWEEP_DELAY_MS 执行一次，此后与兜底扫描同节奏周期执行
+   * （均容错，失败仅记日志）；仍可手动调用，updateSettings 更新 retentionDays 时不立即触发。
    */
   cleanupRetention(): number
+  /**
+   * 手动触发 models.dev 全量定价同步：syncPricing(storage)（内部以 'sync' 分级
+   * upsert，user 行受保护）→ 成功后失效 pricing 缓存 → 零成本回填
+   * （新价可能解锁历史零成本行，回填失败仅记日志不阻塞）。
+   * 同步本身的网络/HTTP/JSON 失败向上抛，由 IPC 层兜底。
+   */
+  syncModelsDevPricing(): Promise<SyncResult>
+  /** 按当前定价重算零成本历史明细并增量修正日聚合；启动与定价变更后（IPC 层）调用 */
+  runZeroCostBackfill(): Promise<BackfillResult>
   /** 退出清理：停采集 → 卸载全部插件 → 关闭数据库 */
   dispose(): void
 }
@@ -166,6 +195,73 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
   const usageQuery = createUsageQuery(db)
   let currentSyncIntervalMs = settings.get().syncIntervalMs
 
+  // —— 过期明细清理调度（docs/concepts/data-model.md → 保留策略）——
+  // collector 内部定时回调无法从外部挂钩，宿主经同一 scheduler 以相同间隔独立触发，
+  // 与兜底扫描同节奏；启动后延迟 RETENTION_SWEEP_DELAY_MS 先行一次。
+  function runRetentionSweep(): void {
+    try {
+      cleanupOldRecords(db, settings.get().retentionDays)
+    } catch (err) {
+      console.error('[host] 过期明细清理失败:', err)
+    }
+  }
+
+  let stopRetentionSweep: (() => void) | null = null
+
+  function startRetentionSweepLoop(intervalMs: number): void {
+    stopRetentionSweep?.()
+    stopRetentionSweep = scheduler.schedule(intervalMs, runRetentionSweep)
+  }
+
+  startRetentionSweepLoop(currentSyncIntervalMs)
+  const startupSweepTimer = setTimeout(runRetentionSweep, RETENTION_SWEEP_DELAY_MS)
+
+  // —— models.dev 定价目录（docs/concepts/pricing.md）——
+  // 零成本回填：按当前定价重算 cost 为零/空的历史明细；启动时异步执行一次（不阻塞），
+  // 定价变更后由 IPC 层再次触发。结果数打日志，失败兜底不中断。
+  async function runZeroCostBackfill(): Promise<BackfillResult> {
+    const result = await backfillZeroCost(db, pricing)
+    if (result.updated > 0) {
+      console.log(
+        `[host] 零成本回填完成: scanned=${result.scanned} updated=${result.updated}`
+      )
+    }
+    return result
+  }
+
+  // 手动/定时共用的全量同步：syncPricing 内部分级 upsert → 失效缓存 → 回填；
+  // 同步失败向上抛，回填失败仅记日志。
+  async function syncModelsDevPricing(): Promise<SyncResult> {
+    const result = await syncPricing(storage)
+    pricing.invalidateCache()
+    try {
+      await runZeroCostBackfill()
+    } catch (err) {
+      console.error('[host] 同步后零成本回填失败:', err)
+    }
+    return result
+  }
+
+  let currentAutoSyncPricing = settings.get().autoSyncPricing === true
+  let stopPricingAutoSync: (() => void) | null = null
+
+  function startPricingAutoSync(): void {
+    stopPricingAutoSync?.()
+    stopPricingAutoSync = null
+    if (currentAutoSyncPricing) {
+      stopPricingAutoSync = scheduler.schedule(PRICING_AUTO_SYNC_INTERVAL_MS, () => {
+        syncModelsDevPricing().catch((err) => {
+          console.error('[host] models.dev 定价自动同步失败:', err)
+        })
+      })
+    }
+  }
+
+  startPricingAutoSync()
+  void runZeroCostBackfill().catch((err) => {
+    console.error('[host] 启动零成本回填失败:', err)
+  })
+
   return {
     ctx,
     registry,
@@ -178,17 +274,34 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
     getSettings: settings.get,
     updateSettings(patch) {
       settings.update(patch)
-      const next = settings.get().syncIntervalMs
-      if (next !== currentSyncIntervalMs) {
-        currentSyncIntervalMs = next
+      const next = settings.get()
+      const nextSyncIntervalMs = next.syncIntervalMs
+      if (nextSyncIntervalMs !== currentSyncIntervalMs) {
+        currentSyncIntervalMs = nextSyncIntervalMs
         collector.stop()
-        collector.start(next)
+        collector.start(nextSyncIntervalMs)
+        startRetentionSweepLoop(nextSyncIntervalMs)
       }
+      const nextAutoSyncPricing = next.autoSyncPricing === true
+      if (nextAutoSyncPricing !== currentAutoSyncPricing) {
+        currentAutoSyncPricing = nextAutoSyncPricing
+        startPricingAutoSync()
+      }
+    },
+    getBudgetStatus() {
+      return Promise.resolve(computeBudgetStatus(db, settings.get()))
     },
     cleanupRetention() {
       return cleanupOldRecords(db, settings.get().retentionDays)
     },
+    syncModelsDevPricing,
+    runZeroCostBackfill,
     dispose() {
+      clearTimeout(startupSweepTimer)
+      stopRetentionSweep?.()
+      stopRetentionSweep = null
+      stopPricingAutoSync?.()
+      stopPricingAutoSync = null
       collector.stop()
       for (const p of plugins) lifecycle.unmount(ctx, p)
       storage.close()
