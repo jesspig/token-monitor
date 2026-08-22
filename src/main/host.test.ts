@@ -4,6 +4,7 @@ import path from 'node:path'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import type { UsageUpdatedEvent } from '../../shared/context'
 import type { MonitorPlugin } from '../../shared/plugin'
+import type { BudgetStatus } from '../../shared/query'
 import { createCollector } from './collector'
 import { createHost } from './host'
 import { registerIpcHandlers, type IpcMainLike } from './ipc/register'
@@ -14,7 +15,7 @@ import { registerIpcHandlers, type IpcMainLike } from './ipc/register'
  * claude 插件即扫描临时目录下的 .claude/projects 会话 JSONL。
  */
 
-/** 可注入的 fake ipcMain（记录 handler 并支持同步 invoke） */
+/** 可注入的 fake ipcMain（记录 handler 并支持 invoke；handler 同步抛错转为 rejection，对齐 ipcRenderer.invoke 语义） */
 type FakeIpc = IpcMainLike & {
   invoke(channel: string, ...args: unknown[]): Promise<unknown>
 }
@@ -24,10 +25,10 @@ function makeFakeIpcMain(): FakeIpc {
     handle(channel, listener) {
       handlers.set(channel, listener as (...args: unknown[]) => unknown)
     },
-    invoke(channel, ...args) {
+    async invoke(channel, ...args) {
       const h = handlers.get(channel)
-      if (!h) return Promise.reject(new Error(`No handler for "${channel}"`))
-      return Promise.resolve(h({ sender: {} }, ...args))
+      if (!h) throw new Error(`No handler for "${channel}"`)
+      return h({ sender: {} }, ...args)
     }
   }
 }
@@ -100,6 +101,38 @@ describe('createHost 装配', () => {
       const settings = (await ipc.invoke('settings:get')) as { syncIntervalMs: number; retentionDays: number }
       expect(settings.syncIntervalMs).toBe(300_000)
       expect(settings.retentionDays).toBe(90)
+    } finally {
+      host.dispose()
+    }
+  })
+
+  it('IPC 冒烟：budget:status 贯通——今日费用可见，设置预算后超限告警', async () => {
+    // 时间戳取「现在」，保证 rollup 归桶落在本地今天（预算口径为当日/当月）
+    writeClaudeSession('proj-a', 'session-1.jsonl', [
+      claudeLine('claude-sonnet-4-5', 1_000_000, 0, new Date().toISOString())
+    ])
+    const host = await createHost({ dataDir: ':memory:' })
+    const ipc = makeFakeIpcMain()
+    registerIpcHandlers(ipc, host, () => null)
+    try {
+      await host.collector.syncAll()
+
+      // 未设置预算：不告警，但今日费用可见（seed 价 input $3/M → 3 USD）
+      const unset = (await ipc.invoke('budget:status')) as BudgetStatus
+      expect(unset.dailyBudgetUsd).toBeNull()
+      expect(unset.monthlyBudgetUsd).toBeNull()
+      expect(unset.dailyUsageRatio).toBeNull()
+      expect(unset.dailyExceeded).toBe(false)
+      expect(unset.monthlyExceeded).toBe(false)
+      expect(unset.dailyCostUsd).toBe('3')
+
+      // 设置日预算 2 < 今日费用 3 → 日超限；月上限未设 → 月维度不告警
+      host.updateSettings({ dailyBudgetUsd: 2 })
+      const over = await host.getBudgetStatus()
+      expect(over.dailyBudgetUsd).toBe(2)
+      expect(over.dailyExceeded).toBe(true)
+      expect(over.dailyUsageRatio).toBeCloseTo(1.5, 10)
+      expect(over.monthlyExceeded).toBe(false)
     } finally {
       host.dispose()
     }
@@ -361,6 +394,105 @@ describe('createCollector 插件注入', () => {
       }
     } finally {
       rmSync(sessionDir, { recursive: true, force: true })
+    }
+  })
+})
+
+/** models.dev api.json 最小载荷：1 有效 + 1 解析丢弃 + 1 无 models 的 provider */
+const MODELSDEV_PAYLOAD = {
+  anthropic: {
+    name: 'Anthropic',
+    models: {
+      'claude-test-model': {
+        id: 'claude-test-model',
+        name: 'Claude Test',
+        cost: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }
+      },
+      broken: { cost: {} }
+    }
+  },
+  empty: { name: 'Empty' }
+}
+
+function stubModelsDevFetch(): ReturnType<typeof vi.fn> {
+  const fetchMock = vi.fn(async () => ({
+    ok: true,
+    json: async () => MODELSDEV_PAYLOAD
+  }))
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
+}
+
+const HOUR_MS = 60 * 60 * 1000
+
+describe('models.dev 定价目录（T8 主进程侧）', () => {
+  it('autoSyncPricing 开关切换每日自动同步调度；dispose 清理', async () => {
+    vi.useFakeTimers()
+    const fetchMock = stubModelsDevFetch()
+    const host = await createHost({ dataDir: ':memory:' })
+    try {
+      // 默认关闭（undefined）：推进 25h 不触发同步
+      await vi.advanceTimersByTimeAsync(25 * HOUR_MS)
+      expect(fetchMock).not.toHaveBeenCalled()
+
+      // 开启：注册调度，推进满一个周期（24h）触发一次并入库（sync 来源）
+      host.updateSettings({ autoSyncPricing: true })
+      expect(host.getSettings().autoSyncPricing).toBe(true)
+      await vi.advanceTimersByTimeAsync(24 * HOUR_MS)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(
+        (await host.storage.getModelPricing()).find((r) => r.model_id === 'claude-test-model')
+      ).toMatchObject({ source: 'sync' })
+
+      // 关闭：再推进 48h 无新调用
+      host.updateSettings({ autoSyncPricing: false })
+      expect(host.getSettings().autoSyncPricing).toBe(false)
+      await vi.advanceTimersByTimeAsync(48 * HOUR_MS)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    } finally {
+      host.dispose()
+      vi.unstubAllGlobals()
+      vi.useRealTimers()
+    }
+  })
+
+  it('IPC 冒烟：modelsdev-sync/catalog/import 三通道贯通', async () => {
+    stubModelsDevFetch()
+    const host = await createHost({ dataDir: ':memory:' })
+    const ipc = makeFakeIpcMain()
+    registerIpcHandlers(ipc, host, () => null)
+    try {
+      // 手动全量同步：fetched = imported + skipped
+      await expect(ipc.invoke('pricing:modelsdev-sync')).resolves.toEqual({
+        fetched: 2,
+        imported: 1,
+        skipped: 1
+      })
+
+      // 在线目录：供前端勾选的条目数组
+      const catalog = (await ipc.invoke('pricing:modelsdev-catalog')) as {
+        entries: Array<{ modelId: string; inputPerMillion: number }>
+        total: number
+        skipped: number
+      }
+      expect(catalog.total).toBe(2)
+      expect(catalog.skipped).toBe(1)
+      const picked = catalog.entries.find((e) => e.modelId === 'claude-test-model')
+      expect(picked).toMatchObject({ inputPerMillion: 3 })
+
+      // 导入勾选子集：user 来源写入；非法条目跳过；非数组抛错
+      await expect(ipc.invoke('pricing:modelsdev-import', [picked, { nope: true }])).resolves.toEqual({
+        imported: 1
+      })
+      expect(
+        (await host.storage.getModelPricing()).find((r) => r.model_id === 'claude-test-model')
+      ).toMatchObject({ source: 'user' })
+      await expect(ipc.invoke('pricing:modelsdev-import', 'nope')).rejects.toThrow(
+        /必须为条目数组/
+      )
+    } finally {
+      host.dispose()
+      vi.unstubAllGlobals()
     }
   })
 })
