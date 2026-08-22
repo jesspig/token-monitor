@@ -57,6 +57,11 @@ export interface DailyStats {
 export interface HourlyStats {
   /** 0–23（本地时区小时） */
   hour: number
+  /**
+   * 本地日期 YYYY-MM-DD：小时桶的日期维度。
+   * 跨天窗口（如 24h 滚动窗口）用其区分同钟点的不同日桶，避免「昨天 9 点」与「今天 9 点」被误合并。
+   */
+  dayKey?: string
   requestCount: number
   inputTokens: number
   outputTokens: number
@@ -144,6 +149,8 @@ export interface PluginStatus {
   lastSyncAt: number | null
   /** 累计解析错误数 */
   errorCount: number
+  /** 被监控 CLI 的实际版本；null/缺省表示探测失败 */
+  cliVersion?: string | null
 }
 
 /** 设置页：同步间隔、数据保留策略、数据目录 */
@@ -154,12 +161,14 @@ export interface AppSettings {
   retentionDays: number
   /** 数据目录 */
   dataDir: string
-  /** 开启后每 24h 自动同步一次 models.dev 定价目录（默认 false=关闭） */
-  autoSyncPricing?: boolean
   /** 日预算上限（USD，全局所有 CLI 合计）；null/缺省=不启用告警 */
   dailyBudgetUsd?: number | null
   /** 月预算上限（USD，自然月）；null/缺省=不启用告警 */
   monthlyBudgetUsd?: number | null
+  /** 统计自动刷新间隔（ms，默认 5000），渲染端查询轮询用 */
+  statsRefreshIntervalMs?: number
+  /** models.dev 价格自动同步间隔（ms，默认 300000） */
+  pricingSyncIntervalMs?: number
 }
 
 /**
@@ -199,26 +208,11 @@ export interface ModelsDevCatalogEntry {
   cacheCreationPerMillion: number
 }
 
-/** models.dev 在线目录拉取结果；恒有 total === entries.length + skipped */
-export interface ModelsDevCatalogResult {
-  entries: ModelsDevCatalogEntry[]
-  /** 发现的模型条目总数（含被丢弃者）；在线目录可达上万条 */
-  total: number
-  /** 解析阶段丢弃数 */
-  skipped: number
-}
-
 /** models.dev 全量同步结果；恒有 fetched === imported + skipped */
 export interface ModelsDevSyncResult {
   fetched: number
   imported: number
   skipped: number
-}
-
-/** models.dev 手动导入结果 */
-export interface ModelsDevImportResult {
-  /** 成功写入（user 来源）的条目数 */
-  imported: number
 }
 
 /** 请求日志页：筛选维度候选（模型/项目 distinct 非空值，升序），供筛选控件生成选项 */

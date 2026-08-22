@@ -6,6 +6,7 @@ import { Card } from '../components/Card'
 import { EmptyState } from '../components/EmptyState'
 import { PageHeader } from '../components/PageHeader'
 import { useSettings } from '../hooks/useSettings'
+import { setCachedSettings } from '../lib/settings-cache'
 
 const INPUT_CLS =
   'w-full rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-neutral-600 focus:outline-none'
@@ -29,9 +30,10 @@ export default function SettingsPage(): ReactElement {
   const qc = useQueryClient()
 
   const [syncMin, setSyncMin] = useState('')
+  const [statsRefreshSec, setStatsRefreshSec] = useState('')
   const [retentionDays, setRetentionDays] = useState('')
+  const [pricingSyncMin, setPricingSyncMin] = useState('')
   const [dataDir, setDataDir] = useState('')
-  const [autoSyncPricing, setAutoSyncPricing] = useState(false)
   const [dailyBudget, setDailyBudget] = useState('')
   const [monthlyBudget, setMonthlyBudget] = useState('')
   const [budgetError, setBudgetError] = useState('')
@@ -39,9 +41,10 @@ export default function SettingsPage(): ReactElement {
   useEffect(() => {
     if (!data) return
     setSyncMin(String(data.syncIntervalMs / 60_000))
+    setStatsRefreshSec(String((data.statsRefreshIntervalMs ?? 5000) / 1000))
     setRetentionDays(String(data.retentionDays))
+    setPricingSyncMin(String((data.pricingSyncIntervalMs ?? 300_000) / 60_000))
     setDataDir(data.dataDir)
-    setAutoSyncPricing(data.autoSyncPricing === true)
     setDailyBudget(data.dailyBudgetUsd != null ? String(data.dailyBudgetUsd) : '')
     setMonthlyBudget(data.monthlyBudgetUsd != null ? String(data.monthlyBudgetUsd) : '')
   }, [data])
@@ -55,14 +58,17 @@ export default function SettingsPage(): ReactElement {
       return
     }
     setBudgetError('')
-    await api.updateSettings({
+    const payload = {
       syncIntervalMs: (Math.max(1, Number(syncMin) || 5) * 60_000),
+      statsRefreshIntervalMs: Math.max(1, Number(statsRefreshSec) || 5) * 1000,
       retentionDays: Math.max(1, Number(retentionDays) || 30),
+      pricingSyncIntervalMs: Math.max(1, Number(pricingSyncMin) || 5) * 60_000,
       dataDir: dataDir.trim() || data?.dataDir || '',
-      autoSyncPricing,
       dailyBudgetUsd: daily.value,
       monthlyBudgetUsd: monthly.value
-    })
+    }
+    await api.updateSettings(payload)
+    setCachedSettings(payload)
     await qc.invalidateQueries({ queryKey: ['settings'] })
   }
 
@@ -89,6 +95,19 @@ export default function SettingsPage(): ReactElement {
               />
             </div>
             <div>
+              <label className={LABEL_CLS} htmlFor="stats-refresh-interval">
+                统计自动刷新间隔（秒）
+              </label>
+              <input
+                id="stats-refresh-interval"
+                type="number"
+                min={1}
+                value={statsRefreshSec}
+                onChange={(e) => setStatsRefreshSec(e.target.value)}
+                className={INPUT_CLS}
+              />
+            </div>
+            <div>
               <label className={LABEL_CLS} htmlFor="retention">
                 明细保留天数
               </label>
@@ -98,6 +117,19 @@ export default function SettingsPage(): ReactElement {
                 min={1}
                 value={retentionDays}
                 onChange={(e) => setRetentionDays(e.target.value)}
+                className={INPUT_CLS}
+              />
+            </div>
+            <div>
+              <label className={LABEL_CLS} htmlFor="pricing-sync-interval">
+                价格同步间隔（分钟）
+              </label>
+              <input
+                id="pricing-sync-interval"
+                type="number"
+                min={1}
+                value={pricingSyncMin}
+                onChange={(e) => setPricingSyncMin(e.target.value)}
                 className={INPUT_CLS}
               />
             </div>
@@ -148,27 +180,6 @@ export default function SettingsPage(): ReactElement {
                 placeholder="留空表示不启用"
                 className={INPUT_CLS}
               />
-            </div>
-            <div className="md:col-span-2">
-              <label className={LABEL_CLS} htmlFor="auto-sync-pricing">
-                自动同步定价（models.dev）
-              </label>
-              <label
-                htmlFor="auto-sync-pricing"
-                className="flex items-center gap-2 text-sm text-neutral-300"
-              >
-                <input
-                  id="auto-sync-pricing"
-                  type="checkbox"
-                  checked={autoSyncPricing}
-                  onChange={(e) => setAutoSyncPricing(e.target.checked)}
-                  className="h-4 w-4 rounded border-neutral-700 bg-neutral-900 accent-emerald-600"
-                />
-                启用
-              </label>
-              <p className="mt-1 text-xs text-neutral-500">
-                每日自动从 models.dev 同步缺失与更新的定价；手动修改过的价格不会被覆盖。
-              </p>
             </div>
           </div>
           <div className="mt-4 flex items-center justify-end gap-3">

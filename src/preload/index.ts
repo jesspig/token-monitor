@@ -2,8 +2,7 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type { AppType } from '../../shared/app'
 import type { UsageUpdatedEvent } from '../../shared/context'
 import type { RendererApi } from '../../shared/ipc'
-import type { AppSettings, LogFilters, ModelsDevCatalogEntry } from '../../shared/query'
-import type { ModelPricingRow } from '../../shared/tables'
+import type { AppSettings, LogFilters } from '../../shared/query'
 
 /**
  * preload 白名单 API：仅暴露主进程允许的能力（RendererApi 契约），
@@ -24,14 +23,9 @@ const api: RendererApi = {
   getStatsByApp: (filters: LogFilters) => ipcRenderer.invoke('usage:stats-by-app', filters),
   getFilterOptions: () => ipcRenderer.invoke('usage:filter-options'),
 
-  // 定价配置
+  // 定价配置（只读列表 + 手动全量同步）
   getModelPricing: () => ipcRenderer.invoke('pricing:list'),
-  updateModelPricing: (entry: ModelPricingRow) => ipcRenderer.invoke('pricing:update', entry),
-  deleteModelPricing: (modelId: string) => ipcRenderer.invoke('pricing:delete', modelId),
   syncModelsDevPricing: () => ipcRenderer.invoke('pricing:modelsdev-sync'),
-  fetchModelsDevCatalog: () => ipcRenderer.invoke('pricing:modelsdev-catalog'),
-  importModelsDevEntries: (entries: ModelsDevCatalogEntry[]) =>
-    ipcRenderer.invoke('pricing:modelsdev-import', entries),
 
   // 监控插件状态与启停
   listPlugins: () => ipcRenderer.invoke('plugins:list'),

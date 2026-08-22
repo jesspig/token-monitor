@@ -65,8 +65,8 @@ export default function SourcesPage(): ReactElement {
 
               <dl className="mt-3 space-y-1.5 text-xs">
                 <div className="flex justify-between">
-                  <dt className="text-neutral-500">版本</dt>
-                  <dd className="font-mono text-neutral-300">{p.version}</dd>
+                  <dt className="text-neutral-500">CLI 版本</dt>
+                  <dd className="font-mono text-neutral-300">{p.cliVersion ?? '未知'}</dd>
                 </div>
                 <div className="flex justify-between">
                   <dt className="text-neutral-500">状态</dt>
