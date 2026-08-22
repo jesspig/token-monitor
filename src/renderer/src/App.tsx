@@ -12,6 +12,7 @@ import {
   TrendingUp
 } from 'lucide-react'
 import { isMock } from './api'
+import { useUsageEvents } from './hooks/useUsageEvents'
 import DashboardPage from './pages/DashboardPage'
 import TrendsPage from './pages/TrendsPage'
 import RequestLogsPage from './pages/RequestLogsPage'
@@ -43,6 +44,7 @@ const PAGES: Record<PageKey, () => ReactElement> = {
 }
 
 function App(): ReactElement {
+  useUsageEvents()
   const [page, setPage] = useState<PageKey>('dashboard')
   const ActivePage = PAGES[page]
 
