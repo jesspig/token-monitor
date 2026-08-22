@@ -4,25 +4,31 @@ title: 数据模型
 description: SQLite 五张核心表：明细、日聚合、定价、同步游标、去重账本。
 tags: [data-model, sqlite, schema, usage]
 resource: src/main/services/db.ts
-timestamp: 2026-08-21T23:41:51+08:00
+timestamp: 2026-08-22T06:42:00+08:00
 ---
 
 # 数据模型
 
 > [!note] 当前状态
-> **已实现**（2026-08-20）。五张表与迁移（v1，`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
+> **已实现**（2026-08-20；2026-08-22 schema 升级至 v2）。五张表与迁移（v1 建表，v2 为 `model_pricing` 增加 `source` 列；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
 
 ## 表清单
 
 | 表 | 用途 | 主键/关键字段 |
 |---|---|---|
 | `usage_records` | 用量明细 | `id`（去重 key = `data_source:file_path:line`） |
-| `usage_daily_rollups` | 日聚合（趋势主数据源） | `(date, app_type, model)` |
-| `model_pricing` | 定价 | `model_id` |
+| `usage_daily_rollups` | 日聚合镜像（`recordUsage` 实时维护，聚合查询优先读它，见下方「查询语义」） | `(date, app_type, model)` |
+| `model_pricing` | 定价（含 `source` 来源分级：`seed`/`sync`/`user`） | `model_id` |
 | `sync_cursors` | 增量同步游标 | `file_path` |
 | `dedup_ledger` | 去重账本（**已建表、未接入写入路径**） | `(data_source, request_id)` |
 
 索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`。
+
+## 日聚合查询语义
+
+- `usage_daily_rollups` 由 `storage.recordUsage` 在入库同事务实时维护，是明细的**镜像**而非独立主数据。
+- `usageQuery.ts` 全部聚合类查询（汇总 / 日趋势 / 按模型 / 按应用）**优先读本表**；筛选条件包含 `status` / `project` / `sessionId` / `keyword` 时回退明细表（rollup 桶不携带这些维度）。
+- 明细分页与详情查询始终走明细表，不经 rollups。
 
 ## 明细表要点
 
@@ -33,9 +39,11 @@ timestamp: 2026-08-21T23:41:51+08:00
 - 费用精度：`cost_usd` 以字符串存储避免浮点误差，聚合时统一转为整数微美元累加再回写字符串。
 - `project` / `session_id` 记录会话归属（可选）；`status` 默认 `'success'`。
 
-## 保留策略（已落地）
+## 保留策略（已接线）
 
-- 默认 **90 天**（`retentionDays=90`，可在设置中修改），清理只删 `usage_records` 明细，**rollups 永不清理**（历史趋势长期保留）；`retentionDays <= 0` 视为不清理。由宿主 `cleanupRetention()` 触发（定时/手动调用方决定，改设置不自动触发）。
+- 默认 **90 天**（`retentionDays=90`，可在设置中修改），清理只删 `usage_records` 明细，**rollups 永不清理**；`retentionDays <= 0` 视为不清理。
+- 清理调度已由宿主 `host.ts` 接线：启动延迟 30s 执行一次，并经 scheduler 以 `syncIntervalMs` 同间隔周期执行；设置变更联动重启调度，dispose 可逆。
+- 到期明细删除后，历史趋势因 rollups 镜像完整保留，聚合查询不受清理影响。
 
 ## 与监控插件的扩展关系
 

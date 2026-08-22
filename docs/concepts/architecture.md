@@ -4,7 +4,7 @@ title: 总体架构
 description: 插件宿主（Electron 主进程）承担全部数据逻辑，渲染进程经 preload contextBridge 白名单通信。
 tags: [architecture, electron, main-process, renderer, ipc, plugin-host]
 resource: src/main/
-timestamp: 2026-08-21T23:41:51+08:00
+timestamp: 2026-08-22T06:42:00+08:00
 ---
 
 # 总体架构
@@ -25,20 +25,22 @@ Electron 主进程（插件宿主）
 │   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts
 ├── services/       核心服务（注册进 ctx，供插件注入）
 │   ├── storage.ts     SQLite 读写 + 日聚合
-│   ├── pricing.ts     定价与费用计算
+│   ├── pricing.ts     定价与费用计算 + 零成本回填
 │   ├── scheduler.ts   定时兜底扫描
 │   ├── watcher.ts     chokidar 文件监听
-│   ├── usageQuery.ts  聚合查询
-│   ├── db.ts          建库与迁移
+│   ├── usageQuery.ts  聚合查询（优先读日聚合镜像，带维度筛选时回退明细）
+│   ├── modelsdev.ts   models.dev 目录拉取与定价同步
+│   ├── budget.ts      预算状态计算（只读 rollups 算今日/本月费用与占比）
+│   ├── db.ts          建库与迁移（v1 建表 / v2 定价 source 列）
 │   └── retention.ts   明细保留清理
-└── ipc/            IPC handler（15 通道）+ 事件推送
+└── ipc/            IPC handler（21 方法）+ 事件推送
         │
         │ contextBridge (preload 白名单 API)
         ▼
-Renderer (React)：Dashboard / 趋势 / 日志表 / 统计 / 定价 / 监控源 / 设置
+Renderer (React)：Dashboard(预算横幅) / 趋势 / 日志表 / 统计 / 定价(models.dev 目录) / 监控源 / 设置
 ```
 
-宿主编排于 `host.ts`：建库迁移 → seed 定价 → 组装 ctx → 注册/装载插件（装载时把各插件会话目录注册进 watcher，500ms 防抖触发同步）→ 暴露采集器与查询/设置入口。采集链路编排在 `collector.ts`。
+宿主编排于 `host.ts`：建库迁移 → seed 定价（99 条主流模型）→ 组装 ctx → 注册/装载插件（装载时把各插件会话目录注册进 watcher，500ms 防抖触发同步）→ 启动钩子：延迟 30s 执行一次保留清理并经 scheduler 按 `syncIntervalMs` 同间隔周期清理（设置变更联动重启）、零成本回填。采集链路编排在 `collector.ts`。
 
 ## 模块职责
 
@@ -49,9 +51,9 @@ Renderer (React)：Dashboard / 趋势 / 日志表 / 统计 / 定价 / 监控源 
 | `core/lifecycle.ts` | 依赖解析（deps）、延迟装载队列与卸载可逆清理（dispose + scope disposer） |
 | `core/event-bus.ts` | 类型化事件；数据更新经 `usage-updated`（200ms 防抖合并）推送 |
 | `plugins/` | 监控插件：实现 `MonitorPlugin`（见 [监控插件](monitor-plugins.md)） |
-| `services/` | 核心服务：存储/定价/调度/监听/查询/迁移/保留清理 |
+| `services/` | 核心服务：存储/定价(含零成本回填)/调度/监听/查询/models.dev 同步/预算/迁移/保留清理 |
 | `collector.ts` | 采集编排：探测 → 列文件 → 增量解析 → 计费 → 入库 → 推游标 → 发事件 |
-| `ipc/register.ts` | IPC handler（15 通道：ping + 6 查询 + 3 定价 + 2 插件 + 2 设置 + 1 事件推送） |
+| `ipc/register.ts` | IPC handler（21 方法：ping + 8 查询(含 hourly-trends/filter-options) + 3 定价 + 3 models.dev + 2 插件 + 2 设置 + 1 预算 + 1 事件推送） |
 
 ## 关键约束
 

@@ -4,7 +4,7 @@ title: 同步与去重
 description: 增量游标 + chokidar 监听 + 定时兜底扫描；主键幂等去重，fork/rewrite 语义去重账本预留。
 tags: [sync, dedup, cursor, chokidar, watcher]
 resource: src/main/services/storage.ts
-timestamp: 2026-08-21T23:41:51+08:00
+timestamp: 2026-08-22T06:42:00+08:00
 ---
 
 # 同步与去重
@@ -32,7 +32,8 @@ timestamp: 2026-08-21T23:41:51+08:00
 
 ## 实时刷新（已实现）
 
-- 一轮同步实际新增记录数 > 0 才发 `usage-updated` 事件（EventBus **200ms 防抖**窗口内合并，addedRecords 累加），经 IPC 推送前端自动刷新。
+- 一轮同步实际新增记录数 > 0 才发 `usage-updated` 事件（EventBus **200ms 防抖**窗口内合并，addedRecords 累加），经 IPC 推送前端。
+- 渲染端 `hooks/useUsageEvents.ts` 订阅该事件，失效 5 个用量 queryKey（`usage-summary` / `daily-trends` / `request-logs` / `stats-by-model` / `stats-by-app`），由 TanStack Query 自动重新拉取。
 
 ## 关联页面
 
