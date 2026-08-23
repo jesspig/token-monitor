@@ -12,9 +12,12 @@ import { LifecycleManager, type LifecyclePlugin } from './core/lifecycle'
 import { PluginRegistry } from './core/registry'
 import { claudePlugin } from './plugins/claude'
 import { codexPlugin } from './plugins/codex'
+import { dshPlugin } from './plugins/dsh'
 import { geminiPlugin } from './plugins/gemini'
 import { grokPlugin } from './plugins/grok'
 import { opencodePlugin } from './plugins/opencode'
+import { piPlugin } from './plugins/pi'
+import { zcodePlugin } from './plugins/zcode'
 import { createDatabase, migrate } from './services/db'
 import { syncPricing, type SyncResult } from './services/modelsdev'
 import {
@@ -32,7 +35,7 @@ import { watcherService } from './services/watcher'
 
 /**
  * 插件宿主（docs/concepts/architecture.md → 主进程）。
- * 组装服务容器 ctx（storage/pricing/events/scheduler/watcher）、注册 5 个内置监控插件、
+ * 组装服务容器 ctx（storage/pricing/events/scheduler/watcher）、注册 8 个内置监控插件、
  * 装载插件并把各插件会话目录注册进 watcher，向外部暴露采集器与查询/设置入口。
  */
 
@@ -140,13 +143,16 @@ function createSettingsStore(
   }
 }
 
-/** 第一阶段 5 个内置监控插件（docs/concepts/monitor-plugins.md） */
+/** 8 个内置监控插件（docs/concepts/monitor-plugins.md） */
 const BUILTIN_PLUGINS: MonitorPlugin[] = [
   claudePlugin,
   codexPlugin,
   opencodePlugin,
   geminiPlugin,
-  grokPlugin
+  grokPlugin,
+  piPlugin,
+  zcodePlugin,
+  dshPlugin
 ]
 
 export async function createHost(options: HostOptions = {}): Promise<Host> {

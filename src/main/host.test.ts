@@ -16,7 +16,10 @@ vi.mock('./services/cli-version', () => ({
     codex: 'codex',
     opencode: 'opencode',
     gemini: 'gemini',
-    grok: 'grok'
+    grok: 'grok',
+    pi: 'pi',
+    zcode: 'zcode',
+    dsh: 'dsh'
   },
   detectCliVersion: vi.fn(async (command: string) => (command === 'claude' ? '9.9.9' : null))
 }))
@@ -88,13 +91,22 @@ afterEach(() => {
 })
 
 describe('createHost 装配', () => {
-  it('listPlugins 返回 5 个内置插件，默认全启用；claude 检测可用', async () => {
+  it('listPlugins 返回 8 个内置插件，默认全启用；claude 检测可用', async () => {
     mkdirSync(path.join(tempHome, '.claude', 'projects'), { recursive: true })
     const host = await createHost({ dataDir: ':memory:' })
     try {
       const statuses = await host.collector.getPluginStatus()
-      expect(statuses).toHaveLength(5)
-      expect(statuses.map((s) => s.id).sort()).toEqual(['claude', 'codex', 'gemini', 'grok', 'opencode'])
+      expect(statuses).toHaveLength(8)
+      expect(statuses.map((s) => s.id).sort()).toEqual([
+        'claude',
+        'codex',
+        'dsh',
+        'gemini',
+        'grok',
+        'opencode',
+        'pi',
+        'zcode'
+      ])
       for (const s of statuses) expect(s.enabled).toBe(true)
 
       const claude = statuses.find((s) => s.id === 'claude')
