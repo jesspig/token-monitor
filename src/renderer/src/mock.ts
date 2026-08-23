@@ -68,7 +68,10 @@ const APP_MODELS: Record<AppType, string[]> = {
   codex: ['gpt-4o', 'gpt-4o-mini'],
   opencode: ['gpt-4o', 'deepseek-chat'],
   gemini: ['gemini-2-5-pro', 'gemini-2-5-flash'],
-  grok: ['grok-4']
+  grok: ['grok-4'],
+  pi: [],
+  zcode: [],
+  dsh: []
 }
 
 const APP_WEIGHTS: Array<[AppType, number]> = [

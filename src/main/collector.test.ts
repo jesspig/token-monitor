@@ -11,7 +11,10 @@ vi.mock('./services/cli-version', () => ({
     codex: 'codex',
     opencode: 'opencode',
     gemini: 'gemini',
-    grok: 'grok'
+    grok: 'grok',
+    pi: 'pi',
+    zcode: 'zcode',
+    dsh: 'dsh'
   },
   detectCliVersion: vi.fn(async (command: string) => (command === 'opencode' ? '9.9.9' : null))
 }))

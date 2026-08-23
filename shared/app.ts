@@ -1,9 +1,9 @@
 /**
- * 应用类型 = 监控对象标识（第一阶段 5 个内置监控插件）。
+ * 应用类型 = 监控对象标识（内置监控插件，随新增监控插件扩展取值）。
  * 对应 docs/concepts/data-model.md 中 usage_records.app_type 的取值；
  * 后续新增监控插件时，其插件 id 即新的 AppType 取值，无需改表结构。
  */
-export type AppType = 'claude' | 'codex' | 'opencode' | 'gemini' | 'grok'
+export type AppType = 'claude' | 'codex' | 'opencode' | 'gemini' | 'grok' | 'pi' | 'zcode' | 'dsh'
 
 /**
  * ctx 服务容器暴露的服务键（docs/concepts/plugin-architecture.md）。

@@ -93,13 +93,16 @@ describe('detectCliVersion', () => {
 })
 
 describe('常量映射', () => {
-  it('五个监控对象均映射到同名 CLI 命令', () => {
+  it('八个监控对象均映射到同名 CLI 命令', () => {
     expect(CLI_VERSION_COMMANDS).toEqual({
       claude: 'claude',
       codex: 'codex',
       opencode: 'opencode',
       gemini: 'gemini',
-      grok: 'grok'
+      grok: 'grok',
+      pi: 'pi',
+      zcode: 'zcode',
+      dsh: 'dsh'
     })
   })
 
