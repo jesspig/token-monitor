@@ -114,6 +114,10 @@ const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(
  * 单行 JSON → UsageRecord。
  * 仅 type==='assistant' 且 message.usage 存在时产出；
  * 无 model 或 usage 缺失的行返回 null（跳过，不阻塞整体）。
+ * message.id（上游消息 UUID）作为稳定语义请求 ID 写入 source.requestId：
+ * fork/compact 后同一逻辑消息会同时存在于主会话与 subagents/workflows 子树文件，
+ * (file,line) 主键去重无法识别，storage 按 (data_source, request_id) 语义判重；
+ * id 缺失/非字符串时不设置，退回旧 (file,line) 主键去重。
  */
 function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecord | null {
   if (!obj || typeof obj !== 'object') return null
@@ -131,6 +135,9 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
   if (!usage || typeof usage !== 'object') return null
   const u = usage as Record<string, unknown>
 
+  // 宽松取语义请求 ID：string 且非空才采用
+  const requestId = typeof msg.id === 'string' && msg.id.trim() !== '' ? msg.id.trim() : undefined
+
   const ts = typeof row.timestamp === 'string' ? row.timestamp : ''
   const parsed = ts ? Date.parse(ts) : NaN
 
@@ -147,8 +154,45 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
     createdAt: Number.isNaN(parsed) ? Date.now() : parsed,
     project: typeof row.cwd === 'string' ? row.cwd : undefined,
     sessionId: typeof row.sessionId === 'string' ? row.sessionId : undefined,
-    source: { filePath, line }
+    source: { filePath, line, ...(requestId ? { requestId } : {}) }
   }
+}
+
+/**
+ * 按 message.id 折叠同一 API 调用的流式分片（纯函数，导出便于测试）。
+ * 依据（Claude Code 2.1.x 社区多源实测）：一条 assistant 消息按 content block 逐行写入 JSONL，
+ * 同一调用的各行共享相同 message.id 与顶层 requestId，message.usage 中 input/cache_read/cache_creation
+ * 各行一致，而 output_tokens 随流式单调增长（最终值在最后一行）；逐行直录会把同一请求的 output
+ * 重复累计（约 2.4 倍高估）。
+ * 规则：
+ * - 无 requestId 的记录不折叠，直接产出（旧行为）；
+ * - 有 requestId 的按首次出现顺序占位，后续行 outputTokens ≥ 已存值时整体替换该占位
+ *   （取 ≥ 保证同值后到也覆盖，时间戳/source 行号随最新行更新；流式单调增长 → 最终保留 final 行）；
+ * - 后续行 outputTokens 更小视为乱序残留，直接丢弃；
+ * - 不同 requestId 互不影响。
+ * 边界：一轮 API 的各行被拆进两次解析批次（极罕见：watcher 500ms 防抖 + 一轮写完才触发）时，
+ * 首批 partial 已入库、后续 final 会被 storage 按 requestId 判重拦截，残留 partial 误差可接受，
+ * 不做跨批修复（YAGNI）。
+ */
+export function foldById(records: UsageRecord[]): UsageRecord[] {
+  const out: UsageRecord[] = []
+  // requestId → 该请求在 out 中占位的下标（替换时位置不变）
+  const slots = new Map<string, number>()
+  for (const rec of records) {
+    const rid = rec.source.requestId
+    if (!rid) {
+      out.push(rec)
+      continue
+    }
+    const existing = slots.get(rid)
+    if (existing === undefined) {
+      slots.set(rid, out.length)
+      out.push(rec)
+    } else if (rec.outputTokens >= out[existing].outputTokens) {
+      out[existing] = rec
+    }
+  }
+  return out
 }
 
 /**
@@ -156,6 +200,7 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
  * - 失败行宽松跳过不阻塞；仅「尾部不完整行」（JSON.parse 失败且其后仅剩空行）
  *   时游标停在最后一个成功解析行之后（= 该失败行），下次从该行重试，避免丢失正在写入的内容。
  * - eof：读到文件结尾即 true（含尾部不完整行也算 EOF）。
+ * - 本批解析出的记录先经 foldById 折叠流式分片再产出（见 foldById 说明）。
  */
 async function parseFile(
   _ctx: PluginContext,
@@ -170,7 +215,8 @@ async function parseFile(
   }
 
   const lines = content.split('\n')
-  const records: UsageRecord[] = []
+  // 折叠缓冲：同批解析的记录先收集，循环结束后按 message.id 折叠再产出
+  const buffered: UsageRecord[] = []
   let nextLine = fromLine
   let eof = false
 
@@ -201,13 +247,14 @@ async function parseFile(
     }
 
     const record = toUsageRecord(obj, filePath, lineNumber)
-    if (record) records.push(record)
+    if (record) buffered.push(record)
     nextLine = lineNumber + 1
   }
 
   // 读到文件结尾即 EOF（尾部不完整行分支已置 eof）
   if (!eof) eof = true
 
+  const records = foldById(buffered)
   return { records, nextLine, eof }
 }
 

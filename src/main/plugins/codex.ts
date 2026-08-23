@@ -109,16 +109,17 @@ function sessionIdFromFilename(filePath: string): string | undefined {
 }
 
 /**
- * 解析状态：随行推进维护「当前模型」「会话 cwd」「sessionId」。
+ * 解析状态：随行推进维护「当前模型」「会话 cwd」「sessionId」「threadId」。
  * 每次 parseFile 全文件扫描维护状态，保证增量续读（fromLine>0）时上下文不丢失。
  */
 interface CodexState {
   model?: string
   cwd?: string
   sessionId?: string
+  threadId?: string
 }
 
-/** 一行更新状态：session_meta→cwd/id；turn_context→model（最近一次生效） */
+/** 一行更新状态：session_meta→cwd/id/threadId；turn_context→model（最近一次生效） */
 function updateState(row: Record<string, unknown>, state: CodexState): void {
   const payload = getPayloadObj(row)
   if (!payload) return
@@ -127,6 +128,8 @@ function updateState(row: Record<string, unknown>, state: CodexState): void {
     if (cwd) state.cwd = cwd
     const id = toStr(payload.id)
     if (id) state.sessionId = id
+    const threadId = toStr(payload.thread_id)
+    if (threadId) state.threadId = threadId
   } else if (row.type === 'turn_context') {
     const model = toStr(payload.model)
     if (model) state.model = model
@@ -136,6 +139,13 @@ function updateState(row: Record<string, unknown>, state: CodexState): void {
 /**
  * event_msg(token_count) 行 → UsageRecord（用 info.last_token_usage 本轮增量）。
  * 非 token_count 行、无当前模型、last_token_usage 缺失或全 0 → null（跳过该条，不阻塞）。
+ *
+ * 语义请求 ID（source.requestId）为组合键
+ * `<threadId>:<行顶层timestamp>:<input>-<cached>-<output>`：
+ * token_count 事件无 per-event id，但同一轮的 last_token_usage 每轮至多一条，
+ * 且同轮重写场景下 threadId/timestamp/用量三分量均不变 → 组合键幂等稳定；
+ * 任一成分缺失（threadId 空或行顶层 timestamp 非 string）时不设置，
+ * 该记录退回旧 (file,line) 主键去重。
  */
 function toUsageRecord(
   row: Record<string, unknown>,
@@ -172,6 +182,13 @@ function toUsageRecord(
   }
   if (Number.isNaN(createdAt)) createdAt = Date.now()
 
+  // 语义请求 ID 组合键：任一成分缺失则不设置（退回旧行为）；timestamp 用原始串保证幂等
+  const rowTimestamp = typeof row.timestamp === 'string' && row.timestamp.trim() !== '' ? row.timestamp.trim() : undefined
+  const requestId =
+    state.threadId && rowTimestamp
+      ? `${state.threadId}:${rowTimestamp}:${inputTokens}-${cacheReadTokens}-${outputTokens}`
+      : undefined
+
   return {
     appType: 'codex',
     model,
@@ -185,7 +202,7 @@ function toUsageRecord(
     createdAt,
     project: state.cwd,
     sessionId: state.sessionId,
-    source: { filePath, line }
+    source: { filePath, line, ...(requestId ? { requestId } : {}) }
   }
 }
 

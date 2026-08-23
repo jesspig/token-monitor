@@ -11,6 +11,8 @@ const ctx = {} as PluginContext
 /** inference_done 事件行样例（字段可覆盖；noTime 时不写任何时间字段） */
 const inferenceLine = (o: {
   sessionId?: string
+  sid?: unknown
+  loopIndex?: unknown
   prompt?: number
   cached?: number
   completion?: number
@@ -29,6 +31,8 @@ const inferenceLine = (o: {
       reasoning_tokens: 10
     }
   }
+  if (o.sid !== undefined) row.sid = o.sid
+  if (o.loopIndex !== undefined) (row.ctx as Record<string, unknown>).loop_index = o.loopIndex
   if (o.noTime) {
     // 不写时间字段
   } else if (o.timestamp !== undefined || o.ts !== undefined || o.time !== undefined) {
@@ -311,6 +315,57 @@ describe('parseFile unified.jsonl', () => {
     expect(r2.records).toHaveLength(0)
     expect(r2.nextLine).toBe(99)
     expect(r2.eof).toBe(true)
+  })
+})
+
+describe('parseFile requestId 组合键', () => {
+  /** 建好映射并写入单行样例，返回首条记录的 source */
+  async function parseSingleSource(line: string): Promise<{ filePath: string; line: number; requestId?: string }> {
+    makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, line, 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    return res.records[0].source
+  }
+
+  it('行含 sid 与 loop_index 时 requestId 为 "<sid>:<loop_index>"', async () => {
+    const source = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid', loopIndex: 3 }))
+    expect(source.requestId).toBe('9f1c-uuid:3')
+  })
+
+  it('缺 loop_index 时 requestId 为 undefined，其余字段不受影响', async () => {
+    const source = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid' }))
+    expect(source.requestId).toBeUndefined()
+    expect(source).toEqual({ filePath: path.join(tmpDir, 'logs', 'unified.jsonl'), line: 1 })
+  })
+
+  it('sid 缺失 / 空白串时 requestId 为 undefined（loop_index 在场也不设置）', async () => {
+    const noSid = await parseSingleSource(inferenceLine({ loopIndex: 2 }))
+    expect(noSid.requestId).toBeUndefined()
+
+    const blankSid = await parseSingleSource(inferenceLine({ sid: '   ', loopIndex: 2 }))
+    expect(blankSid.requestId).toBeUndefined()
+  })
+
+  it('loop_index 非有限数（字符串/缺失语义）时 requestId 为 undefined', async () => {
+    const strLoop = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid', loopIndex: '3' }))
+    expect(strLoop.requestId).toBeUndefined()
+
+    const nanLoop = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid', loopIndex: Number.NaN }))
+    expect(nanLoop.requestId).toBeUndefined()
+  })
+
+  it('loop_index 为 0 视为有效成分，组合键正常产出', async () => {
+    const source = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid', loopIndex: 0 }))
+    expect(source.requestId).toBe('9f1c-uuid:0')
+  })
+
+  it('sid 首尾空白被 trim 后参与组合键', async () => {
+    const source = await parseSingleSource(inferenceLine({ sid: '  9f1c-uuid  ', loopIndex: 5 }))
+    expect(source.requestId).toBe('9f1c-uuid:5')
   })
 })
 

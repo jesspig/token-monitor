@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
-import { claudePlugin, detectFromRoot, listFilesFromRoot } from './claude'
+import { claudePlugin, detectFromRoot, foldById, listFilesFromRoot } from './claude'
 import type { PluginContext } from '../../../shared/context'
+import type { UsageRecord } from '../../../shared/dto'
 
 /** parseFile 不使用 ctx 上的服务，测试时给个空壳即可 */
 const ctx = {} as PluginContext
@@ -24,9 +25,10 @@ const userLine = (): string =>
     message: { role: 'user', content: 'hello' }
   })
 
-/** assistant 行样例（含 message.usage，字段可覆盖） */
+/** assistant 行样例（含 message.usage，字段可覆盖；id 为 message.id 语义请求 ID） */
 const assistantLine = (o: {
   uuid?: string
+  id?: string
   timestamp?: string
   model?: string
   input?: number
@@ -44,6 +46,7 @@ const assistantLine = (o: {
     version: '2.0.0',
     message: {
       role: 'assistant',
+      ...(o.id ? { id: o.id } : {}),
       model: o.model ?? 'claude-sonnet-4-5',
       usage: {
         input_tokens: o.input ?? 100,
@@ -228,6 +231,118 @@ describe('parseFile 增量解析', () => {
     expect(res.records).toHaveLength(1)
     expect(Number.isNaN(res.records[0].createdAt)).toBe(false)
     expect(Math.abs(res.records[0].createdAt - Date.now())).toBeLessThan(60_000)
+  })
+
+  it('message.id 写入 source.requestId；缺失/非字符串时不设置（退回旧去重）', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    // 带 id：fork 场景同一消息出现在不同文件也能语义判重
+    fs.writeFileSync(
+      file,
+      [
+        assistantLine({ uuid: 'a-1', id: 'msg_01ABC' }),
+        assistantLine({ uuid: 'a-2', timestamp: '2026-08-19T10:00:10+08:00' }), // 无 id
+        JSON.stringify({
+          type: 'assistant',
+          uuid: 'a-3',
+          timestamp: '2026-08-19T10:00:15+08:00',
+          sessionId: 'sess-1',
+          cwd: '/Users/a/b',
+          message: { role: 'assistant', id: 42, model: 'claude-sonnet-4-5', usage: { input_tokens: 1, output_tokens: 1 } }
+        }) // 非字符串 id
+      ].join('\n'),
+      'utf8'
+    )
+    const res = await claudePlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(3)
+    expect(res.records[0].source).toEqual({ filePath: file, line: 1, requestId: 'msg_01ABC' })
+    expect(res.records[1].source.requestId).toBeUndefined()
+    expect('requestId' in res.records[1].source).toBe(false)
+    expect(res.records[2].source.requestId).toBeUndefined()
+  })
+})
+
+describe('流式分片按 message.id 折叠', () => {
+  /** foldById 单测用的最小记录构造器（line 兼作 createdAt，便于断言最终行） */
+  const foldRecord = (o: { requestId?: string; output: number; line: number }): UsageRecord => ({
+    appType: 'claude',
+    model: 'claude-sonnet-4-5',
+    rawModel: 'claude-sonnet-4-5',
+    inputTokens: 100,
+    outputTokens: o.output,
+    cacheReadTokens: 10,
+    cacheCreationTokens: 20,
+    inputSemantics: 2,
+    status: 'success',
+    createdAt: o.line * 1000,
+    source: { filePath: 'f.jsonl', line: o.line, ...(o.requestId ? { requestId: o.requestId } : {}) }
+  })
+
+  it('共享 message.id 的三行折叠为一条 final 记录：output 取最大、其余字段与行号取最终行', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(
+      file,
+      [
+        userLine(),
+        assistantLine({ uuid: 'a-1', id: 'msg_fold', timestamp: '2026-08-19T10:00:01+08:00', output: 10 }),
+        assistantLine({ uuid: 'a-2', id: 'msg_fold', timestamp: '2026-08-19T10:00:02+08:00', output: 50 }),
+        assistantLine({ uuid: 'a-3', id: 'msg_fold', timestamp: '2026-08-19T10:00:03+08:00', output: 100 })
+      ].join('\n'),
+      'utf8'
+    )
+    const res = await claudePlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+
+    const r = res.records[0]
+    expect(r.outputTokens).toBe(100)
+    expect(r.inputTokens).toBe(100)
+    expect(r.cacheReadTokens).toBe(10)
+    expect(r.cacheCreationTokens).toBe(20)
+    expect(r.model).toBe('claude-sonnet-4-5')
+    expect(r.createdAt).toBe(Date.parse('2026-08-19T10:00:03+08:00'))
+    expect(r.source).toEqual({ filePath: file, line: 4, requestId: 'msg_fold' })
+  })
+
+  it('乱序防御：output 序列 100/30 时保留首条更大的记录', () => {
+    const folded = foldById([
+      foldRecord({ requestId: 'msg_A', output: 100, line: 1 }),
+      foldRecord({ requestId: 'msg_A', output: 30, line: 2 })
+    ])
+    expect(folded).toHaveLength(1)
+    expect(folded[0].outputTokens).toBe(100)
+    expect(folded[0].source.line).toBe(1)
+  })
+
+  it('同值 output 后到仍覆盖：时间戳与行号随最新行更新', () => {
+    const folded = foldById([
+      foldRecord({ requestId: 'msg_A', output: 50, line: 1 }),
+      foldRecord({ requestId: 'msg_A', output: 50, line: 2 })
+    ])
+    expect(folded).toHaveLength(1)
+    expect(folded[0].outputTokens).toBe(50)
+    expect(folded[0].source.line).toBe(2)
+    expect(folded[0].createdAt).toBe(2000)
+  })
+
+  it('无 message.id 的行不参与折叠，逐条产出', () => {
+    const folded = foldById([
+      foldRecord({ output: 10, line: 1 }),
+      foldRecord({ output: 20, line: 2 }),
+      foldRecord({ output: 30, line: 3 })
+    ])
+    expect(folded).toHaveLength(3)
+    expect(folded.map((r) => r.source.line)).toEqual([1, 2, 3])
+  })
+
+  it('不同 message.id 各自独立折叠并保持首次出现顺序', () => {
+    const folded = foldById([
+      foldRecord({ requestId: 'msg_A', output: 10, line: 1 }),
+      foldRecord({ requestId: 'msg_B', output: 30, line: 2 }),
+      foldRecord({ requestId: 'msg_A', output: 20, line: 3 }),
+      foldRecord({ requestId: 'msg_B', output: 40, line: 4 })
+    ])
+    expect(folded.map((r) => r.source.requestId)).toEqual(['msg_A', 'msg_B'])
+    expect(folded.map((r) => r.outputTokens)).toEqual([20, 40])
+    expect(folded.map((r) => r.source.line)).toEqual([3, 4])
   })
 })
 
