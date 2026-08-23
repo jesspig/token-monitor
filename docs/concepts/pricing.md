@@ -1,16 +1,16 @@
 ---
 type: pricing-design
 title: 定价与费用
-description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填；费用 = 各类 token × 每百万价格。
+description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填与存量缓存口径重算；费用 = fresh_input × input 价 + 其余 token × 各自价格，input 按 semantics 三态扣减。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-08-22T18:15:00+08:00
+timestamp: 2026-08-23T03:15:00+08:00
 ---
 
 # 定价与费用
 
 > [!note] 当前状态
-> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）。
+> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）；2026-08-23 第五轮迭代接入输入语义计费（v4 迁移 + 存量重算）并增强匹配兜底链。
 
 ## 定价表（v2，已实现）
 
@@ -24,11 +24,21 @@ timestamp: 2026-08-22T18:15:00+08:00
 
 分级覆盖语义：任何非 user 来源的写入对已存在的 user 行不生效；models.dev 同步完成后必须失效 pricing 内存缓存（`invalidateCache`，宿主同步入口已内置）。
 
-## 费用计算（已实现）
+## 费用计算（已实现，按输入语义扣减）
 
-估算费用 = 各类 token 数 × 对应每百万价格 × cost_multiplier，按微美元整数精度求和后输出 USD 字符串；未找到定价项返回 undefined（记录照常入库，costUsd 为空）。
+估算费用 = `fresh_input × input 价 + output × output 价 + cacheRead × read 价 + cacheCreation × write 价`（全部乘 cost_multiplier），按微美元整数精度求和后输出 USD 字符串；未找到定价项返回 undefined（记录照常入库，costUsd 为空）。
 
-## 模型 ID 归一化（已实现，7 步规则）
+**fresh_input 按 `record.inputSemantics` 三态区分口径**（SSOT 定义，与 data-model.md 一致）：
+
+| inputSemantics | 含义 | fresh_input |
+|---|---|---|
+| 0 | 未知 | inputTokens（全额，保守不扣） |
+| 1 | input 为含缓存读写的总量 | `max(0, input − cacheRead − cacheCreation)` |
+| 2 | input 已为纯新输入 | inputTokens |
+
+五源实际口径（2026-08-23 经上游源码逐一核实）：claude 与 opencode 上游已扣减缓存（=2，不扣）；codex / gemini / grok 的 input_tokens 为含缓存总量（=1，扣 read+write，三源 write 桶实际恒为 0）。旧公式对 semantics=1 全额计价曾造成缓存部分重复计费、费用系统性高估，已修复。
+
+## 模型 ID 归一化（已实现，8 步规则）
 
 查价前先清洗模型 ID（自研规则，按序执行）：
 
@@ -38,9 +48,20 @@ timestamp: 2026-08-22T18:15:00+08:00
 4. 去掉末尾 `[1m]`；
 5. `@` → `-` 并去掉开头 `-`；
 6. 去掉常见包装前缀（`provider.model` / `provider_model` → model，供应商名单内置 19 个）；
-7. 去掉版本/日期后缀（`-YYYY-MM-DD`、`-YYYYMMDD`）。
+7. 去掉版本/日期后缀（`-YYYY-MM-DD`、`-YYYYMMDD`）；
+8. 剥离 reasoning effort 后缀（`-low` / `-high` / `-xhigh`，单次，`$` 锚定防误伤）。
 
-匹配策略：先精确匹配归一化 ID；未命中按「短 ID 匹配带版本项」兜底——请求 ID 以定价 key 为前缀且后继为边界字符（`-`、`.`、数字）时命中，取最长 key，避免家族误配（如 `gpt-4o-latest → gpt-4o`）。
+## 定价匹配策略（已实现，五级兜底链）
+
+`matchPrice` 按序尝试，命中即返回：
+
+1. **精确**匹配归一化 ID；
+2. **点转横线变体的精确匹配**（`claude-sonnet-4.5 → claude-sonnet-4-5`）：仅作查价尝试，不进入 normalizeModelId——Gemini 等官方 id 自带点号，无条件转换会破坏精确命中；
+3. **短 ID 匹配带版本/后缀项**（请求 ID 以定价 key 为前缀且后继为边界字符 `-`/`.`/数字时命中，取最长 key，避免家族误配）；
+4. 点转横线变体的短 ID 匹配（同规则作用于 dotted 变体）；
+5. **家族兜底**：定价 key 以请求 ID 为前缀且后继为边界字符时取**最短 key**（避免过专分档误配），仅当请求 ID 长度 ≥3 才启用。
+
+> 排序约束：级 2 必须先于级 3——否则 `claude-opus-4.5` 会被短 ID `claude-opus-4` 截胡（`.` 通过边界判定），错配上一代价格（单价差 3 倍）；有防回归用例。
 
 ## 内置 seed 价格清单（已实现）
 
@@ -66,6 +87,14 @@ IPC 仅两通道：`pricing:list`（只读列表）/ `pricing:modelsdev-sync`（
 
 - 不变量：rollup 费用 ≡ 组内明细费用之和（增量修正而非重算全桶）；rollup 行缺失时不重建。
 - 触发时机：应用启动、每次 models.dev 全量同步之后（自动调度与手动按钮共用同一入口）。
+
+## 存量缓存口径重算（已实现，recalcCachedInputCosts）
+
+`pricing.recalcCachedInputCosts(db, pricing)`：计费语义修复前 codex/gemini/grok 三源的历史明细（semantics=1）按「input 全额计价」被高估；本函数扫描这三源的 semantics=1 行，以新公式按**当前活定价**重算并回写，delta 增量修正对应 rollup（不变量与零成本回填一致）。
+
+- 与迁移的分工：v4 迁移只做纯 SQL 的 opencode semantics 标注修正（1→2）；费用重算需要活定价而 migrate() 为同步纯 SQL,故落地为独立函数由宿主**启动序列**异步调用一次。
+- 幂等：重算值与现值一致（delta=0）即跳过零写入,重复调用 updated=0;阶段二 UPDATE 附带 `cost_usd IS ?` 乐观守卫（NULL 安全），防覆盖并发写入。
+- rollup 行缺失时不创建（同零成本回填口径）。
 
 ## 关联页面
 
