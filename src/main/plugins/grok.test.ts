@@ -11,6 +11,8 @@ const ctx = {} as PluginContext
 /** inference_done 事件行样例（字段可覆盖；noTime 时不写任何时间字段） */
 const inferenceLine = (o: {
   sessionId?: string
+  sid?: unknown
+  loopIndex?: unknown
   prompt?: number
   cached?: number
   completion?: number
@@ -29,6 +31,8 @@ const inferenceLine = (o: {
       reasoning_tokens: 10
     }
   }
+  if (o.sid !== undefined) row.sid = o.sid
+  if (o.loopIndex !== undefined) (row.ctx as Record<string, unknown>).loop_index = o.loopIndex
   if (o.noTime) {
     // 不写时间字段
   } else if (o.timestamp !== undefined || o.ts !== undefined || o.time !== undefined) {
@@ -62,6 +66,7 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
+  delete process.env.GROK_HOME
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
 
@@ -313,6 +318,57 @@ describe('parseFile unified.jsonl', () => {
   })
 })
 
+describe('parseFile requestId 组合键', () => {
+  /** 建好映射并写入单行样例，返回首条记录的 source */
+  async function parseSingleSource(line: string): Promise<{ filePath: string; line: number; requestId?: string }> {
+    makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, line, 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    return res.records[0].source
+  }
+
+  it('行含 sid 与 loop_index 时 requestId 为 "<sid>:<loop_index>"', async () => {
+    const source = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid', loopIndex: 3 }))
+    expect(source.requestId).toBe('9f1c-uuid:3')
+  })
+
+  it('缺 loop_index 时 requestId 为 undefined，其余字段不受影响', async () => {
+    const source = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid' }))
+    expect(source.requestId).toBeUndefined()
+    expect(source).toEqual({ filePath: path.join(tmpDir, 'logs', 'unified.jsonl'), line: 1 })
+  })
+
+  it('sid 缺失 / 空白串时 requestId 为 undefined（loop_index 在场也不设置）', async () => {
+    const noSid = await parseSingleSource(inferenceLine({ loopIndex: 2 }))
+    expect(noSid.requestId).toBeUndefined()
+
+    const blankSid = await parseSingleSource(inferenceLine({ sid: '   ', loopIndex: 2 }))
+    expect(blankSid.requestId).toBeUndefined()
+  })
+
+  it('loop_index 非有限数（字符串/缺失语义）时 requestId 为 undefined', async () => {
+    const strLoop = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid', loopIndex: '3' }))
+    expect(strLoop.requestId).toBeUndefined()
+
+    const nanLoop = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid', loopIndex: Number.NaN }))
+    expect(nanLoop.requestId).toBeUndefined()
+  })
+
+  it('loop_index 为 0 视为有效成分，组合键正常产出', async () => {
+    const source = await parseSingleSource(inferenceLine({ sid: '9f1c-uuid', loopIndex: 0 }))
+    expect(source.requestId).toBe('9f1c-uuid:0')
+  })
+
+  it('sid 首尾空白被 trim 后参与组合键', async () => {
+    const source = await parseSingleSource(inferenceLine({ sid: '  9f1c-uuid  ', loopIndex: 5 }))
+    expect(source.requestId).toBe('9f1c-uuid:5')
+  })
+})
+
 describe('parseFile summary.json', () => {
   it('不产出记录，仅推进到文件尾', async () => {
     makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
@@ -358,5 +414,54 @@ describe('listFilesFromRoot 收集范围', () => {
   it('无 unified.jsonl / sessions 时返回空列表', () => {
     const entries = listFilesFromRoot(tmpDir)
     expect(entries).toHaveLength(0)
+  })
+})
+
+describe('每轮同步重建模型映射（listFiles 入口）', () => {
+  it('第一轮 summary 缺失时记录被跳过；summary 新增后第二轮同 sessionId 正常产出模型', async () => {
+    process.env.GROK_HOME = tmpDir
+    makeSessions(tmpDir, { 'sess-old': 'grok-3' })
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, inferenceLine({ sessionId: 'sess-new' }), 'utf8')
+
+    // 第一轮：sess-new 尚无 summary.json → 映射缺失，该行被静默跳过
+    await grokPlugin.listFiles(ctx)
+    const r1 = await grokPlugin.parseFile(ctx, file, 0)
+    expect(r1.records).toHaveLength(0)
+    expect(r1.nextLine).toBe(2)
+
+    // summary 新增 sess-new 映射后进入第二轮
+    makeSessions(tmpDir, { 'sess-new': 'grok-4' })
+
+    // 第二轮：listFiles 无条件重建映射 → 同一 sessionId 的行正常产出
+    const files = await grokPlugin.listFiles(ctx)
+    expect(files.some((e) => e.path.endsWith(path.join('sessions', 'sess-new', 'summary.json')))).toBe(true)
+    const r2 = await grokPlugin.parseFile(ctx, file, 0)
+    expect(r2.records).toHaveLength(1)
+    expect(r2.records[0]).toMatchObject({
+      sessionId: 'sess-new',
+      model: 'grok-4',
+      rawModel: 'grok-4',
+      inputTokens: 120,
+      outputTokens: 60
+    })
+  })
+
+  it('单个损坏的 summary.json 不阻塞重建，其余映射照常生效', async () => {
+    process.env.GROK_HOME = tmpDir
+    makeSessions(tmpDir, { 'sess-ok': 'grok-3-fast' })
+    const bad = path.join(tmpDir, 'sessions', 'sess-bad')
+    fs.mkdirSync(bad, { recursive: true })
+    fs.writeFileSync(path.join(bad, 'summary.json'), '{broken', 'utf8')
+
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, inferenceLine({ sessionId: 'sess-ok' }), 'utf8')
+
+    await grokPlugin.listFiles(ctx)
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0]).toMatchObject({ sessionId: 'sess-ok', model: 'grok-3-fast' })
   })
 })

@@ -10,6 +10,8 @@ export interface Detection {
   reason?: string
   /** 探测到的会话目录 */
   sessionDir?: string
+  /** 探测到的 CLI 版本号；null 表示探测失败或未探测 */
+  cliVersion?: string | null
 }
 
 /**
@@ -36,7 +38,7 @@ export interface UsageRecord {
   outputTokens: number
   cacheReadTokens: number
   cacheCreationTokens: number
-  /** 输入语义：0=未知 / 1=含缓存写 / 2=纯新输入 */
+  /** 输入语义：0=未知 / 1=input 为含缓存读写的总量(计费前需扣减缓存) / 2=input 已为纯新输入 */
   inputSemantics: number
   /** 费用（USD，字符串避免浮点误差；由 pricing 计算后回填） */
   costUsd?: string
@@ -55,6 +57,8 @@ export interface UsageRecord {
   source: {
     filePath: string
     line: number
+    /** 稳定语义请求 ID（如上游消息 UUID），跨文件/重写场景唯一标识同一逻辑请求；缺失时退回 (file,line) 主键去重 */
+    requestId?: string
   }
 }
 

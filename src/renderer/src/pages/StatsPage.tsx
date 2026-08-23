@@ -68,11 +68,10 @@ export default function StatsPage(): ReactElement {
         />
       ) : tab === 'model' ? (
         <div className="overflow-x-auto rounded-xl border border-neutral-800 bg-neutral-900/60">
-          <table className="w-full min-w-[880px] border-collapse">
+          <table className="w-full min-w-[800px] border-collapse">
             <thead>
               <tr className="border-b border-neutral-800 bg-neutral-900">
                 <th className={TH}>模型</th>
-                <th className={TH}>应用</th>
                 <th className={TH}>请求</th>
                 <th className={TH}>输入</th>
                 <th className={TH}>输出</th>
@@ -87,13 +86,6 @@ export default function StatsPage(): ReactElement {
               {models.map((m) => (
                 <tr key={m.model} className="border-b border-neutral-800/70 hover:bg-neutral-800/40">
                   <td className={`${TD} font-mono text-xs`}>{m.model}</td>
-                  <td className={TD}>
-                    <span
-                      className={`inline-block rounded border px-1.5 py-0.5 text-[11px] ${APP_META[m.appType].badge}`}
-                    >
-                      {APP_META[m.appType].label}
-                    </span>
-                  </td>
                   <td className={`${TD} tabular-nums`}>{m.requestCount}</td>
                   <td className={`${TD} tabular-nums`}>{formatTokens(m.inputTokens)}</td>
                   <td className={`${TD} tabular-nums`}>{formatTokens(m.outputTokens)}</td>

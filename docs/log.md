@@ -2,8 +2,15 @@
 
 > 仅保留最近 7 天。详细按小时记录见 [changelog/](changelog/)。
 
+## 2026-08-23
+
+- **各 CLI 最新版日志格式核实与兼容**：联网核实五源——claude 当前版按 content block 逐行写 JSONL（共享 message.id、output 流式单调增长），插件新增 `foldById` 折叠消除约 2.4 倍高估；gemini 新版已迁移 append-only JSONL（首行 metadata + 消息行 + $set 更新行，subagent 嵌套目录），插件双格式兼容（chats 子树 .jsonl 任意层级 + legacy session-*.json 不变）；codex 经 codex-rs 源码定论 output_tokens 已含 reasoning（现有实现正确）、opencode/grok 无变化。typecheck / 297 项单测 / build 全部通过。
+- **第五轮迭代（对标 cc-switch 用量统计）**：计费语义修复——`calcCost` 对 semantics=1 的 codex/gemini/grok 先扣缓存再计价（旧公式重复计费高估费用），opencode 存量标注由 v4 迁移修正为 2、三源历史费用经 `recalcCachedInputCosts` 启动重算；fork/rewrite 语义去重接入——五插件产出稳定 requestId、入库事务内查写 dedup_ledger；opencode WAL mtime 感知与清理前预回填；定价归一化 8 步 + 五级匹配链（effort 后缀剥离、点转横线变体、家族兜底）；前端自定义时间档、趋势图渐变、token 数量级中文本地化。typecheck / 286 项单测 / build 全部通过。
+
 ## 2026-08-22
 
+- **第四轮迭代（时间范围五档 + 统计页精简 + 设置拆分）**：时间范围扩为 today/24h/7d/14d/30d 五档，today 与 24h 走小时聚合、其余按天（后端 LogFilters 纯时间戳过滤不变）；统计页「按模型」视图移除「应用」列；AppSettings 新增 statsRefreshIntervalMs（默认 5000）与 pricingSyncIntervalMs（默认 300000），价格自动同步间隔与渲染端轮询间隔均改为设置可配。typecheck / 222 项单测通过。
+- **第三轮迭代（数据质量 + 定价自动化 + CLI 版本探测）**：全零 token 记录入库前统一拦截（游标照常推进）+ v3 迁移清洗存量脏明细并重建受影响日期日聚合；models.dev 定价改为每 5 分钟无条件自动同步（seed 仅离线兜底），定价页只读化、IPC 收窄至 17 方法；新增 CLI `--version` 探测并在监控源页展示；渲染端 5s 兜底轮询、固定侧边栏布局与深色滚动条。typecheck / 222 项单测通过。
 - **AGENTS.md 精简重写**：改为紧凑指令文件，补充 pnpm 非 TTY 环境坑（`$env:CI='true'`）与单文件测试命令，删除与 docs/ 重复的低信号内容。
 
 ## 2026-08-21

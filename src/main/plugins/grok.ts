@@ -118,13 +118,13 @@ function readCurrentModel(p: string): string | undefined {
   return undefined
 }
 
-/** sessionId → 模型 映射缓存（loadModelMap 刷新，parseFile 消费） */
+/** sessionId → 模型 映射缓存（loadModelMap 重建，parseFile 消费；每轮同步经 listFiles 刷新） */
 let modelMap = new Map<string, string>()
 
 /**
  * 建立 sessionId → 模型 映射（root 可注入，便于测试）。
  * 递归读 ~/.grok/sessions/任意层级/summary.json，取 current_model_id；会话目录名即 sessionId。
- * 宿主在装载/同步前调用；供测试直接调用。
+ * 由本插件在每轮同步 listFiles 开始处重建；导出仅供测试直接调用。
  */
 export async function loadModelMap(root: string): Promise<Map<string, string>> {
   const map = new Map<string, string>()
@@ -174,7 +174,15 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
 
   const sessionId = typeof row.sessionId === 'string' && row.sessionId ? row.sessionId : undefined
   const model = sessionId ? modelMap.get(sessionId) : undefined
-  if (!model) return null // 无模型映射 → 跳过（等待宿主刷新映射）
+  if (!model) return null // 无模型映射 → 跳过（下一轮同步重建映射后即可匹配）
+
+  // 语义请求 ID："<sid>:<loop_index>"。unified.jsonl 为 append-only 日志，同一次推理调用
+  // 只会出现一行相同 (sid, ctx.loop_index)，组合键跨轮稳定、可唯一标识该次调用；
+  // 任一成分缺失（sid 空白 / loop_index 非有限数）则不设置，退回 (file_path, line) 主键去重
+  const rawSid = typeof row.sid === 'string' ? row.sid.trim() : ''
+  const loop = c.loop_index
+  const loopIndex = typeof loop === 'number' && Number.isFinite(loop) ? loop : undefined
+  const requestId = rawSid && loopIndex !== undefined ? `${rawSid}:${loopIndex}` : undefined
 
   return {
     appType: 'grok',
@@ -189,7 +197,7 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
     createdAt: extractTime(row, c),
     project: typeof row.project === 'string' ? row.project : typeof row.cwd === 'string' ? row.cwd : undefined,
     sessionId,
-    source: { filePath, line }
+    source: requestId ? { filePath, line, requestId } : { filePath, line }
   }
 }
 
@@ -198,7 +206,7 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
  * - unified.jsonl：逐行 JSON.parse，遇 msg==='shell.turn.inference_done' 且 ctx 存在时产出记录
  *   （模型取自 sessionId→模型 映射，无映射跳过）；失败行宽松跳过不阻塞；
  *   「尾部不完整行」（JSON.parse 失败且其后仅剩空行）时游标停在该行，下次从该行重试。
- * - summary.json：不产出记录，仅推进到文件尾（映射由 loadModelMap 单独建立）。
+ * - summary.json：不产出记录，仅推进到文件尾（映射由每轮同步 listFiles 时的 loadModelMap 重建）。
  * - eof：读到文件结尾即 true（含尾部不完整行也算 EOF）。
  */
 async function parseFile(
@@ -211,11 +219,6 @@ async function parseFile(
   }
   if (!filePath.endsWith('unified.jsonl')) {
     return { records: [], nextLine: fromLine, eof: true }
-  }
-
-  // 映射未装载时，由文件路径反推根目录（~/.grok/logs/unified.jsonl → ~/.grok）惰性装载
-  if (modelMap.size === 0) {
-    await loadModelMap(path.dirname(path.dirname(filePath)))
   }
 
   let content: string
@@ -279,6 +282,11 @@ export const grokPlugin: MonitorPlugin = {
   version: '1.0.0',
   deps: ['storage', 'pricing', 'events'],
   detect,
-  listFiles: async () => listFilesFromRoot(grokRoot()),
+  listFiles: async () => {
+    // 每轮同步开始处无条件重建 sessionId→模型 映射：summary.json 的新增/变更在本轮即生效
+    const root = grokRoot()
+    await loadModelMap(root)
+    return listFilesFromRoot(root)
+  },
   parseFile
 }

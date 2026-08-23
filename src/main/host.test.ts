@@ -4,9 +4,22 @@ import path from 'node:path'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import type { UsageUpdatedEvent } from '../../shared/context'
 import type { MonitorPlugin } from '../../shared/plugin'
+import type { BudgetStatus } from '../../shared/query'
+import type { ModelPricingRow } from '../../shared/tables'
 import { createCollector } from './collector'
 import { createHost } from './host'
 import { registerIpcHandlers, type IpcMainLike } from './ipc/register'
+
+vi.mock('./services/cli-version', () => ({
+  CLI_VERSION_COMMANDS: {
+    claude: 'claude',
+    codex: 'codex',
+    opencode: 'opencode',
+    gemini: 'gemini',
+    grok: 'grok'
+  },
+  detectCliVersion: vi.fn(async (command: string) => (command === 'claude' ? '9.9.9' : null))
+}))
 
 /**
  * 集成测试：宿主装配（createHost）+ 采集（collector.syncAll）+ IPC（registerIpcHandlers）。
@@ -14,7 +27,7 @@ import { registerIpcHandlers, type IpcMainLike } from './ipc/register'
  * claude 插件即扫描临时目录下的 .claude/projects 会话 JSONL。
  */
 
-/** 可注入的 fake ipcMain（记录 handler 并支持同步 invoke） */
+/** 可注入的 fake ipcMain（记录 handler 并支持 invoke；handler 同步抛错转为 rejection，对齐 ipcRenderer.invoke 语义） */
 type FakeIpc = IpcMainLike & {
   invoke(channel: string, ...args: unknown[]): Promise<unknown>
 }
@@ -24,10 +37,10 @@ function makeFakeIpcMain(): FakeIpc {
     handle(channel, listener) {
       handlers.set(channel, listener as (...args: unknown[]) => unknown)
     },
-    invoke(channel, ...args) {
+    async invoke(channel, ...args) {
       const h = handlers.get(channel)
-      if (!h) return Promise.reject(new Error(`No handler for "${channel}"`))
-      return Promise.resolve(h({ sender: {} }, ...args))
+      if (!h) throw new Error(`No handler for "${channel}"`)
+      return h({ sender: {} }, ...args)
     }
   }
 }
@@ -65,11 +78,13 @@ let homeSpy: MockInstance<() => string>
 beforeEach(() => {
   tempHome = mkdtempSync(path.join(os.tmpdir(), 'token-monitor-home-'))
   homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(tempHome)
+  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({}) })))
 })
 
 afterEach(() => {
   homeSpy.mockRestore()
   rmSync(tempHome, { recursive: true, force: true })
+  vi.unstubAllGlobals()
 })
 
 describe('createHost 装配', () => {
@@ -86,6 +101,8 @@ describe('createHost 装配', () => {
       expect(claude?.available).toBe(true)
       expect(claude?.lastSyncAt).toBeNull()
       expect(claude?.errorCount).toBe(0)
+      expect(claude?.cliVersion).toBe('9.9.9')
+      expect(statuses.find((s) => s.id === 'codex')?.cliVersion).toBeUndefined()
     } finally {
       host.dispose()
     }
@@ -100,6 +117,38 @@ describe('createHost 装配', () => {
       const settings = (await ipc.invoke('settings:get')) as { syncIntervalMs: number; retentionDays: number }
       expect(settings.syncIntervalMs).toBe(300_000)
       expect(settings.retentionDays).toBe(90)
+    } finally {
+      host.dispose()
+    }
+  })
+
+  it('IPC 冒烟：budget:status 贯通——今日费用可见，设置预算后超限告警', async () => {
+    // 时间戳取「现在」，保证 rollup 归桶落在本地今天（预算口径为当日/当月）
+    writeClaudeSession('proj-a', 'session-1.jsonl', [
+      claudeLine('claude-sonnet-4-5', 1_000_000, 0, new Date().toISOString())
+    ])
+    const host = await createHost({ dataDir: ':memory:' })
+    const ipc = makeFakeIpcMain()
+    registerIpcHandlers(ipc, host, () => null)
+    try {
+      await host.collector.syncAll()
+
+      // 未设置预算：不告警，但今日费用可见（seed 价 input $3/M → 3 USD）
+      const unset = (await ipc.invoke('budget:status')) as BudgetStatus
+      expect(unset.dailyBudgetUsd).toBeNull()
+      expect(unset.monthlyBudgetUsd).toBeNull()
+      expect(unset.dailyUsageRatio).toBeNull()
+      expect(unset.dailyExceeded).toBe(false)
+      expect(unset.monthlyExceeded).toBe(false)
+      expect(unset.dailyCostUsd).toBe('3')
+
+      // 设置日预算 2 < 今日费用 3 → 日超限；月上限未设 → 月维度不告警
+      host.updateSettings({ dailyBudgetUsd: 2 })
+      const over = await host.getBudgetStatus()
+      expect(over.dailyBudgetUsd).toBe(2)
+      expect(over.dailyExceeded).toBe(true)
+      expect(over.dailyUsageRatio).toBeCloseTo(1.5, 10)
+      expect(over.monthlyExceeded).toBe(false)
     } finally {
       host.dispose()
     }
@@ -361,6 +410,179 @@ describe('createCollector 插件注入', () => {
       }
     } finally {
       rmSync(sessionDir, { recursive: true, force: true })
+    }
+  })
+})
+
+/** models.dev api.json 最小载荷：1 有效 + 1 解析丢弃 + 1 无 models 的 provider */
+const MODELSDEV_PAYLOAD = {
+  anthropic: {
+    name: 'Anthropic',
+    models: {
+      'claude-test-model': {
+        id: 'claude-test-model',
+        name: 'Claude Test',
+        cost: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }
+      },
+      broken: { cost: {} }
+    }
+  },
+  empty: { name: 'Empty' }
+}
+
+function stubModelsDevFetch(): ReturnType<typeof vi.fn> {
+  const fetchMock = vi.fn(async () => ({
+    ok: true,
+    json: async () => MODELSDEV_PAYLOAD
+  }))
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
+}
+
+const MINUTE_MS = 60 * 1000
+
+/** 测试定价项（默认 in 3 / out 15 USD 每百万 → 1M input token = 3 USD） */
+function testPricing(modelId: string, overrides: Partial<ModelPricingRow> = {}): ModelPricingRow {
+  return {
+    model_id: modelId,
+    provider: 'test',
+    input_per_million: 3,
+    output_per_million: 15,
+    cache_read_per_million: 0,
+    cache_creation_per_million: 0,
+    currency: 'USD',
+    cost_multiplier: 1,
+    updated_at: 111,
+    ...overrides
+  }
+}
+
+describe('models.dev 定价目录（T8 主进程侧）', () => {
+  it('默认无条件自动同步：启动即触发一次并入库；retentionDays/syncIntervalMs 不影响调度，pricingSyncIntervalMs 变化以新间隔重启', async () => {
+    vi.useFakeTimers()
+    const fetchMock = stubModelsDevFetch()
+    const host = await createHost({ dataDir: ':memory:' })
+    try {
+      // 启动序列立即同步一次并入库（sync 来源），覆盖 seed 兜底价
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(
+        (await host.storage.getModelPricing()).find((r) => r.model_id === 'claude-test-model')
+      ).toMatchObject({ source: 'sync' })
+
+      // 未满一个周期不触发；此时更新 retentionDays/syncIntervalMs 均不应重置/启停 pricing 调度
+      await vi.advanceTimersByTimeAsync(MINUTE_MS)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      host.updateSettings({ retentionDays: 30 })
+      host.updateSettings({ syncIntervalMs: 60_000 })
+
+      // 自注册起满一个周期（5 分钟）：周期同步触发，且未被设置更新重置
+      await vi.advanceTimersByTimeAsync(MINUTE_MS * 4)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+
+      // 改定价同步间隔为 1 分钟：stop+重启，从变更时刻起按新周期触发
+      host.updateSettings({ pricingSyncIntervalMs: MINUTE_MS })
+      await vi.advanceTimersByTimeAsync(MINUTE_MS)
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+
+      // 继续按新周期（1 分钟）触发，而非原 5 分钟节奏
+      await vi.advanceTimersByTimeAsync(MINUTE_MS)
+      expect(fetchMock).toHaveBeenCalledTimes(4)
+    } finally {
+      host.dispose()
+      vi.unstubAllGlobals()
+      vi.useRealTimers()
+    }
+  })
+
+  it('IPC 冒烟：modelsdev-sync 手动全量同步入库且 pricing:list 可见', async () => {
+    stubModelsDevFetch()
+    const host = await createHost({ dataDir: ':memory:' })
+    const ipc = makeFakeIpcMain()
+    registerIpcHandlers(ipc, host, () => null)
+    try {
+      // 手动全量同步：fetched = imported + skipped
+      await expect(ipc.invoke('pricing:modelsdev-sync')).resolves.toEqual({
+        fetched: 2,
+        imported: 1,
+        skipped: 1
+      })
+
+      const list = (await ipc.invoke('pricing:list')) as Array<{ model_id: string; source: string }>
+      expect(list.find((r) => r.model_id === 'claude-test-model')).toMatchObject({ source: 'sync' })
+    } finally {
+      host.dispose()
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('过期明细清理调度（清理前尽力回填）', () => {
+  it('启动 sweep 先回填再清理：超期零成本明细已删除，其费用保留在日聚合中', async () => {
+    vi.useFakeTimers()
+    // 模型不在 seed 定价目录 → 入库时 calcCost 无价，cost_usd 为 NULL；
+    // created_at 取 400 天前，默认 retentionDays=90 下必过期
+    const oldTs = new Date(Date.now() - 400 * 86_400_000).toISOString()
+    const file = writeClaudeSession('proj-a', 'session-old.jsonl', [
+      claudeLine('unknown-model-x', 1_000_000, 0, oldTs)
+    ])
+    const host = await createHost({ dataDir: ':memory:' })
+    try {
+      // 冲刷启动序列（models.dev 同步 + 零成本回填）：此时模型仍无价，不会提前回填
+      await vi.advanceTimersByTimeAsync(0)
+      await host.collector.syncAll()
+      expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toMatchObject({
+        costUsd: null
+      })
+      expect((await host.usageQuery.getUsageSummary({})).totalCost).toBe('0')
+
+      // 给该模型补价并失效缓存：只有「清理前的回填」能解锁这笔费用
+      await host.storage.updateModelPricing(testPricing('unknown-model-x'))
+      host.pricing.invalidateCache()
+
+      // 推过 RETENTION_SWEEP_DELAY_MS：启动 sweep 执行「先回填 → 后清理」
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // 明细已被清理……
+      expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toBeNull()
+      // ……但 rollup 带上了被清理行的费用（1M input × $3/M = 3 USD）：
+      // 清理只删明细不删 rollup，若清理前未回填，此处将保持 '0'
+      const summary = await host.usageQuery.getUsageSummary({})
+      expect(summary.totalCost).toBe('3')
+      expect(summary.totalRequests).toBe(1)
+    } finally {
+      host.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('回填抛错不阻塞清理：sweep 后旧行仍被删除且宿主保持可用', async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const oldTs = new Date(Date.now() - 400 * 86_400_000).toISOString()
+    const file = writeClaudeSession('proj-a', 'session-old.jsonl', [
+      claudeLine('unknown-model-x', 100, 0, oldTs)
+    ])
+    const host = await createHost({ dataDir: ':memory:' })
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      await host.collector.syncAll()
+      expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).not.toBeNull()
+
+      // 让回填第一步查价即抛错（该行零成本必命中候选，getPrice 必被调用）
+      vi.spyOn(host.pricing, 'getPrice').mockRejectedValue(new Error('pricing unavailable'))
+
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // 回填失败仅记日志，清理照常执行
+      expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toBeNull()
+      expect(errorSpy).toHaveBeenCalledWith('[host] 清理前零成本回填失败:', expect.any(Error))
+      // 宿主未崩溃：查询与退出清理均正常
+      expect((await host.usageQuery.getUsageSummary({})).totalRequests).toBe(1)
+    } finally {
+      errorSpy.mockRestore()
+      host.dispose()
+      vi.useRealTimers()
     }
   })
 })

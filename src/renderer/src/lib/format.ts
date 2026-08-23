@@ -9,15 +9,29 @@ export const APP_META: Record<AppType, { label: string; badge: string }> = {
   grok: { label: 'Grok', badge: 'bg-violet-500/15 text-violet-300 border-violet-500/30' }
 }
 
-/** 千分位 / 缩写展示（1,234 / 1.2k / 3.4M） */
-export function formatNumber(n: number): string {
+/** 去尾零（仅用于 toFixed 输出，恒含小数点，'1.00'→'1'、'1.50'→'1.5'） */
+function trimTrailingZeros(s: string): string {
+  return s.replace(/\.?0+$/, '')
+}
+
+/**
+ * 千分位 / 缩写展示；locale 以 zh 开头时按中文数量级：
+ * ≥1e8 用亿（2 位小数）、≥1e4 用万（1 位小数），其余千分位。
+ */
+export function formatNumber(n: number, locale?: string): string {
+  const lang = locale ?? (typeof navigator !== 'undefined' ? navigator.language : 'en')
+  if (lang.startsWith('zh')) {
+    if (n >= 1e8) return `${trimTrailingZeros((n / 1e8).toFixed(2))}亿`
+    if (n >= 1e4) return `${trimTrailingZeros((n / 1e4).toFixed(1))}万`
+    return n.toLocaleString('zh-CN')
+  }
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
   if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`
   return n.toLocaleString('en-US')
 }
 
-export function formatTokens(n: number): string {
-  return formatNumber(n)
+export function formatTokens(n: number, locale?: string): string {
+  return formatNumber(n, locale)
 }
 
 /** 金额：字符串（避免浮点误差，见 docs/concepts/pricing.md）或数字 → $ 展示 */

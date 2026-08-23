@@ -1,5 +1,5 @@
 import type { UsageRecord } from './dto'
-import type { ModelPricingRow } from './tables'
+import type { ModelPricingRow, PricingSource } from './tables'
 
 /**
  * 数据更新事件负载：同步新增记录后触发，
@@ -26,7 +26,11 @@ export interface StorageService {
   /** 推进增量游标；fileMtime 用于检测文件被 truncate/替换时重置 */
   setCursor(filePath: string, line: number, fileMtime?: number): Promise<void>
   getModelPricing(): Promise<ModelPricingRow[]>
-  updateModelPricing(entry: ModelPricingRow): Promise<void>
+  /**
+   * upsert 单条定价；source 标记来源分级（user > seed/sync）：
+   * user 行不被非 user 写入覆盖，缺省视为 'user'（向后兼容旧调用）。
+   */
+  updateModelPricing(entry: ModelPricingRow, source?: PricingSource): Promise<void>
   deleteModelPricing(modelId: string): Promise<void>
 }
 

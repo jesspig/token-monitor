@@ -3,9 +3,12 @@ import type { RendererApi } from '../../../shared/ipc'
 import type {
   AppSettings,
   AppStats,
+  BudgetStatus,
   DailyStats,
+  HourlyStats,
   LogFilters,
   ModelStats,
+  ModelsDevCatalogEntry,
   PaginatedLogs,
   PluginStatus,
   RequestLogDetail,
@@ -212,6 +215,45 @@ function filterDaily(filters: LogFilters): DailyStats[] {
   })
 }
 
+/** 按本地时区 (dayKey, hour) 双维聚合（与后端 getHourlyTrends 同口径：跨天窗口不合并同钟点；不补零，仅返回有数据的桶） */
+function aggregateHourly(records: RequestLogDetail[]): HourlyStats[] {
+  const map = new Map<string, HourlyStats>()
+  for (const r of records) {
+    const hour = new Date(r.createdAt).getHours()
+    const dayKey = toDateStr(r.createdAt)
+    const key = `${dayKey}T${String(hour).padStart(2, '0')}`
+    let h = map.get(key)
+    if (!h) {
+      h = {
+        hour,
+        dayKey,
+        requestCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        costUsd: '0',
+        successCount: 0,
+        errorCount: 0
+      }
+      map.set(key, h)
+    }
+    h.requestCount += 1
+    h.inputTokens += r.inputTokens
+    h.outputTokens += r.outputTokens
+    h.cacheReadTokens += r.cacheReadTokens
+    h.cacheCreationTokens += r.cacheCreationTokens
+    if (r.costUsd) {
+      h.costUsd = (Number.parseFloat(h.costUsd) + Number.parseFloat(r.costUsd)).toFixed(6)
+    }
+    if (r.status === 'success') h.successCount += 1
+    else h.errorCount += 1
+  }
+  return [...map.values()].sort(
+    (a, b) => (a.dayKey ?? '').localeCompare(b.dayKey ?? '') || a.hour - b.hour
+  )
+}
+
 function aggregateSummary(records: RequestLogDetail[]): UsageSummary {
   let totalRequests = 0
   let successCount = 0
@@ -273,12 +315,50 @@ const PLUGIN_DEFS: Array<{
   reason?: string
   lastSyncAt: number | null
   errorCount: number
+  cliVersion?: string | null
 }> = [
-  { id: 'claude', name: 'Claude Code', available: true, lastSyncAt: NOW - 2 * 60 * 1000, errorCount: 0 },
-  { id: 'codex', name: 'OpenAI Codex', available: true, lastSyncAt: NOW - 9 * 60 * 1000, errorCount: 1 },
-  { id: 'opencode', name: 'OpenCode', available: true, lastSyncAt: NOW - 31 * 60 * 1000, errorCount: 0 },
-  { id: 'gemini', name: 'Gemini CLI', available: false, reason: '未检测到 CLI / 会话目录', lastSyncAt: null, errorCount: 0 },
-  { id: 'grok', name: 'Grok CLI', available: false, reason: '未检测到 CLI / 会话目录', lastSyncAt: null, errorCount: 0 }
+  {
+    id: 'claude',
+    name: 'Claude Code',
+    available: true,
+    lastSyncAt: NOW - 2 * 60 * 1000,
+    errorCount: 0,
+    cliVersion: '2.1.14'
+  },
+  {
+    id: 'codex',
+    name: 'OpenAI Codex',
+    available: true,
+    lastSyncAt: NOW - 9 * 60 * 1000,
+    errorCount: 1,
+    cliVersion: '0.52.0'
+  },
+  {
+    id: 'opencode',
+    name: 'OpenCode',
+    available: true,
+    lastSyncAt: NOW - 31 * 60 * 1000,
+    errorCount: 0,
+    cliVersion: '0.6.3'
+  },
+  {
+    id: 'gemini',
+    name: 'Gemini CLI',
+    available: false,
+    reason: '未检测到 CLI / 会话目录',
+    lastSyncAt: null,
+    errorCount: 0,
+    cliVersion: null
+  },
+  {
+    id: 'grok',
+    name: 'Grok CLI',
+    available: false,
+    reason: '未检测到 CLI / 会话目录',
+    lastSyncAt: null,
+    errorCount: 0,
+    cliVersion: null
+  }
 ]
 
 let PLUGINS: PluginStatus[] = PLUGIN_DEFS.map((p, i) => ({
@@ -290,7 +370,104 @@ let PLUGINS: PluginStatus[] = PLUGIN_DEFS.map((p, i) => ({
 let SETTINGS: AppSettings = {
   syncIntervalMs: 5 * 60 * 1000,
   retentionDays: 30,
-  dataDir: '~/.config/token-monitor'
+  dataDir: '~/.config/token-monitor',
+  dailyBudgetUsd: 10,
+  monthlyBudgetUsd: 200,
+  statsRefreshIntervalMs: 5000,
+  pricingSyncIntervalMs: 300_000
+}
+
+/** 预算占比与超限判定（与主进程 budget.ts 同口径：null/<=0 视同未设置=不告警，严格大于才判超限） */
+function evaluateBudget(costMicro: number, budget: number | null | undefined) {
+  const effective = budget != null && budget > 0 ? budget : null
+  if (effective == null) return { ratio: null as number | null, exceeded: false, normalized: null }
+  const ratio = costMicro / (effective * 1_000_000)
+  return { ratio, exceeded: ratio > 1, normalized: effective }
+}
+
+/** 按当前 Mock 记录集聚合今日/本月费用（本地时区），结合 SETTINGS 预算得出状态 */
+function buildBudgetStatus(): BudgetStatus {
+  const todayKey = toDateStr(NOW)
+  const monthPrefix = todayKey.slice(0, 7)
+  let dailyMicro = 0
+  let monthlyMicro = 0
+  for (const r of ALL_RECORDS) {
+    if (!r.costUsd) continue
+    const micro = Math.round(Number.parseFloat(r.costUsd) * 1_000_000)
+    const key = toDateStr(r.createdAt)
+    if (key === todayKey) dailyMicro += micro
+    if (key.startsWith(monthPrefix)) monthlyMicro += micro
+  }
+  const daily = evaluateBudget(dailyMicro, SETTINGS.dailyBudgetUsd)
+  const monthly = evaluateBudget(monthlyMicro, SETTINGS.monthlyBudgetUsd)
+  return {
+    dailyCostUsd: (dailyMicro / 1_000_000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0',
+    monthlyCostUsd:
+      (monthlyMicro / 1_000_000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0',
+    dailyBudgetUsd: daily.normalized,
+    monthlyBudgetUsd: monthly.normalized,
+    dailyUsageRatio: daily.ratio,
+    monthlyUsageRatio: monthly.ratio,
+    dailyExceeded: daily.exceeded,
+    monthlyExceeded: monthly.exceeded
+  }
+}
+
+/** models.dev 目录 Mock 小样本（确定性，模拟全量同步导入的条目） */
+const MODELSDEV_MOCK_CATALOG: ModelsDevCatalogEntry[] = [
+  {
+    provider: 'anthropic',
+    modelId: 'claude-fable-5',
+    name: 'Claude Fable 5',
+    inputPerMillion: 10,
+    outputPerMillion: 50,
+    cacheReadPerMillion: 1,
+    cacheCreationPerMillion: 12.5
+  },
+  {
+    provider: 'openai',
+    modelId: 'gpt-5.6-sol',
+    name: 'GPT-5.6 Sol',
+    inputPerMillion: 4,
+    outputPerMillion: 20,
+    cacheReadPerMillion: 0.4,
+    cacheCreationPerMillion: 5
+  },
+  {
+    provider: 'google',
+    modelId: 'gemini-3.6-flash',
+    name: 'Gemini 3.6 Flash',
+    inputPerMillion: 1.5,
+    outputPerMillion: 7.5,
+    cacheReadPerMillion: 0.15,
+    cacheCreationPerMillion: 1.5
+  },
+  {
+    provider: 'deepseek',
+    modelId: 'deepseek-v4-pro',
+    name: 'DeepSeek V4 Pro',
+    inputPerMillion: 1.32,
+    outputPerMillion: 3.96,
+    cacheReadPerMillion: 0.044,
+    cacheCreationPerMillion: 1.32
+  }
+]
+
+/** 目录条目 → 定价行并 upsert 进 Mock 定价表（Mock 不区分 seed/sync/user 分级） */
+function upsertCatalogEntry(entry: ModelsDevCatalogEntry): void {
+  const row: ModelPricingRow = {
+    model_id: entry.modelId,
+    provider: entry.provider,
+    input_per_million: entry.inputPerMillion,
+    output_per_million: entry.outputPerMillion,
+    cache_read_per_million: entry.cacheReadPerMillion,
+    cache_creation_per_million: entry.cacheCreationPerMillion,
+    currency: 'USD',
+    cost_multiplier: 1,
+    updated_at: Date.now()
+  }
+  const idx = PRICING.findIndex((p) => p.model_id === row.model_id)
+  PRICING = idx >= 0 ? PRICING.map((p, i) => (i === idx ? row : p)) : [...PRICING, row]
 }
 
 /** 生成与 RendererApi 契约对齐的 Mock 实现 */
@@ -301,6 +478,8 @@ export function createMockApi(): RendererApi {
     getUsageSummary: async (filters) => aggregateSummary(filterRecords(filters)),
 
     getDailyTrends: async (filters) => filterDaily(filters),
+
+    getHourlyTrends: async (filters) => aggregateHourly(filterRecords(filters)),
 
     getRequestLogs: async (filters): Promise<PaginatedLogs> => {
       const page = filters.page ?? 1
@@ -393,16 +572,24 @@ export function createMockApi(): RendererApi {
         .sort((a, b) => b.requestCount - a.requestCount)
     },
 
-    getModelPricing: async () => PRICING,
-
-    updateModelPricing: async (entry) => {
-      const idx = PRICING.findIndex((p) => p.model_id === entry.model_id)
-      const next = { ...entry, updated_at: Date.now() }
-      PRICING = idx >= 0 ? PRICING.map((p, i) => (i === idx ? next : p)) : [...PRICING, next]
+    getFilterOptions: async () => {
+      const models = new Set<string>()
+      const projects = new Set<string>()
+      for (const r of ALL_RECORDS) {
+        if (r.model) models.add(r.model)
+        if (r.project) projects.add(r.project)
+      }
+      return {
+        models: [...models].sort((a, b) => a.localeCompare(b)),
+        projects: [...projects].sort((a, b) => a.localeCompare(b))
+      }
     },
 
-    deleteModelPricing: async (modelId) => {
-      PRICING = PRICING.filter((p) => p.model_id !== modelId)
+    getModelPricing: async () => PRICING,
+
+    syncModelsDevPricing: async () => {
+      for (const entry of MODELSDEV_MOCK_CATALOG) upsertCatalogEntry(entry)
+      return { fetched: 5, imported: MODELSDEV_MOCK_CATALOG.length, skipped: 1 }
     },
 
     listPlugins: async () => PLUGINS,
@@ -416,6 +603,8 @@ export function createMockApi(): RendererApi {
     updateSettings: async (patch) => {
       SETTINGS = { ...SETTINGS, ...patch }
     },
+
+    getBudgetStatus: async () => buildBudgetStatus(),
 
     onUsageUpdated: () => () => {}
   }

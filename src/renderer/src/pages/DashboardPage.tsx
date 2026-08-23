@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react'
 import type { ReactElement } from 'react'
-import { Activity, CircleDollarSign, Database, Gauge, ShieldCheck } from 'lucide-react'
-import type { UsageSummary } from '../../../../shared/query'
-import { isMock } from '../api'
+import { useQuery } from '@tanstack/react-query'
+import { Activity, CircleDollarSign, Database, Gauge, ShieldCheck, TriangleAlert } from 'lucide-react'
+import type { BudgetStatus, UsageSummary } from '../../../../shared/query'
+import { api, isMock } from '../api'
 import { Card } from '../components/Card'
 import { EmptyState } from '../components/EmptyState'
 import { HeroCard } from '../components/HeroCard'
@@ -11,10 +12,20 @@ import { RangeSelector } from '../components/RangeSelector'
 import { StatCard } from '../components/StatCard'
 import { TrendChart } from '../components/TrendChart'
 import { useDailyTrends } from '../hooks/useDailyTrends'
-import { useRequestLogs } from '../hooks/useRequestLogs'
 import { useUsageSummary } from '../hooks/useUsageSummary'
-import { formatHour, formatNumber, formatPercent, formatTokens, formatUsd } from '../lib/format'
-import { RANGE_OPTIONS, rangeToFilters, type RangeKey } from '../lib/range'
+import { formatNumber, formatPercent, formatTokens, formatUsd } from '../lib/format'
+import {
+  RANGE_OPTIONS,
+  customRangeToMs,
+  rangeToFilters,
+  type CustomRange,
+  type RangeKey
+} from '../lib/range'
+
+/** HourlyStats.hour（0–23）→ 'HH:00' 横轴标签，与原 formatHour 视觉一致 */
+function hourLabel(hour: number): string {
+  return `${String(hour).padStart(2, '0')}:00`
+}
 
 const EMPTY_SUMMARY: UsageSummary = {
   totalRequests: 0,
@@ -30,40 +41,91 @@ const EMPTY_SUMMARY: UsageSummary = {
   successRate: 0
 }
 
+/** 预算横幅状态：danger（已超限）/ warning（占比 ≥ 80%）/ 无（未设置预算或占比低） */
+type BudgetBanner = { level: 'danger' | 'warning'; text: string } | null
+
+/**
+ * 预算横幅派生：monthlyExceeded 或 dailyExceeded → danger「费用已超预算:$X / 上限 $Y」；
+ * 未超但任一占比 ≥ 80% → warning 显示占比百分比；未设置预算或占比 < 80% → 不渲染。
+ */
+function deriveBudgetBanner(b: BudgetStatus | undefined): BudgetBanner {
+  if (!b) return null
+  const parts: string[] = []
+  if (b.dailyExceeded) {
+    parts.push(
+      `今日费用已超预算:${formatUsd(b.dailyCostUsd)} / 上限 ${formatUsd(b.dailyBudgetUsd)}`
+    )
+  }
+  if (b.monthlyExceeded) {
+    parts.push(
+      `本月费用已超预算:${formatUsd(b.monthlyCostUsd)} / 上限 ${formatUsd(b.monthlyBudgetUsd)}`
+    )
+  }
+  if (parts.length > 0) return { level: 'danger', text: parts.join('；') }
+
+  const warnParts: string[] = []
+  if (b.dailyUsageRatio != null && b.dailyUsageRatio >= 0.8) {
+    warnParts.push(`今日预算已用 ${formatPercent(b.dailyUsageRatio)}`)
+  }
+  if (b.monthlyUsageRatio != null && b.monthlyUsageRatio >= 0.8) {
+    warnParts.push(`本月预算已用 ${formatPercent(b.monthlyUsageRatio)}`)
+  }
+  if (warnParts.length > 0) return { level: 'warning', text: warnParts.join('；') }
+  return null
+}
+
 /** Dashboard：Hero 汇总卡 + 时间范围筛选 + 请求/Token 迷你趋势 */
 export default function DashboardPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('today')
-  const filters = useMemo(() => rangeToFilters(range), [range])
-  // 今日迷你趋势需要按小时分桶，取请求日志明细
-  const logsFilters = useMemo(() => rangeToFilters(range, { page: 1, pageSize: 500 }), [range])
+  const [customRange, setCustomRange] = useState<CustomRange | null>(null)
+  // custom 且区间合法时按自定义毫秒区间查询，否则回退既有五档（custom 无区间时 rangeToFilters 内部回退 7 天）
+  const filters = useMemo(() => {
+    if (range === 'custom' && customRange) {
+      return rangeToFilters('custom', customRangeToMs(customRange) ?? {})
+    }
+    return rangeToFilters(range)
+  }, [range, customRange])
 
   const summaryQuery = useUsageSummary(filters)
   const dailyQuery = useDailyTrends(filters)
-  const logsQuery = useRequestLogs(logsFilters)
+  // 今日 / 24 小时迷你趋势改由后端按小时分桶（不再取明细在前端分桶，避免大流量日截断）；
+  // queryKey 复用 daily-trends 一级前缀，纳入既有 usage-updated 失效清单
+  const hourlyQuery = useQuery({
+    queryKey: ['daily-trends', 'hourly', filters],
+    queryFn: () => api.getHourlyTrends(filters),
+    enabled: range === 'today' || range === '24h'
+  })
+  // 预算限额状态（全局维度，staleTime 与页面其他查询一致走全局默认）
+  const budgetQuery = useQuery({
+    queryKey: ['budget-status'],
+    queryFn: () => api.getBudgetStatus()
+  })
+
+  const banner = useMemo(() => deriveBudgetBanner(budgetQuery.data), [budgetQuery.data])
 
   const s = summaryQuery.data ?? EMPTY_SUMMARY
-  const rangeLabel = RANGE_OPTIONS.find((o) => o.key === range)?.label ?? ''
+  const rangeLabel = RANGE_OPTIONS.find((o) => o.key === range)?.label ?? (range === 'custom' ? '自定义' : '')
 
   const trend = useMemo(() => {
-    if (range === 'today') {
-      const buckets = new Map<string, { requests: number; tokens: number }>()
-      for (const r of logsQuery.data?.items ?? []) {
-        const label = formatHour(r.createdAt)
-        const b = buckets.get(label) ?? { requests: 0, tokens: 0 }
-        b.requests += 1
-        b.tokens += r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheCreationTokens
-        buckets.set(label, b)
-      }
-      return Array.from(buckets, ([label, v]) => ({ label, ...v })).sort((a, b) =>
-        a.label.localeCompare(b.label)
-      )
+    if (range === 'today' || range === '24h') {
+      const hourly = hourlyQuery.data ?? []
+      const crossDay = new Set(hourly.map((h) => h.dayKey)).size >= 2
+      return hourly.map((h) => ({
+        label:
+          crossDay && h.dayKey
+            ? `${h.dayKey.slice(5)} ${hourLabel(h.hour)}`
+            : hourLabel(h.hour),
+        requests: h.requestCount,
+        tokens:
+          h.inputTokens + h.outputTokens + h.cacheReadTokens + h.cacheCreationTokens
+      }))
     }
     return (dailyQuery.data ?? []).map((d) => ({
       label: d.date.slice(5),
       requests: d.requestCount,
       tokens: d.inputTokens + d.outputTokens + d.cacheReadTokens + d.cacheCreationTokens
     }))
-  }, [range, dailyQuery.data, logsQuery.data])
+  }, [range, dailyQuery.data, hourlyQuery.data])
 
   return (
     <div className="space-y-6">
@@ -76,8 +138,30 @@ export default function DashboardPage(): ReactElement {
               ? '当前展示 Mock 数据，后端 IPC 就绪后自动切换真实数据'
               : 'Token 用量汇总'
         }
-        action={<RangeSelector value={range} onChange={setRange} options={RANGE_OPTIONS} />}
+        action={
+          <RangeSelector
+            value={range}
+            onChange={setRange}
+            options={RANGE_OPTIONS}
+            customRange={customRange}
+            onCustomRangeChange={setCustomRange}
+          />
+        }
       />
+
+      {banner && (
+        <div
+          role="alert"
+          className={`flex items-center gap-2 rounded-lg border px-4 py-3 text-sm ${
+            banner.level === 'danger'
+              ? 'border-red-500/40 bg-red-500/10 text-red-300'
+              : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+          }`}
+        >
+          <TriangleAlert className="h-4 w-4 shrink-0" />
+          <span>{banner.text}</span>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
         <HeroCard
@@ -113,7 +197,7 @@ export default function DashboardPage(): ReactElement {
       </div>
 
       <Card
-        title={`${rangeLabel} 请求 / Token 趋势（${range === 'today' ? '按小时' : '按天'}）`}
+        title={`${rangeLabel} 请求 / Token 趋势（${range === 'today' || range === '24h' ? '按小时' : '按天'}）`}
       >
         {trend.length > 0 ? (
           <TrendChart data={trend} />

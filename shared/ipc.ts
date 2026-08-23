@@ -3,9 +3,13 @@ import type { UsageUpdatedEvent } from './context'
 import type {
   AppSettings,
   AppStats,
+  BudgetStatus,
   DailyStats,
+  FilterOptions,
+  HourlyStats,
   LogFilters,
   ModelStats,
+  ModelsDevSyncResult,
   PaginatedLogs,
   PluginStatus,
   RequestLogDetail,
@@ -28,11 +32,17 @@ export interface RendererApi {
   /** 趋势页：按天聚合序列 */
   getDailyTrends(filters: LogFilters): Promise<DailyStats[]>
 
+  /** 趋势页/Dashboard：今日按小时聚合序列（本地时区，后端分桶；filters 显式时间范围优先） */
+  getHourlyTrends(filters: LogFilters): Promise<HourlyStats[]>
+
   /** 请求日志页：分页查询 */
   getRequestLogs(filters: LogFilters): Promise<PaginatedLogs>
 
   /** 请求日志页：行详情 */
   getRequestLogDetail(id: string): Promise<RequestLogDetail | null>
+
+  /** 请求日志页：模型/项目筛选候选（distinct 非空值，升序） */
+  getFilterOptions(): Promise<FilterOptions>
 
   /** 统计页：按模型聚合 */
   getStatsByModel(filters: LogFilters): Promise<ModelStats[]>
@@ -40,14 +50,11 @@ export interface RendererApi {
   /** 统计页：按应用聚合 */
   getStatsByApp(filters: LogFilters): Promise<AppStats[]>
 
-  /** 定价配置页：价格列表 */
+  /** 定价配置页：价格列表（只读，数据由 models.dev 同步维护） */
   getModelPricing(): Promise<ModelPricingRow[]>
 
-  /** 定价配置页：新增/更新 */
-  updateModelPricing(entry: ModelPricingRow): Promise<void>
-
-  /** 定价配置页：删除 */
-  deleteModelPricing(modelId: string): Promise<void>
+  /** 定价配置页：手动触发 models.dev 全量定价同步（网络失败向上抛） */
+  syncModelsDevPricing(): Promise<ModelsDevSyncResult>
 
   /** 监控源页：插件状态列表 */
   listPlugins(): Promise<PluginStatus[]>
@@ -60,6 +67,9 @@ export interface RendererApi {
 
   /** 设置页：更新（部分字段） */
   updateSettings(patch: Partial<AppSettings>): Promise<void>
+
+  /** Dashboard：预算限额状态（全局日/月费用与上限占比；未设置预算=不告警） */
+  getBudgetStatus(): Promise<BudgetStatus>
 
   /** 数据更新推送（usage-updated，200ms 防抖）；返回取消订阅函数 */
   onUsageUpdated(callback: (payload: UsageUpdatedEvent) => void): () => void

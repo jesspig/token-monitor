@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { ReactElement } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   Area,
   AreaChart,
@@ -11,15 +12,21 @@ import {
   XAxis,
   YAxis
 } from 'recharts'
-import type { DailyStats, RequestLogDetail } from '../../../../shared/query'
+import type { DailyStats, HourlyStats } from '../../../../shared/query'
+import { api } from '../api'
 import { Card } from '../components/Card'
 import { EmptyState } from '../components/EmptyState'
 import { PageHeader } from '../components/PageHeader'
 import { RangeSelector } from '../components/RangeSelector'
 import { useDailyTrends } from '../hooks/useDailyTrends'
-import { useRequestLogs } from '../hooks/useRequestLogs'
-import { formatHour, formatUsd } from '../lib/format'
-import { RANGE_OPTIONS, rangeToFilters, type RangeKey } from '../lib/range'
+import { formatUsd } from '../lib/format'
+import {
+  RANGE_OPTIONS,
+  customRangeToMs,
+  rangeToFilters,
+  type CustomRange,
+  type RangeKey
+} from '../lib/range'
 
 const tooltipStyle = {
   background: '#171717',
@@ -41,35 +48,29 @@ interface TrendRow {
   cost: number
 }
 
-/** 今日：从请求日志明细按小时分桶聚合 */
-function buildHourlyRows(logs: RequestLogDetail[]): TrendRow[] {
-  const buckets = new Map<string, TrendRow>()
-  for (const r of logs) {
-    const label = formatHour(r.createdAt)
-    const b = buckets.get(label)
-    if (b) {
-      b.requestCount += 1
-      b.inputTokens += r.inputTokens
-      b.outputTokens += r.outputTokens
-      b.cacheReadTokens += r.cacheReadTokens
-      b.cacheCreationTokens += r.cacheCreationTokens
-      b.cost += r.costUsd ? Number.parseFloat(r.costUsd) : 0
-    } else {
-      buckets.set(label, {
-        label,
-        requestCount: 1,
-        inputTokens: r.inputTokens,
-        outputTokens: r.outputTokens,
-        cacheReadTokens: r.cacheReadTokens,
-        cacheCreationTokens: r.cacheCreationTokens,
-        cost: r.costUsd ? Number.parseFloat(r.costUsd) : 0
-      })
-    }
-  }
-  return Array.from(buckets.values()).sort((a, b) => a.label.localeCompare(b.label))
+/** HourlyStats.hour（0–23）→ 'HH:00' 横轴标签，与原 formatHour 视觉一致 */
+function hourLabel(hour: number): string {
+  return `${String(hour).padStart(2, '0')}:00`
 }
 
-/** 7 / 30 天：映射按天聚合序列 */
+/** 今日 / 24 小时：映射后端按小时分桶序列（原前端分桶已移除，不再受明细分页截断影响）；
+ * 跨天窗口（≥2 个不同 dayKey）时标签带日期 'MM-DD HH:00'，单一日期维持 'HH:00' */
+function buildHourlyRows(data: HourlyStats[]): TrendRow[] {
+  const rows = data ?? []
+  const crossDay = new Set(rows.map((h) => h.dayKey)).size >= 2
+  return rows.map((h) => ({
+    label:
+      crossDay && h.dayKey ? `${h.dayKey.slice(5)} ${hourLabel(h.hour)}` : hourLabel(h.hour),
+    requestCount: h.requestCount,
+    inputTokens: h.inputTokens,
+    outputTokens: h.outputTokens,
+    cacheReadTokens: h.cacheReadTokens,
+    cacheCreationTokens: h.cacheCreationTokens,
+    cost: Number.parseFloat(h.costUsd)
+  }))
+}
+
+/** 其余范围：映射按天聚合序列 */
 function buildDailyRows(data: DailyStats[]): TrendRow[] {
   return (data ?? []).map((d) => ({
     label: d.date.slice(5),
@@ -82,22 +83,34 @@ function buildDailyRows(data: DailyStats[]): TrendRow[] {
   }))
 }
 
-/** 趋势页：请求 / Token / 成本 时间趋势（今日按小时，7/30 天按天） */
+/** 趋势页：请求 / Token / 成本 时间趋势（今日与 24 小时按小时，其余按天） */
 export default function TrendsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('7d')
-  const filters = useMemo(() => rangeToFilters(range), [range])
+  const [customRange, setCustomRange] = useState<CustomRange | null>(null)
+  // custom 且区间合法时按自定义毫秒区间查询，否则回退既有五档（custom 无区间时 rangeToFilters 内部回退 7 天）
+  const filters = useMemo(() => {
+    if (range === 'custom' && customRange) {
+      return rangeToFilters('custom', customRangeToMs(customRange) ?? {})
+    }
+    return rangeToFilters(range)
+  }, [range, customRange])
   const dailyQuery = useDailyTrends(filters)
-  // 今日请求趋势需按小时分桶，取请求日志明细（与 Dashboard 一致的取数方式）
-  const logsFilters = useMemo(() => rangeToFilters(range, { page: 1, pageSize: 500 }), [range])
-  const logsQuery = useRequestLogs(logsFilters)
+  // 今日小时趋势改由后端分桶（原 pageSize:500 明细截断问题随之消除）；
+  // queryKey 复用 daily-trends 一级前缀，纳入既有 usage-updated 失效清单
+  const hourlyQuery = useQuery({
+    queryKey: ['daily-trends', 'hourly', filters],
+    queryFn: () => api.getHourlyTrends(filters),
+    enabled: range === 'today' || range === '24h'
+  })
 
   const rows = useMemo(() => {
-    if (range === 'today') return buildHourlyRows(logsQuery.data?.items ?? [])
+    if (range === 'today' || range === '24h') return buildHourlyRows(hourlyQuery.data ?? [])
     return buildDailyRows(dailyQuery.data ?? [])
-  }, [range, dailyQuery.data, logsQuery.data])
+  }, [range, dailyQuery.data, hourlyQuery.data])
 
-  const granularity = range === 'today' ? '按小时' : '按天'
-  const loading = rows.length === 0 && (dailyQuery.isLoading || logsQuery.isLoading)
+  const granularity =
+    range === 'today' || range === '24h' ? '按小时' : '按天'
+  const loading = rows.length === 0 && (dailyQuery.isLoading || hourlyQuery.isLoading)
 
   if (loading) {
     return (
@@ -115,7 +128,15 @@ export default function TrendsPage(): ReactElement {
       <PageHeader
         title="趋势"
         description="请求量、Token 消耗与成本的时间趋势"
-        action={<RangeSelector value={range} onChange={setRange} options={RANGE_OPTIONS} />}
+        action={
+          <RangeSelector
+            value={range}
+            onChange={setRange}
+            options={RANGE_OPTIONS}
+            customRange={customRange}
+            onCustomRangeChange={setCustomRange}
+          />
+        }
       />
 
       {rows.length === 0 ? (
@@ -153,6 +174,24 @@ export default function TrendsPage(): ReactElement {
           <Card title={`Token 趋势（${granularity}）：输入 / 输出 / 缓存创建 / 缓存命中 / 成本`}>
             <ResponsiveContainer width="100%" height={280}>
               <AreaChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                <defs>
+                  <linearGradient id="trend-input" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#60a5fa" stopOpacity={0.5} />
+                    <stop offset="100%" stopColor="#60a5fa" stopOpacity={0.03} />
+                  </linearGradient>
+                  <linearGradient id="trend-output" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#34d399" stopOpacity={0.5} />
+                    <stop offset="100%" stopColor="#34d399" stopOpacity={0.03} />
+                  </linearGradient>
+                  <linearGradient id="trend-cache-create" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#fbbf24" stopOpacity={0.5} />
+                    <stop offset="100%" stopColor="#fbbf24" stopOpacity={0.03} />
+                  </linearGradient>
+                  <linearGradient id="trend-cache-read" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#a78bfa" stopOpacity={0.5} />
+                    <stop offset="100%" stopColor="#a78bfa" stopOpacity={0.03} />
+                  </linearGradient>
+                </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
                 <XAxis
                   dataKey="label"
@@ -185,8 +224,7 @@ export default function TrendsPage(): ReactElement {
                   name="输入"
                   stackId="tokens"
                   stroke="#60a5fa"
-                  fill="#60a5fa"
-                  fillOpacity={0.4}
+                  fill="url(#trend-input)"
                 />
                 <Area
                   yAxisId="tokens"
@@ -195,8 +233,7 @@ export default function TrendsPage(): ReactElement {
                   name="输出"
                   stackId="tokens"
                   stroke="#34d399"
-                  fill="#34d399"
-                  fillOpacity={0.4}
+                  fill="url(#trend-output)"
                 />
                 <Area
                   yAxisId="tokens"
@@ -205,8 +242,7 @@ export default function TrendsPage(): ReactElement {
                   name="缓存创建"
                   stackId="tokens"
                   stroke="#fbbf24"
-                  fill="#fbbf24"
-                  fillOpacity={0.4}
+                  fill="url(#trend-cache-create)"
                 />
                 <Area
                   yAxisId="tokens"
@@ -215,8 +251,7 @@ export default function TrendsPage(): ReactElement {
                   name="缓存命中"
                   stackId="tokens"
                   stroke="#a78bfa"
-                  fill="#a78bfa"
-                  fillOpacity={0.4}
+                  fill="url(#trend-cache-read)"
                 />
                 <Line
                   yAxisId="cost"

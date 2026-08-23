@@ -1,8 +1,18 @@
 import type { AppType } from '../../shared/app'
 import type { PluginContext } from '../../shared/context'
-import type { Detection, FileEntry } from '../../shared/dto'
+import type { Detection, FileEntry, UsageRecord } from '../../shared/dto'
 import type { MonitorPlugin } from '../../shared/plugin'
 import type { PluginStatus } from '../../shared/query'
+import { CLI_VERSION_COMMANDS, detectCliVersion } from './services/cli-version'
+
+function isAllZeroUsage(record: UsageRecord): boolean {
+  return (
+    record.inputTokens === 0 &&
+    record.outputTokens === 0 &&
+    record.cacheReadTokens === 0 &&
+    record.cacheCreationTokens === 0
+  )
+}
 
 /**
  * 采集器（docs/concepts/sync-mechanism.md + data-flow.md）。
@@ -106,18 +116,19 @@ export function createCollector(
           // 增量：从游标续读（未同步过为 0）
           const cursor = (await ctx.storage.getCursor(file.path)) ?? 0
           const parsed = await plugin.parseFile(ctx, file.path, cursor)
+          const records = parsed.records.filter((record) => !isAllZeroUsage(record))
 
           // 费用计算回填 costUsd（无定价项则保持 undefined）
-          for (const record of parsed.records) {
+          for (const record of records) {
             const cost = await ctx.pricing.calcCost(record)
             if (cost !== undefined) record.costUsd = cost
           }
 
-          const added = await ctx.storage.recordUsage(parsed.records)
+          const added = await ctx.storage.recordUsage(records)
           // 游标始终按 parseFile 的 nextLine 推进，避免丢行；去重由 storage 处理
           await ctx.storage.setCursor(file.path, parsed.nextLine, file.mtime)
 
-          imported += parsed.records.length
+          imported += records.length
           addedRecords += added
         } catch (err) {
           // 单文件解析抛错：宽松兜底，不阻塞其它文件/插件
@@ -152,8 +163,12 @@ export function createCollector(
   }
 
   async function getPluginStatus(): Promise<PluginStatus[]> {
+    const versions = await Promise.all(
+      plugins.map((plugin) => detectCliVersion(CLI_VERSION_COMMANDS[plugin.id]))
+    )
     const out: PluginStatus[] = []
-    for (const plugin of plugins) {
+    for (let i = 0; i < plugins.length; i++) {
+      const plugin = plugins[i]
       let det: Detection
       try {
         det = await plugin.detect(ctx)
@@ -161,10 +176,12 @@ export function createCollector(
         det = { available: false, reason: '检测异常' }
       }
       const r = getRuntime(plugin.id)
+      const v = versions[i]
       out.push({
         id: plugin.id,
         name: plugin.name,
         version: plugin.version,
+        ...(v ? { cliVersion: v } : {}),
         enabled: isEnabled(plugin.id),
         available: det.available,
         ...(det.reason ? { reason: det.reason } : {}),
