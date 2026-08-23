@@ -11,6 +11,7 @@ import type {
 import type { StorageService } from '../../../shared/context'
 import { createDatabase, migrate, type SqliteDatabase } from './db'
 import { SqliteStorage, openStorage } from './storage'
+import { semanticFingerprint } from './dedup'
 
 /** 构造一条可复用的测试用量记录 */
 function makeRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
@@ -46,7 +47,7 @@ describe('数据库迁移', () => {
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(3)
+      expect(db.pragma('user_version', { simple: true })).toBe(4)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
@@ -300,7 +301,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     expect(db.pragma('user_version', { simple: true })).toBe(2)
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(3)
+    expect(db.pragma('user_version', { simple: true })).toBe(4)
 
     const zeroCount = db.prepare(`SELECT COUNT(*) AS c FROM usage_records WHERE ${ZERO_COND}`).get() as { c: number }
     expect(zeroCount.c).toBe(0)
@@ -375,8 +376,135 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     db.pragma('user_version = 2')
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(3)
+    expect(db.pragma('user_version', { simple: true })).toBe(4)
     expect(snapshot()).toEqual(before)
+  })
+})
+
+describe('v4 迁移：修正 opencode 存量语义标注', () => {
+  const CREATED_AT = new Date('2026-08-19T10:00:00Z').getTime()
+
+  function insertLegacyRecord(
+    db: SqliteDatabase,
+    seed: {
+      id: string
+      app_type: string
+      model: string
+      input_semantics: number
+      cost_usd?: string | null
+      created_at?: number
+    }
+  ): void {
+    db.prepare(
+      `INSERT INTO usage_records (
+        id, data_source, app_type, model, raw_model,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+        input_semantics, cost_usd, currency, latency_ms, project, session_id,
+        status, file_path, line, created_at
+      ) VALUES (
+        @id, @data_source, @app_type, @model, NULL,
+        100, 50, 20, 10,
+        @input_semantics, @cost_usd, NULL, NULL, NULL, NULL,
+        'success', '/legacy/sessions.jsonl', @line, @created_at
+      )`
+    ).run({
+      id: seed.id,
+      data_source: seed.app_type,
+      app_type: seed.app_type,
+      model: seed.model,
+      input_semantics: seed.input_semantics,
+      cost_usd: seed.cost_usd ?? null,
+      created_at: seed.created_at ?? CREATED_AT,
+      line: Number(seed.id.split(':').pop())
+    })
+  }
+
+  /** 已应用 v3 的库（回拨 user_version），插入存量数据后 migrate 即触发 v4 */
+  function makeDirtyV3Db(): SqliteDatabase {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    db.pragma('user_version = 3')
+    return db
+  }
+
+  it('v3 库升级到 v4：opencode 行 semantics 1→2，claude/codex 行不受影响', () => {
+    const db = makeDirtyV3Db()
+    try {
+      insertLegacyRecord(db, {
+        id: 'opencode:/a.jsonl:1',
+        app_type: 'opencode',
+        model: 'qwen3-coder-plus',
+        input_semantics: 1
+      })
+      // 已是 2 的 opencode 行与未知口径 0 行均不在修正范围
+      insertLegacyRecord(db, {
+        id: 'opencode:/a.jsonl:2',
+        app_type: 'opencode',
+        model: 'kimi-k2',
+        input_semantics: 2
+      })
+      insertLegacyRecord(db, {
+        id: 'claude:/b.jsonl:1',
+        app_type: 'claude',
+        model: 'claude-sonnet-4',
+        input_semantics: 1
+      })
+      insertLegacyRecord(db, {
+        id: 'codex:/c.jsonl:1',
+        app_type: 'codex',
+        model: 'gpt-5',
+        input_semantics: 1
+      })
+
+      migrate(db)
+
+      expect(db.pragma('user_version', { simple: true })).toBe(4)
+      const rows = db
+        .prepare('SELECT id, input_semantics FROM usage_records ORDER BY id')
+        .all() as { id: string; input_semantics: number }[]
+      expect(rows).toEqual([
+        { id: 'claude:/b.jsonl:1', input_semantics: 1 },
+        { id: 'codex:/c.jsonl:1', input_semantics: 1 },
+        { id: 'opencode:/a.jsonl:1', input_semantics: 2 },
+        { id: 'opencode:/a.jsonl:2', input_semantics: 2 }
+      ])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('全新库直接建至 v4，重复迁移幂等', () => {
+    const db = createDatabase(':memory:')
+    try {
+      migrate(db)
+      migrate(db) // 第二次执行应无副作用
+      expect(db.pragma('user_version', { simple: true })).toBe(4)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('幂等：回拨版本重跑 v4，已修正数据不变', () => {
+    const db = makeDirtyV3Db()
+    try {
+      insertLegacyRecord(db, {
+        id: 'opencode:/a.jsonl:1',
+        app_type: 'opencode',
+        model: 'qwen3-coder-plus',
+        input_semantics: 1,
+        cost_usd: '0.01'
+      })
+      migrate(db)
+      const snapshot = () => db.prepare('SELECT * FROM usage_records ORDER BY id').all()
+      const before = snapshot()
+
+      db.pragma('user_version = 3')
+      migrate(db)
+      expect(db.pragma('user_version', { simple: true })).toBe(4)
+      expect(snapshot()).toEqual(before)
+    } finally {
+      db.close()
+    }
   })
 })
 
@@ -411,6 +539,66 @@ describe('recordUsage 去重', () => {
       { id: 'claude:/x.jsonl:1', data_source: 'claude' },
       { id: 'codex:/x.jsonl:1', data_source: 'codex' }
     ])
+  })
+
+  it('同 requestId 不同 (file_path, line)：第二次被语义去重拒绝，明细与 rollup 只计一次', async () => {
+    const { storage, db } = makeStorage()
+    const first = makeRecord({ source: { filePath: '/main/a.jsonl', line: 1, requestId: 'msg_001' } })
+    // fork 场景：同一逻辑请求出现在 subagents 文件的不同行
+    const forked = makeRecord({ source: { filePath: '/main/subagents/b.jsonl', line: 42, requestId: 'msg_001' } })
+
+    expect(await storage.recordUsage([first])).toBe(1)
+    expect(await storage.recordUsage([forked])).toBe(0)
+
+    const recordCount = (db.prepare('SELECT COUNT(*) AS c FROM usage_records').get() as { c: number }).c
+    expect(recordCount).toBe(1)
+    const rollup = db.prepare('SELECT * FROM usage_daily_rollups').get() as UsageDailyRollupRow
+    expect(rollup.request_count).toBe(1)
+    expect(rollup.input_tokens).toBe(first.inputTokens)
+    expect(rollup.cost_usd).toBe('0.001')
+  })
+
+  it('同批次内两条同 requestId 记录：仅首条入库', async () => {
+    const { storage, db } = makeStorage()
+    const added = await storage.recordUsage([
+      makeRecord({ source: { filePath: '/a.jsonl', line: 1, requestId: 'msg_002' } }),
+      makeRecord({ source: { filePath: '/a.jsonl', line: 2, requestId: 'msg_002' } })
+    ])
+    expect(added).toBe(1)
+    const recordCount = (db.prepare('SELECT COUNT(*) AS c FROM usage_records').get() as { c: number }).c
+    expect(recordCount).toBe(1)
+    const ledgerCount = (db.prepare('SELECT COUNT(*) AS c FROM dedup_ledger').get() as { c: number }).c
+    expect(ledgerCount).toBe(1)
+  })
+
+  it('无 requestId 记录走旧主键去重，ledger 无行', async () => {
+    const { storage, db } = makeStorage()
+    expect(await storage.recordUsage([makeRecord()])).toBe(1)
+    expect(await storage.recordUsage([makeRecord({ source: { filePath: '/other.jsonl', line: 9 } })])).toBe(1)
+    expect(await storage.recordUsage([makeRecord({ source: { filePath: '/other.jsonl', line: 9 } })])).toBe(0)
+    const ledgerCount = (db.prepare('SELECT COUNT(*) AS c FROM dedup_ledger').get() as { c: number }).c
+    expect(ledgerCount).toBe(0)
+  })
+
+  it('ledger 按 request_id 判定而非指纹：重复 requestId 即使 token 字段不同仍被拒', async () => {
+    const { storage, db } = makeStorage()
+    const first = makeRecord({ source: { filePath: '/a.jsonl', line: 1, requestId: 'msg_003' }, inputTokens: 100 })
+    // 同 requestId 但 token/费用字段不同（如 rewrite 后数值变化）→ 指纹不同仍须按 request_id 拒绝
+    const rewritten = makeRecord({
+      source: { filePath: '/b.jsonl', line: 7, requestId: 'msg_003' },
+      inputTokens: 999,
+      outputTokens: 888,
+      costUsd: '9.99'
+    })
+    expect(await storage.recordUsage([first])).toBe(1)
+    expect(await storage.recordUsage([rewritten])).toBe(0)
+
+    const row = db
+      .prepare('SELECT data_source, request_id, semantic_id FROM dedup_ledger')
+      .get() as { data_source: string; request_id: string; semantic_id: string }
+    expect(row.data_source).toBe('claude')
+    expect(row.request_id).toBe('msg_003')
+    expect(row.semantic_id).toBe(semanticFingerprint(first))
   })
 })
 

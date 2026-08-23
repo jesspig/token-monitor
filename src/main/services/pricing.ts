@@ -40,7 +40,8 @@ const PROVIDER_TOKENS = [
  * 4. 去掉末尾 `[1m]`；
  * 5. `@` → `-`（OpenCode 风格 `@provider/model`），并去掉由此产生的开头 `-`；
  * 6. 去掉常见包装前缀（`provider.model` / `provider_model` → model）；
- * 7. 去掉版本/日期后缀（`-YYYY-MM-DD`、`-YYYYMMDD`）。
+ * 7. 去掉版本/日期后缀（`-YYYY-MM-DD`、`-YYYYMMDD`）；
+ * 8. 去掉 reasoning effort 后缀（`-low` / `-high` / `-xhigh`，单次）。
  */
 export function normalizeModelId(raw: string): string {
   let id = (raw ?? '').trim().toLowerCase()
@@ -74,31 +75,82 @@ export function normalizeModelId(raw: string): string {
   // 7. 版本/日期后缀：-YYYY-MM-DD、-YYYYMMDD
   id = id.replace(/-\d{4}-\d{2}-\d{2}$/, '').replace(/-\d{8}$/, '')
 
+  // 8. reasoning effort 后缀：-low / -high / -xhigh（单次，$ 锚定防误伤 -highish 等）
+  id = id.replace(/-(?:low|high|xhigh)$/, '')
+
   return id
 }
 
 /**
- * 定价匹配（docs/concepts/pricing.md）：
- * 先精确匹配归一化模型 ID；未命中时按「短 ID 匹配带版本/后缀项」兜底
- * （如 gpt-4o-latest → gpt-4o、gemini-2-5-pro-001 → gemini-2-5-pro），
- * 命中要求请求 ID 以定价项为前缀且后继为边界字符（- / . / 数字），避免家族误配。
+ * 家族兜底启用的最短请求 ID 长度：过短前缀（如单双字符）误配面太大，不回退。
  */
-function matchPrice(map: Map<string, ModelPricingRow>, model: string): ModelPricingRow | undefined {
-  const exact = map.get(model)
-  if (exact || !model) return exact
+const MIN_FAMILY_MODEL_LENGTH = 3
 
+/** 前缀后继边界判定：紧随前缀的字符须为分隔符（- / .）或数字，避免家族误配 */
+function hasBoundaryChar(ch: string | undefined): boolean {
+  return ch === '-' || ch === '.' || /\d/.test(ch ?? '')
+}
+
+/** 短 ID 前缀匹配：取最长前缀 key（如 gpt-4o-latest → gpt-4o），要求边界后继 */
+function shortIdPrefix(map: Map<string, ModelPricingRow>, id: string): ModelPricingRow | undefined {
   let best: ModelPricingRow | undefined
   let bestLen = -1
   for (const [key, row] of map) {
-    if (model.length <= key.length || key.length <= bestLen) continue
-    if (!model.startsWith(key)) continue
-    const boundary = model[key.length]
-    if (boundary === '-' || boundary === '.' || /\d/.test(boundary)) {
-      best = row
-      bestLen = key.length
-    }
+    if (id.length <= key.length || key.length <= bestLen) continue
+    if (!id.startsWith(key)) continue
+    if (!hasBoundaryChar(id[key.length])) continue
+    best = row
+    bestLen = key.length
   }
   return best
+}
+
+/**
+ * 定价匹配（docs/concepts/pricing.md），五级兜底链：
+ * 1. 精确匹配归一化模型 ID；
+ * 2. 点转横线变体的精确匹配（claude-sonnet-4.5 → claude-sonnet-4-5）：仅作查价尝试，
+ *    不进入 normalizeModelId（Gemini 等官方 id 自带点号，无条件转换会破坏精确命中）；
+ * 3. 短 ID 匹配带版本/后缀项（gpt-4o-latest → gpt-4o、gemini-2-5-pro-001 → gemini-2-5-pro）；
+ * 4. 点转横线变体的短 ID 匹配（同规则作用于 dotted 变体）；
+ * 5. 家族兜底：请求 ID 为某定价项的前缀时取最短 key（避免过专分档误配，同长取字典序），
+ *    同样要求边界后继，且 model 长度 ≥ MIN_FAMILY_MODEL_LENGTH 才启用。
+ *
+ * 关键排序约束：点号变体的【精确】命中（级 2）必须先于一切前缀模糊匹配（级 3+），
+ * 否则 claude-sonnet-4.5 会被短 ID 'claude-sonnet-4' 截胡（边界字符 '.' 通过判定），
+ * 错配到上一代模型价格（如 opus-4.5 → opus-4，单价差 3 倍）。
+ */
+function matchPrice(map: Map<string, ModelPricingRow>, model: string): ModelPricingRow | undefined {
+  // 级 1：原样精确
+  const exact = map.get(model)
+  if (exact) return exact
+
+  // 级 2：点转横线变体的精确（必须先于短 ID 前缀，防 x.y 被 x 截胡）
+  const dotted = model.replace(/\./g, '-')
+  const viaDotsExact = dotted !== model ? map.get(dotted) : undefined
+  if (viaDotsExact) return viaDotsExact
+
+  // 级 3/4：短 ID 前缀（原样优先于 dotted 变体）
+  const prefixed =
+    shortIdPrefix(map, model) ?? (dotted !== model ? shortIdPrefix(map, dotted) : undefined)
+  if (prefixed) return prefixed
+
+  // 级 5 家族兜底：key 以 model 为前缀且后继为边界字符，取最短 key
+  if (model.length < MIN_FAMILY_MODEL_LENGTH) return undefined
+  let fallback: ModelPricingRow | undefined
+  let fallbackKey = ''
+  for (const [key, row] of map) {
+    if (model.length >= key.length || !key.startsWith(model)) continue
+    if (!hasBoundaryChar(key[model.length])) continue
+    if (
+      !fallback ||
+      key.length < fallbackKey.length ||
+      (key.length === fallbackKey.length && key < fallbackKey)
+    ) {
+      fallback = row
+      fallbackKey = key
+    }
+  }
+  return fallback
 }
 
 /** 微美元 → USD 字符串（与 storage 聚合口径一致：toFixed(6) 后去尾零） */
@@ -992,9 +1044,19 @@ export class PricingServiceImpl implements PricingService {
   }
 
   /**
-   * 估算费用（USD 字符串）：按归一化模型查价后，
-   * 各 token 数 × 对应每百万价格求和（微美元整数精度，避免浮点误差）。
-   * 未找到定价项返回 undefined。
+   * 估算费用（USD 字符串）：按归一化模型查价后，各 token 数 × 对应每百万价格
+   * 求和（微美元整数精度，避免浮点误差）。未找到定价项返回 undefined。
+   *
+   * 输入项按 record.inputSemantics 三态区分口径：
+   * - 0（未知）：inputTokens 视为纯新输入，全额按 input 价计费；
+   * - 1（含缓存总量）：inputTokens 为含缓存的 prompt 总量，先扣除
+   *   cacheReadTokens + cacheCreationTokens 得到纯新输入再计费；
+   * - 2（纯新输入）：同 0，全额计费。
+   *
+   * 五源实际口径：claude / opencode 上游已扣减缓存（=2，不扣）；
+   * codex / gemini / grok 的 input_tokens 为含缓存总量（=1，扣 read+write，
+   * 三源的 write 桶实际恒为 0）。Math.max(0, …) 防御上游异常导致的负数。
+   * cost_multiplier 保持逐项相乘。
    */
   async calcCost(record: UsageRecord): Promise<string | undefined> {
     const map = await this.getPriceMap()
@@ -1002,8 +1064,12 @@ export class PricingServiceImpl implements PricingService {
     if (!pricing) return undefined
 
     const mult = pricing.cost_multiplier ?? 1
+    const freshInput =
+      record.inputSemantics === 1
+        ? Math.max(0, record.inputTokens - record.cacheReadTokens - record.cacheCreationTokens)
+        : record.inputTokens
     const micro = Math.round(
-      record.inputTokens * pricing.input_per_million * mult +
+      freshInput * pricing.input_per_million * mult +
         record.outputTokens * pricing.output_per_million * mult +
         record.cacheReadTokens * pricing.cache_read_per_million * mult +
         record.cacheCreationTokens * pricing.cache_creation_per_million * mult
@@ -1174,6 +1240,155 @@ export async function backfillZeroCost(
     const runTx = db.transaction((items: PendingCostUpdate[], now: number) => {
       for (const p of items) {
         const info = updateRecordStmt.run(p.newCost, p.id)
+        if (info.changes === 0) continue
+        updated++
+        const rollup = getRollupStmt.get(p.dateKey, p.appType, p.model) as
+          | { cost_usd: string }
+          | undefined
+        if (!rollup) continue
+        updateRollupStmt.run(
+          toCostString(toMicroUsd(rollup.cost_usd) + p.deltaMicro),
+          now,
+          p.dateKey,
+          p.appType,
+          p.model
+        )
+      }
+    })
+    runTx(pending, Date.now())
+  }
+
+  return { scanned: candidates.length, updated }
+}
+
+/** 缓存口径存量重算结果统计 */
+export interface RecalcResult {
+  /** 扫描到的候选明细行数（codex/gemini/grok 且 semantics=1，含因无价或重算一致被跳过的行） */
+  scanned: number
+  /** 实际更新费用的明细行数 */
+  updated: number
+}
+
+/** 重算产出的待应用更新：在通用字段上追加旧费用原值，供阶段二乐观守卫 NULL 安全比对 */
+interface PendingRecalcUpdate extends PendingCostUpdate {
+  oldCostUsd: string | null
+}
+
+/**
+ * 存量缓存口径费用重算：计费语义修复前，codex/gemini/grok 三源历史明细
+ * （input 为含缓存总量，semantics=1）按「input 全额计价」被系统性高估；
+ * 本函数扫描这三源的 semantics=1 行，以新公式（calcCost 内先扣减
+ * cacheRead+cacheCreation 再计价）按当前活定价重算并回写，同时把差额增量
+ * 累加到对应 (date, app_type, model) 日聚合，维持不变量
+ * 「rollup.cost_usd ≡ 组内全部明细 cost 之和」。rollup 行不存在时不创建。
+ *
+ * 触发时机：宿主启动序列异步调用一次。定价随 models.dev 同步持续漂移，
+ * 而迁移函数为同步纯 SQL 拿不到活定价，故不在 v4 迁移内做（opencode 的
+ * semantics 错标则由 v4 迁移直接修正）；公式级修复执行一次即可，
+ * 不挂进 models.dev 同步链路。
+ *
+ * 幂等：重算值与现值一致（delta = 0）即跳过，不产生任何写入，
+ * 后续重复调用 updated = 0。候选行 semantics 不改写，重复扫描无害。
+ *
+ * 两阶段结构与守卫同 backfillZeroCost：阶段一在事务外逐行取价与计算，
+ * 阶段二单同步事务原子提交；UPDATE 附带 cost_usd 原值的 IS 守卫
+ * （NULL 与非 NULL 统一判定），防止覆盖并发写入的真实费用。
+ */
+export async function recalcCachedInputCosts(
+  db: SqliteDatabase,
+  pricing: PricingService
+): Promise<RecalcResult> {
+  const candidates = db
+    .prepare(
+      `
+      SELECT id, app_type, model, input_tokens, output_tokens,
+             cache_read_tokens, cache_creation_tokens, input_semantics,
+             cost_usd, created_at, file_path, line
+      FROM usage_records
+      WHERE app_type IN ('codex', 'gemini', 'grok') AND input_semantics = 1
+      `
+    )
+    .all() as Pick<
+    UsageRecordRow,
+    | 'id'
+    | 'app_type'
+    | 'model'
+    | 'input_tokens'
+    | 'output_tokens'
+    | 'cache_read_tokens'
+    | 'cache_creation_tokens'
+    | 'input_semantics'
+    | 'cost_usd'
+    | 'created_at'
+    | 'file_path'
+    | 'line'
+  >[]
+
+  // 阶段一（事务外）：逐行查价并按新公式重算费用。rollup 归桶用 model 原值（与 recordUsage 一致），计费才归一化。
+  const pending: PendingRecalcUpdate[] = []
+  for (const row of candidates) {
+    const priced = await pricing.getPrice(normalizeModelId(row.model))
+    if (!priced) continue
+    const allFree =
+      priced.input_per_million === 0 &&
+      priced.output_per_million === 0 &&
+      priced.cache_read_per_million === 0 &&
+      priced.cache_creation_per_million === 0
+    if (allFree) continue
+
+    const newCost = await pricing.calcCost({
+      appType: row.app_type,
+      model: row.model,
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+      cacheReadTokens: row.cache_read_tokens,
+      cacheCreationTokens: row.cache_creation_tokens,
+      inputSemantics: row.input_semantics,
+      createdAt: row.created_at,
+      source: { filePath: row.file_path, line: row.line }
+    })
+    if (newCost == null) continue
+
+    const newMicro = toMicroUsd(newCost)
+    const oldMicro = toMicroUsd(row.cost_usd)
+    // 重算一致即跳过：幂等关键，不产生任何写入
+    if (newMicro === oldMicro) continue
+
+    pending.push({
+      id: row.id,
+      newCost,
+      deltaMicro: newMicro - oldMicro,
+      dateKey: toDateKey(row.created_at),
+      appType: row.app_type,
+      model: row.model,
+      oldCostUsd: row.cost_usd
+    })
+  }
+
+  // 阶段二：单同步事务内原子更新明细与日聚合；IS 守卫对旧值 NULL/非 NULL 统一成立
+  let updated = 0
+  if (pending.length > 0) {
+    const updateRecordStmt = db.prepare(
+      `
+      UPDATE usage_records SET cost_usd = ?
+      WHERE id = ? AND cost_usd IS ?
+      `
+    )
+    const getRollupStmt = db.prepare(
+      `
+      SELECT cost_usd FROM usage_daily_rollups
+      WHERE date = ? AND app_type = ? AND model = ?
+      `
+    )
+    const updateRollupStmt = db.prepare(
+      `
+      UPDATE usage_daily_rollups SET cost_usd = ?, updated_at = ?
+      WHERE date = ? AND app_type = ? AND model = ?
+      `
+    )
+    const runTx = db.transaction((items: PendingRecalcUpdate[], now: number) => {
+      for (const p of items) {
+        const info = updateRecordStmt.run(p.newCost, p.id, p.oldCostUsd)
         if (info.changes === 0) continue
         updated++
         const rollup = getRollupStmt.get(p.dateKey, p.appType, p.model) as

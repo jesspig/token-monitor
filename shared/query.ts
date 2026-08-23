@@ -110,7 +110,7 @@ export interface RequestLogDetail {
   outputTokens: number
   cacheReadTokens: number
   cacheCreationTokens: number
-  /** 输入语义：0=未知 / 1=含缓存写 / 2=纯新输入 */
+  /** 输入语义：0=未知 / 1=input 为含缓存读写的总量(计费前需扣减缓存) / 2=input 已为纯新输入 */
   inputSemantics: number
   costUsd: string | null
   currency: string | null

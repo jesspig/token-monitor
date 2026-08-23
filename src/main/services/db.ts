@@ -55,7 +55,11 @@ function microUsdToCostString(micro: number): string {
  *      使既有用户可见数据不被后续 seed/sync 同步覆盖）；
  * v3 = 清理四项 token 全为 0 的异常明细，并按剩余明细重建受影响日期的日聚合
  *      （聚合口径与 storage.recordUsage 一致；sync_cursors 游标不动；
- *      幂等：重复执行时无全零行即无操作）。
+ *      幂等：重复执行时无全零行即无操作）；
+ * v4 = 修正 opencode 存量行的语义标注（input_semantics 1→2：上游已核实其 input
+ *      本为纯新输入）；codex/gemini/grok 的历史费用重算不在迁移内做——migrate()
+ *      为同步函数拿不到活定价，由 pricing.recalcCachedInputCosts 在宿主启动时
+ *      以当前定价重算并增量修正日聚合。
  * 字段/主键/索引与 shared/tables.ts 及 docs/concepts/data-model.md 一致。
  */
 const MIGRATIONS: Migration[] = [
@@ -227,6 +231,19 @@ const MIGRATIONS: Migration[] = [
           })
         }
       }
+    }
+  },
+  {
+    version: 4,
+    up(db) {
+      // opencode 源经上游核实 input 本已是纯新输入（与 claude 同为 semantics=2），
+      // 存量错标为 1 的行统一改为 2；条件收敛使重复执行无操作（幂等）。
+      // codex/gemini/grok 的历史费用重算需要活定价，由宿主启动时的
+      // pricing.recalcCachedInputCosts 完成（见 pricing.ts）。
+      db.prepare(
+        `UPDATE usage_records SET input_semantics = 2
+         WHERE app_type = 'opencode' AND input_semantics = 1`
+      ).run()
     }
   }
 ]

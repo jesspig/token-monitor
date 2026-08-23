@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import type { UsageUpdatedEvent } from '../../shared/context'
 import type { MonitorPlugin } from '../../shared/plugin'
 import type { BudgetStatus } from '../../shared/query'
+import type { ModelPricingRow } from '../../shared/tables'
 import { createCollector } from './collector'
 import { createHost } from './host'
 import { registerIpcHandlers, type IpcMainLike } from './ipc/register'
@@ -440,6 +441,22 @@ function stubModelsDevFetch(): ReturnType<typeof vi.fn> {
 
 const MINUTE_MS = 60 * 1000
 
+/** 测试定价项（默认 in 3 / out 15 USD 每百万 → 1M input token = 3 USD） */
+function testPricing(modelId: string, overrides: Partial<ModelPricingRow> = {}): ModelPricingRow {
+  return {
+    model_id: modelId,
+    provider: 'test',
+    input_per_million: 3,
+    output_per_million: 15,
+    cache_read_per_million: 0,
+    cache_creation_per_million: 0,
+    currency: 'USD',
+    cost_multiplier: 1,
+    updated_at: 111,
+    ...overrides
+  }
+}
+
 describe('models.dev 定价目录（T8 主进程侧）', () => {
   it('默认无条件自动同步：启动即触发一次并入库；retentionDays/syncIntervalMs 不影响调度，pricingSyncIntervalMs 变化以新间隔重启', async () => {
     vi.useFakeTimers()
@@ -496,6 +513,76 @@ describe('models.dev 定价目录（T8 主进程侧）', () => {
     } finally {
       host.dispose()
       vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('过期明细清理调度（清理前尽力回填）', () => {
+  it('启动 sweep 先回填再清理：超期零成本明细已删除，其费用保留在日聚合中', async () => {
+    vi.useFakeTimers()
+    // 模型不在 seed 定价目录 → 入库时 calcCost 无价，cost_usd 为 NULL；
+    // created_at 取 400 天前，默认 retentionDays=90 下必过期
+    const oldTs = new Date(Date.now() - 400 * 86_400_000).toISOString()
+    const file = writeClaudeSession('proj-a', 'session-old.jsonl', [
+      claudeLine('unknown-model-x', 1_000_000, 0, oldTs)
+    ])
+    const host = await createHost({ dataDir: ':memory:' })
+    try {
+      // 冲刷启动序列（models.dev 同步 + 零成本回填）：此时模型仍无价，不会提前回填
+      await vi.advanceTimersByTimeAsync(0)
+      await host.collector.syncAll()
+      expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toMatchObject({
+        costUsd: null
+      })
+      expect((await host.usageQuery.getUsageSummary({})).totalCost).toBe('0')
+
+      // 给该模型补价并失效缓存：只有「清理前的回填」能解锁这笔费用
+      await host.storage.updateModelPricing(testPricing('unknown-model-x'))
+      host.pricing.invalidateCache()
+
+      // 推过 RETENTION_SWEEP_DELAY_MS：启动 sweep 执行「先回填 → 后清理」
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // 明细已被清理……
+      expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toBeNull()
+      // ……但 rollup 带上了被清理行的费用（1M input × $3/M = 3 USD）：
+      // 清理只删明细不删 rollup，若清理前未回填，此处将保持 '0'
+      const summary = await host.usageQuery.getUsageSummary({})
+      expect(summary.totalCost).toBe('3')
+      expect(summary.totalRequests).toBe(1)
+    } finally {
+      host.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('回填抛错不阻塞清理：sweep 后旧行仍被删除且宿主保持可用', async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const oldTs = new Date(Date.now() - 400 * 86_400_000).toISOString()
+    const file = writeClaudeSession('proj-a', 'session-old.jsonl', [
+      claudeLine('unknown-model-x', 100, 0, oldTs)
+    ])
+    const host = await createHost({ dataDir: ':memory:' })
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      await host.collector.syncAll()
+      expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).not.toBeNull()
+
+      // 让回填第一步查价即抛错（该行零成本必命中候选，getPrice 必被调用）
+      vi.spyOn(host.pricing, 'getPrice').mockRejectedValue(new Error('pricing unavailable'))
+
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // 回填失败仅记日志，清理照常执行
+      expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toBeNull()
+      expect(errorSpy).toHaveBeenCalledWith('[host] 清理前零成本回填失败:', expect.any(Error))
+      // 宿主未崩溃：查询与退出清理均正常
+      expect((await host.usageQuery.getUsageSummary({})).totalRequests).toBe(1)
+    } finally {
+      errorSpy.mockRestore()
+      host.dispose()
+      vi.useRealTimers()
     }
   })
 })
