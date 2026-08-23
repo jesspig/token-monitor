@@ -4,7 +4,7 @@
 
 - Electron + TypeScript 桌面工具：监控多个 AI 编程 CLI 的 Token 用量与费用；采集方式为扫描各 CLI 本地会话日志，**不做代理拦截**。
 - **改代码前先读 `docs/index.md`**：`docs/` 知识库是唯一设计依据，全部概念页已与实现对齐（2026-08-21 审计 + 2026-08-23 第五轮迭代同步）。既定技术栈（Electron / electron-vite / React + Tailwind + TanStack Query + Recharts / better-sqlite3 / chokidar）勿擅自更改。
-- 第一阶段已交付：插件宿主 + 5 个内置监控插件（claude / codex / opencode / gemini / grok）；2026-08-23 第五轮迭代（对标 cc-switch）完成计费语义修复、语义去重接入、定价匹配增强，并完成各 CLI 最新版日志格式联网复核与兼容（claude 按 message.id 折叠流式分片；gemini 双格式兼容新版 append-only JSONL；codex output 已含 reasoning 勿加速率）。当前 typecheck / 297 单测 / 构建全部通过。
+- 第一阶段已交付：插件宿主 + 5 个内置监控插件（claude / codex / opencode / gemini / grok）；2026-08-23 第五轮迭代（对标 cc-switch）完成计费语义修复、语义去重接入、定价匹配增强，并完成各 CLI 最新版日志格式联网复核与兼容（claude 按 message.id 折叠流式分片；gemini 双格式兼容新版 append-only JSONL；codex output 已含 reasoning 勿加速率）；同日接入 pi / zcode / dsh 三个监控插件（内置 8 个；dsh 引入纯 JS 解压依赖 fzstd，禁止 napi 系 zstd 包以防 ABI 坑）。当前 typecheck / 346 单测 / 构建全部通过。
 
 ## 命令
 
@@ -34,7 +34,7 @@
 - 计费语义：`input_semantics` 三态（0=未知 / 1=含缓存总量需扣减 / 2=纯新输入）；codex/gemini/grok=1、claude/opencode=2；`calcCost` 对 semantics=1 先扣缓存再乘价；存量高估费用由 `pricing.recalcCachedInputCosts` 启动重算（v4 迁移只修 opencode 标注）。
 - 关键默认值：兜底同步间隔 5 分钟（设置可调）；明细保留 90 天、日聚合永不清理、**保留清理前先尽力零成本回填**；事件 `usage-updated` 200ms 防抖、watcher 500ms 防抖；seed 定价 99 个模型（USD）。
 - 定价为只读 + models.dev 每 5 分钟自动同步：手动更新/删除定价的 IPC 通道已删除，定价写入唯一入口是 models.dev 同步链路（`host.syncModelsDevPricing` 内部先 `invalidateCache` 再回填），无需手动调缓存失效。
-- 各 CLI 数据源差异大（opencode 为 SQLite db 双源、gemini 为新版 JSONL + legacy 单 JSON 双格式、grok 靠 summary.json 建 sessionId→模型映射、claude 同轮多行需按 message.id 折叠），改插件前先读 `docs/concepts/monitor-plugins.md` 的实际清单。
+- 各 CLI 数据源差异大（opencode/zcode 为 SQLite 只读源、gemini 双格式 JSONL+legacy JSON、grok 靠 summary.json 建 sessionId→模型映射、claude 同轮多行需按 message.id 折叠、dsh 默认 zstd 压缩需 fzstd 解压），改插件前先读 `docs/concepts/monitor-plugins.md` 的实际清单。
 
 ## 行为约束
 
