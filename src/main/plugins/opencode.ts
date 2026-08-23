@@ -12,6 +12,8 @@ import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../s
  *  - 新版（1.2+）：SQLite 数据根/opencode.db（message/session 表）
  *  - 旧版：数据根/storage/message/*.json（每文件一条消息 JSON）
  * 数据根可用 $OPENCODE_HOME 覆盖，默认 ~/.local/share/opencode。
+ * WAL 感知：SQLite WAL 模式下新写入先落 -wal 文件，db 源条目 mtime 取主库与 -wal 的较大值，
+ * 避免 watcher 因主库 mtime 长期不变而漏检（实时性退化为兜底扫描）。
  */
 
 /** db 源标识：parseFile 按 path 末尾分派；db 行 source.filePath 恒为该常量（去重键稳定） */
@@ -48,15 +50,23 @@ function safeReaddir(dir: string): fs.Dirent[] {
   }
 }
 
-/** 文件条目：path + mtime（epoch ms；stat 失败按 0 兜底） */
-function toEntry(p: string): FileEntry {
-  let mtime = 0
+/** stat 文件 mtime（epoch ms；stat 失败按 0 兜底） */
+export function statMtimeMs(p: string): number {
   try {
-    mtime = Math.round(fs.statSync(p).mtimeMs)
+    return Math.round(fs.statSync(p).mtimeMs)
   } catch {
-    mtime = 0
+    return 0
   }
-  return { path: p, mtime }
+}
+
+/** 多路径 mtime 最大值（WAL 感知用）；全失败 → 0 */
+export function maxMtime(paths: string[]): number {
+  return paths.reduce((m, p) => Math.max(m, statMtimeMs(p)), 0)
+}
+
+/** 文件条目：path + mtime（epoch ms） */
+function toEntry(p: string): FileEntry {
+  return { path: p, mtime: statMtimeMs(p) }
 }
 
 /** 是否候选 JSON 消息文件：仅 *.json，过滤临时/隐藏文件（*.tmp、*.swp、.*、*~） */
@@ -91,7 +101,8 @@ function collectSessionDir(dir: string, out: FileEntry[]): void {
 export function listFilesFromRoot(root: string): FileEntry[] {
   const dbPath = dbPathOf(root)
   if (fs.existsSync(dbPath)) {
-    return [toEntry(dbPath)]
+    // WAL 感知：mtime 取主库与 -wal 较大值；path 保持 dbPath（去重键稳定）
+    return [{ path: dbPath, mtime: maxMtime([dbPath, dbPath + '-wal']) }]
   }
   const out: FileEntry[] = []
   collectMessageDir(messageDirOf(root), out)
@@ -143,7 +154,14 @@ function toTs(v: unknown): number {
  */
 function toUsageRecordFromData(
   data: unknown,
-  opts: { filePath: string; line: number; project?: string; sessionId?: string; createdAt?: number }
+  opts: {
+    filePath: string
+    line: number
+    project?: string
+    sessionId?: string
+    createdAt?: number
+    requestId?: string
+  }
 ): UsageRecord | null {
   if (!data || typeof data !== 'object') return null
   const d = data as Record<string, unknown>
@@ -163,6 +181,11 @@ function toUsageRecordFromData(
   if (!Number.isFinite(createdAt) || createdAt <= 0) createdAt = toTs(opts.createdAt)
   if (!Number.isFinite(createdAt) || createdAt <= 0) createdAt = Date.now()
 
+  // 语义 ID:优先 db 行主键(opts.requestId),其次旧版 JSON 消息自带 d.id;
+  // fork/rewrite 语义去重依赖该字段,string 非空才设,缺失退回 (file,line) 主键去重
+  const hasId = (v: unknown): v is string => typeof v === 'string' && v.trim() !== ''
+  const requestId = hasId(opts.requestId) ? opts.requestId : hasId(d.id) ? d.id : undefined
+
   return {
     appType: 'opencode',
     model,
@@ -171,12 +194,14 @@ function toUsageRecordFromData(
     outputTokens: toNum(t.output),
     cacheReadTokens: toNum(cache.read),
     cacheCreationTokens: toNum(cache.write),
-    inputSemantics: 1, // 含缓存写
+    // 上游 getUsage 已执行 adjustedInputTokens = input − cacheRead − cacheWrite,
+    // tokens.input 即纯新输入,四项互不重叠 → semantics=2(pricing 不再扣减)
+    inputSemantics: 2,
     status: 'success',
     createdAt,
     project: opts.project ?? (typeof d.directory === 'string' ? d.directory : undefined),
     sessionId: opts.sessionId ?? (typeof d.sessionID === 'string' ? d.sessionID : undefined),
-    source: { filePath: opts.filePath, line: opts.line }
+    source: { filePath: opts.filePath, line: opts.line, requestId }
   }
 }
 
@@ -229,7 +254,8 @@ export function parseDbFile(dbPath: string, fromLine: number): ParsedResult {
         line,
         project: row.project_dir ?? undefined,
         sessionId: row.session_id ?? undefined,
-        createdAt: row.time_created
+        createdAt: row.time_created,
+        requestId: row.id
       })
       if (record) records.push(record)
     }

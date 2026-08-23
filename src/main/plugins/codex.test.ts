@@ -13,14 +13,15 @@ const ctx = {} as PluginContext
  * { type: session_meta|turn_context|event_msg, timestamp, payload }。
  */
 
-/** session_meta 行：payload.cwd = 工作目录、payload.id = 会话 id；id/cwd 传 null 可省略该字段 */
-const sessionMetaLine = (o: { id?: string | null; cwd?: string | null } = {}): string =>
+/** session_meta 行：payload.cwd = 工作目录、payload.id = 会话 id、payload.thread_id = 语义线程 id；传 null 可省略该字段 */
+const sessionMetaLine = (o: { id?: string | null; cwd?: string | null; threadId?: string | null } = {}): string =>
   JSON.stringify({
     type: 'session_meta',
     timestamp: '2026-08-19T09:00:00+08:00',
     payload: {
       ...(o.id === null ? {} : { id: o.id ?? 'sess-1' }),
       ...(o.cwd === null ? {} : { cwd: o.cwd ?? '/Users/a/b' }),
+      ...(o.threadId ? { thread_id: o.threadId } : {}),
       model: 'gpt-5' // 注意：session_meta.model 不作为「当前模型」
     }
   })
@@ -301,6 +302,46 @@ describe('parseFile 增量解析', () => {
     expect(r2.records).toHaveLength(0)
     expect(r2.nextLine).toBe(99)
     expect(r2.eof).toBe(true)
+  })
+
+  it('thread_id + 行 timestamp + 用量组合为 source.requestId；成分缺失时不设置', async () => {
+    // 全成分齐备：requestId = <threadId>:<行顶层timestamp>:<input>-<cached>-<output>
+    const f1 = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      f1,
+      [sessionMetaLine({ threadId: 'thr-9' }), turnContextLine(), tokenCountLine()].join('\n'),
+      'utf8'
+    )
+    const r1 = await codexPlugin.parseFile(ctx, f1, 0)
+    expect(r1.records).toHaveLength(1)
+    expect(r1.records[0].source).toEqual({
+      filePath: f1,
+      line: 3,
+      requestId: 'thr-9:2026-08-19T09:00:02+08:00:100-20-50'
+    })
+
+    // 无 session_meta（无 threadId）→ 不设置 requestId，其余解析不变
+    const f2 = path.join(tmpDir, 'rollout-noMeta.jsonl')
+    fs.writeFileSync(f2, [turnContextLine(), tokenCountLine()].join('\n'), 'utf8')
+    const r2 = await codexPlugin.parseFile(ctx, f2, 0)
+    expect(r2.records).toHaveLength(1)
+    expect(r2.records[0].source.requestId).toBeUndefined()
+    expect('requestId' in r2.records[0].source).toBe(false)
+
+    // session_meta 有 thread_id 但 token_count 行无顶层 timestamp → 不设置
+    const f3 = path.join(tmpDir, 'rollout-noTs.jsonl')
+    fs.writeFileSync(
+      f3,
+      [
+        sessionMetaLine({ threadId: 'thr-9' }),
+        turnContextLine(),
+        tokenCountLine({ timestamp: null, infoTime: '2026-08-19T09:00:05+08:00' })
+      ].join('\n'),
+      'utf8'
+    )
+    const r3 = await codexPlugin.parseFile(ctx, f3, 0)
+    expect(r3.records).toHaveLength(1)
+    expect(r3.records[0].source.requestId).toBeUndefined()
   })
 
   it('尾部半行补全后，从 nextLine 续读只产出新增（line 5），不重放 line 3', async () => {

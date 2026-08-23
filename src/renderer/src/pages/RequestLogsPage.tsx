@@ -17,7 +17,7 @@ import {
   formatTokens,
   formatUsd
 } from '../lib/format'
-import { RANGE_OPTIONS, rangeToFilters, type RangeKey } from '../lib/range'
+import { RANGE_OPTIONS, customRangeToMs, rangeToFilters, type CustomRange, type RangeKey } from '../lib/range'
 
 type StatusFilter = 'all' | 'success' | 'error'
 
@@ -36,6 +36,7 @@ const TD = 'px-3 py-2 text-sm text-neutral-300'
 /** 请求日志页：筛选栏 + 分页表格 + 行详情抽屉 */
 export default function RequestLogsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('30d')
+  const [customRange, setCustomRange] = useState<CustomRange | null>(null)
   const [appTypes, setAppTypes] = useState<AppType[]>([])
   const [models, setModels] = useState<string[]>([])
   const [project, setProject] = useState('')
@@ -56,7 +57,9 @@ export default function RequestLogsPage(): ReactElement {
 
   const filters = useMemo<LogFilters>(
     () => ({
-      ...rangeToFilters(range),
+      ...(range === 'custom' && customRange
+        ? rangeToFilters('custom', customRangeToMs(customRange) ?? {})
+        : rangeToFilters(range)),
       appTypes: appTypes.length > 0 ? appTypes : undefined,
       models: models.length > 0 ? models : undefined,
       status: status === 'all' ? undefined : status,
@@ -65,7 +68,7 @@ export default function RequestLogsPage(): ReactElement {
       page,
       pageSize: 15
     }),
-    [range, appTypes, models, status, keyword, knownProject, page]
+    [range, customRange, appTypes, models, status, keyword, knownProject, page]
   )
 
   const { data, isLoading } = useRequestLogs(filters)
@@ -74,6 +77,11 @@ export default function RequestLogsPage(): ReactElement {
 
   const changeRange = (r: RangeKey): void => {
     setRange(r)
+    setPage(1)
+  }
+
+  const changeCustomRange = (r: CustomRange | null): void => {
+    setCustomRange(r)
     setPage(1)
   }
 
@@ -113,7 +121,13 @@ export default function RequestLogsPage(): ReactElement {
 
       {/* 筛选栏：时间范围 + 应用 + 关键字 + 状态 + 模型多选 + 项目 */}
       <div className="flex flex-wrap items-center gap-2">
-        <RangeSelector value={range} onChange={changeRange} options={RANGE_OPTIONS} />
+        <RangeSelector
+          value={range}
+          onChange={changeRange}
+          options={RANGE_OPTIONS}
+          customRange={customRange}
+          onCustomRangeChange={changeCustomRange}
+        />
 
         <div className="flex flex-wrap items-center gap-1.5">
           <button

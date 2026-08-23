@@ -14,7 +14,13 @@ import { TrendChart } from '../components/TrendChart'
 import { useDailyTrends } from '../hooks/useDailyTrends'
 import { useUsageSummary } from '../hooks/useUsageSummary'
 import { formatNumber, formatPercent, formatTokens, formatUsd } from '../lib/format'
-import { RANGE_OPTIONS, rangeToFilters, type RangeKey } from '../lib/range'
+import {
+  RANGE_OPTIONS,
+  customRangeToMs,
+  rangeToFilters,
+  type CustomRange,
+  type RangeKey
+} from '../lib/range'
 
 /** HourlyStats.hour（0–23）→ 'HH:00' 横轴标签，与原 formatHour 视觉一致 */
 function hourLabel(hour: number): string {
@@ -71,7 +77,14 @@ function deriveBudgetBanner(b: BudgetStatus | undefined): BudgetBanner {
 /** Dashboard：Hero 汇总卡 + 时间范围筛选 + 请求/Token 迷你趋势 */
 export default function DashboardPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('today')
-  const filters = useMemo(() => rangeToFilters(range), [range])
+  const [customRange, setCustomRange] = useState<CustomRange | null>(null)
+  // custom 且区间合法时按自定义毫秒区间查询，否则回退既有五档（custom 无区间时 rangeToFilters 内部回退 7 天）
+  const filters = useMemo(() => {
+    if (range === 'custom' && customRange) {
+      return rangeToFilters('custom', customRangeToMs(customRange) ?? {})
+    }
+    return rangeToFilters(range)
+  }, [range, customRange])
 
   const summaryQuery = useUsageSummary(filters)
   const dailyQuery = useDailyTrends(filters)
@@ -91,7 +104,7 @@ export default function DashboardPage(): ReactElement {
   const banner = useMemo(() => deriveBudgetBanner(budgetQuery.data), [budgetQuery.data])
 
   const s = summaryQuery.data ?? EMPTY_SUMMARY
-  const rangeLabel = RANGE_OPTIONS.find((o) => o.key === range)?.label ?? ''
+  const rangeLabel = RANGE_OPTIONS.find((o) => o.key === range)?.label ?? (range === 'custom' ? '自定义' : '')
 
   const trend = useMemo(() => {
     if (range === 'today' || range === '24h') {
@@ -125,7 +138,15 @@ export default function DashboardPage(): ReactElement {
               ? '当前展示 Mock 数据，后端 IPC 就绪后自动切换真实数据'
               : 'Token 用量汇总'
         }
-        action={<RangeSelector value={range} onChange={setRange} options={RANGE_OPTIONS} />}
+        action={
+          <RangeSelector
+            value={range}
+            onChange={setRange}
+            options={RANGE_OPTIONS}
+            customRange={customRange}
+            onCustomRangeChange={setCustomRange}
+          />
+        }
       />
 
       {banner && (

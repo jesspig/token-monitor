@@ -3,8 +3,8 @@
 ## 项目定位与设计依据
 
 - Electron + TypeScript 桌面工具：监控多个 AI 编程 CLI 的 Token 用量与费用；采集方式为扫描各 CLI 本地会话日志，**不做代理拦截**。
-- **改代码前先读 `docs/index.md`**：`docs/` 知识库是唯一设计依据，全部概念页已与实现对齐（2026-08-21 审计）。既定技术栈（Electron / electron-vite / React + Tailwind + TanStack Query + Recharts / better-sqlite3 / chokidar）勿擅自更改。
-- 第一阶段已交付：插件宿主 + 5 个内置监控插件（claude / codex / opencode / gemini / grok），typecheck / 222 单测 / 构建 / electron-builder 打包全部通过。
+- **改代码前先读 `docs/index.md`**：`docs/` 知识库是唯一设计依据，全部概念页已与实现对齐（2026-08-21 审计 + 2026-08-23 第五轮迭代同步）。既定技术栈（Electron / electron-vite / React + Tailwind + TanStack Query + Recharts / better-sqlite3 / chokidar）勿擅自更改。
+- 第一阶段已交付：插件宿主 + 5 个内置监控插件（claude / codex / opencode / gemini / grok）；2026-08-23 第五轮迭代（对标 cc-switch）完成计费语义修复、语义去重接入、定价匹配增强，并完成各 CLI 最新版日志格式联网复核与兼容（claude 按 message.id 折叠流式分片；gemini 双格式兼容新版 append-only JSONL；codex output 已含 reasoning 勿加速率）。当前 typecheck / 297 单测 / 构建全部通过。
 
 ## 命令
 
@@ -12,7 +12,7 @@
 |---|---|
 | `pnpm dev` | 开发模式（electron-vite dev，热更新） |
 | `pnpm typecheck` | 类型检查（tsconfig.node.json + tsconfig.web.json 两段串行） |
-| `$env:ELECTRON_RUN_AS_NODE='1'; & "node_modules\electron\dist\electron.exe" node_modules/vitest/vitest.mjs run` | 全部单测（21 文件 / 222 用例，经 Electron 内置 Node v20.18.3 运行）。**package.json 没有 test 脚本；且 better-sqlite3 已重编为 Electron ABI，`pnpm exec vitest run` 会报 NODE_MODULE_VERSION 错，只能这样跑** |
+| `$env:ELECTRON_RUN_AS_NODE='1'; & "node_modules\electron\dist\electron.exe" node_modules/vitest/vitest.mjs run` | 全部单测（24 文件 / 286 用例，经 Electron 内置 Node v20.18.3 运行）。**package.json 没有 test 脚本；且 better-sqlite3 已重编为 Electron ABI，`pnpm exec vitest run` 会报 NODE_MODULE_VERSION 错，只能这样跑** |
 | `$env:ELECTRON_RUN_AS_NODE='1'; & "node_modules\electron\dist\electron.exe" node_modules/vitest/vitest.mjs run src/main/services/storage.test.ts` | 单文件测试 |
 | `pnpm build` | 构建到 `out/`（main/preload/renderer 三段） |
 | `pnpm dist` / `pnpm dist:dir` | electron-builder 打包（安装包 / 解包目录），产物在 `release/` |
@@ -30,10 +30,11 @@
 - 数据流：`CLI 会话文件 → 插件增量解析(行游标) → 去重 → 费用计算 → usage_records 明细 → usage_daily_rollups 日聚合 → 前端查询`。
 - 进程边界：主进程承担全部数据逻辑；渲染进程只经 preload `contextBridge` 白名单 API 通信（契约 = `shared/ipc.ts` 的 RendererApi，17 通道），禁止直接暴露 Node 能力。
 - 插件体系为自研框架（`src/main/core/`：registry/context/lifecycle/event-bus）：**新增监控对象 = 新增 `plugins/<id>.ts` 实现 `MonitorPlugin`，并在 `host.ts` 的 `BUILTIN_PLUGINS` 登记一行**。插件经服务容器 `ctx`（storage/pricing/events/scheduler/watcher）访问能力、用 `deps` 声明依赖，不直接 import 宿主实现。
-- 去重现状：记录 id = `data_source:file_path:line` + INSERT OR IGNORE；`dedup_ledger` 表已建但**未接入写入路径**（fork/rewrite 语义去重预留），不要假设账本在生效。
-- 关键默认值：兜底同步间隔 5 分钟（设置可调）；明细保留 90 天、日聚合永不清理；事件 `usage-updated` 200ms 防抖、watcher 500ms 防抖；seed 定价 10 个模型（USD）。
+- 去重现状：双层——记录 id = `data_source:file_path:line` + INSERT OR IGNORE（主键幂等）；五插件产出稳定 `source.requestId`，入库事务内按 `(data_source, request_id)` 查写 `dedup_ledger` 做 fork/rewrite 语义去重（2026-08-23 接入，命中不入明细/rollup/事件）。
+- 计费语义：`input_semantics` 三态（0=未知 / 1=含缓存总量需扣减 / 2=纯新输入）；codex/gemini/grok=1、claude/opencode=2；`calcCost` 对 semantics=1 先扣缓存再乘价；存量高估费用由 `pricing.recalcCachedInputCosts` 启动重算（v4 迁移只修 opencode 标注）。
+- 关键默认值：兜底同步间隔 5 分钟（设置可调）；明细保留 90 天、日聚合永不清理、**保留清理前先尽力零成本回填**；事件 `usage-updated` 200ms 防抖、watcher 500ms 防抖；seed 定价 99 个模型（USD）。
 - 定价为只读 + models.dev 每 5 分钟自动同步：手动更新/删除定价的 IPC 通道已删除，定价写入唯一入口是 models.dev 同步链路（`host.syncModelsDevPricing` 内部先 `invalidateCache` 再回填），无需手动调缓存失效。
-- 各 CLI 数据源差异大（opencode 为 SQLite db 双源、gemini 为单 JSON 对象、grok 靠 summary.json 建 sessionId→模型映射），改插件前先读 `docs/concepts/monitor-plugins.md` 的实际清单。
+- 各 CLI 数据源差异大（opencode 为 SQLite db 双源、gemini 为新版 JSONL + legacy 单 JSON 双格式、grok 靠 summary.json 建 sessionId→模型映射、claude 同轮多行需按 message.id 折叠），改插件前先读 `docs/concepts/monitor-plugins.md` 的实际清单。
 
 ## 行为约束
 

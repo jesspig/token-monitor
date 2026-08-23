@@ -9,6 +9,8 @@ import {
   listFilesFromRoot,
   parseDbFile,
   parseJsonFile,
+  statMtimeMs,
+  maxMtime,
   DB_SOURCE_SUFFIX
 } from './opencode'
 import type { PluginContext } from '../../../shared/context'
@@ -209,6 +211,46 @@ describe('listFilesFromRoot 收集范围', () => {
   })
 })
 
+describe('listFilesFromRoot WAL 感知 mtime', () => {
+  /** 写入空文件并设置指定 mtime（epoch ms），返回实际 stat 到的毫秒值（规避文件系统时间精度截断） */
+  function writeWithMtime(p: string, atMs: number): number {
+    fs.writeFileSync(p, '')
+    const t = new Date(atMs)
+    fs.utimesSync(p, t, t)
+    return Math.round(fs.statSync(p).mtimeMs)
+  }
+
+  it('db 与 -wal 同时存在且 wal 较新：条目 mtime 取两者较大值，path 仍为 db 路径', () => {
+    const root = path.join(tmpDir, 'opencode')
+    fs.mkdirSync(root, { recursive: true })
+    const dbPath = path.join(root, DB_SOURCE_SUFFIX)
+    const dbMtime = writeWithMtime(dbPath, Date.now() - 60_000)
+    const walMtime = writeWithMtime(dbPath + '-wal', Date.now())
+    const entries = listFilesFromRoot(root)
+    expect(entries).toHaveLength(1)
+    expect(entries[0].path).toBe(dbPath)
+    expect(entries[0].mtime).toBe(Math.max(dbMtime, walMtime))
+    expect(entries[0].mtime).toBe(walMtime)
+  })
+
+  it('仅 db 无 -wal：条目 mtime 等于 db 自身 mtime', () => {
+    const root = path.join(tmpDir, 'opencode')
+    fs.mkdirSync(root, { recursive: true })
+    const dbPath = path.join(root, DB_SOURCE_SUFFIX)
+    const dbMtime = writeWithMtime(dbPath, Date.now() - 60_000)
+    const entries = listFilesFromRoot(root)
+    expect(entries).toHaveLength(1)
+    expect(entries[0].mtime).toBe(dbMtime)
+  })
+
+  it('db 与 -wal 双缺：stat 兜底为 0（maxMtime 全失败 → 0）', () => {
+    const missing = path.join(tmpDir, 'nope.db')
+    expect(statMtimeMs(missing)).toBe(0)
+    expect(maxMtime([missing, missing + '-wal'])).toBe(0)
+    expect(maxMtime([])).toBe(0)
+  })
+})
+
 describe('parseDbFile 解析与水位游标', () => {
   it('assistant 消息产出完整 UsageRecord，project 来自 session.directory，line=time_created', () => {
     const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
@@ -226,13 +268,17 @@ describe('parseDbFile 解析与水位游标', () => {
       outputTokens: 45,
       cacheReadTokens: 8,
       cacheCreationTokens: 3,
-      inputSemantics: 1,
+      inputSemantics: 2,
       status: 'success',
       project: '/Users/a/opencode-proj',
       sessionId: 'sess-1',
       createdAt: 1_700_000_000_123
     })
-    expect(res.records[0].source).toEqual({ filePath: DB_SOURCE_SUFFIX, line: 1_700_000_000_123 })
+    expect(res.records[0].source).toEqual({
+      filePath: DB_SOURCE_SUFFIX,
+      line: 1_700_000_000_123,
+      requestId: 'm-1'
+    })
     expect(res.nextLine).toBe(1_700_000_000_123)
     expect(res.eof).toBe(true)
   })
@@ -347,7 +393,7 @@ describe('parseJsonFile 旧版 JSON 源', () => {
       outputTokens: 45,
       cacheReadTokens: 8,
       cacheCreationTokens: 3,
-      inputSemantics: 1,
+      inputSemantics: 2,
       status: 'success',
       createdAt: 9_999,
       project: undefined,
@@ -401,6 +447,49 @@ describe('parseJsonFile 旧版 JSON 源', () => {
     expect(res.records).toHaveLength(0)
     expect(res.nextLine).toBe(0)
     expect(res.eof).toBe(true)
+  })
+})
+
+describe('语义 ID(source.requestId)透传', () => {
+  it('db 源:message 行主键 id 写入 source.requestId', () => {
+    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
+    buildOpencodeDb(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      messages: [asstMsg({ id: 'msg-db-1', time: 1_000 })]
+    })
+    const res = parseDbFile(dbPath, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].source).toEqual({
+      filePath: DB_SOURCE_SUFFIX,
+      line: 1_000,
+      requestId: 'msg-db-1'
+    })
+  })
+
+  it('JSON 源:data.id 写入 source.requestId', () => {
+    const file = path.join(tmpDir, 'with-id.json')
+    const data = { ...(asstMsg({ time: 1 }).data as Record<string, unknown>), id: 'msg-json-1' }
+    fs.writeFileSync(file, JSON.stringify(data), 'utf8')
+    const res = parseJsonFile(file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].source.requestId).toBe('msg-json-1')
+  })
+
+  it('id 缺失/空白时不设 requestId(db 空串主键 + JSON 无 id 字段)', () => {
+    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
+    buildOpencodeDb(dbPath, {
+      sessions: [{ id: 'sess-1' }],
+      messages: [{ id: '', sessionId: 'sess-1', timeCreated: 1_000, data: asstMsg({ time: 1_000 }).data }]
+    })
+    const r1 = parseDbFile(dbPath, 0)
+    expect(r1.records).toHaveLength(1)
+    expect(r1.records[0].source.requestId).toBeUndefined()
+
+    const file = path.join(tmpDir, 'no-id.json')
+    fs.writeFileSync(file, JSON.stringify(asstMsg({ time: 2 }).data), 'utf8')
+    const r2 = parseJsonFile(file, 0)
+    expect(r2.records).toHaveLength(1)
+    expect(r2.records[0].source.requestId).toBeUndefined()
   })
 })
 

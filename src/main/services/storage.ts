@@ -9,6 +9,7 @@ import type {
   UsageRecordRow
 } from '../../../shared/tables'
 import { createDatabase, migrate, type SqliteDatabase } from './db'
+import { semanticFingerprint } from './dedup'
 
 /**
  * 打开数据库并应用迁移，返回满足 StorageService 契约的实例。
@@ -90,6 +91,8 @@ function toUsageRecordRow(r: UsageRecord, dataSource: string, id: string): Usage
  */
 export class SqliteStorage implements StorageService {
   private readonly insertRecordStmt: Database.Statement
+  private readonly getDedupStmt: Database.Statement
+  private readonly insertDedupStmt: Database.Statement
   private readonly getRollupStmt: Database.Statement
   private readonly upsertRollupStmt: Database.Statement
   private readonly getCursorStmt: Database.Statement
@@ -113,6 +116,15 @@ export class SqliteStorage implements StorageService {
         @status, @file_path, @line, @created_at
       )
     `)
+
+    this.getDedupStmt = db.prepare(
+      'SELECT semantic_id FROM dedup_ledger WHERE data_source = ? AND request_id = ?'
+    )
+
+    this.insertDedupStmt = db.prepare(
+      `INSERT OR IGNORE INTO dedup_ledger (data_source, request_id, semantic_id, created_at)
+       VALUES (?, ?, ?, ?)`
+    )
 
     this.getRollupStmt = db.prepare(`
       SELECT * FROM usage_daily_rollups
@@ -201,8 +213,16 @@ export class SqliteStorage implements StorageService {
         const dataSource = r.appType
         // 主键/去重 key = data_source + file_path + line（':' 分隔避免拼接歧义）
         const id = `${dataSource}:${r.source.filePath}:${r.source.line}`
+        // 语义去重：同 requestId 已入账即跳过（fork/rewrite 场景，明细行号不同但为同一逻辑请求）
+        const reqId = r.source.requestId
+        if (reqId != null && this.getDedupStmt.get(dataSource, reqId) != null) {
+          continue
+        }
         const info = this.insertRecordStmt.run(toUsageRecordRow(r, dataSource, id))
         if (info.changes === 0) continue // 去重命中，跳过（不累计 rollup）
+        if (reqId != null) {
+          this.insertDedupStmt.run(dataSource, reqId, semanticFingerprint(r), now)
+        }
 
         added++
         const date = toDateKey(r.createdAt)

@@ -176,6 +176,14 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
   const model = sessionId ? modelMap.get(sessionId) : undefined
   if (!model) return null // 无模型映射 → 跳过（下一轮同步重建映射后即可匹配）
 
+  // 语义请求 ID："<sid>:<loop_index>"。unified.jsonl 为 append-only 日志，同一次推理调用
+  // 只会出现一行相同 (sid, ctx.loop_index)，组合键跨轮稳定、可唯一标识该次调用；
+  // 任一成分缺失（sid 空白 / loop_index 非有限数）则不设置，退回 (file_path, line) 主键去重
+  const rawSid = typeof row.sid === 'string' ? row.sid.trim() : ''
+  const loop = c.loop_index
+  const loopIndex = typeof loop === 'number' && Number.isFinite(loop) ? loop : undefined
+  const requestId = rawSid && loopIndex !== undefined ? `${rawSid}:${loopIndex}` : undefined
+
   return {
     appType: 'grok',
     model,
@@ -189,7 +197,7 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
     createdAt: extractTime(row, c),
     project: typeof row.project === 'string' ? row.project : typeof row.cwd === 'string' ? row.cwd : undefined,
     sessionId,
-    source: { filePath, line }
+    source: requestId ? { filePath, line, requestId } : { filePath, line }
   }
 }
 

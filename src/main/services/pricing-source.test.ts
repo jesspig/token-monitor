@@ -39,7 +39,7 @@ describe('model_pricing source 列迁移', () => {
   it('全新建库经 v1→v2 迁移后表含 source 列（NOT NULL）且新行默认 user', () => {
     const { db } = makeStorage()
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(3)
+      expect(db.pragma('user_version', { simple: true })).toBe(4)
       const columns = db.pragma('table_info(model_pricing)') as {
         name: string
         notnull: number
@@ -156,7 +156,7 @@ describe('model_pricing source 列迁移', () => {
       migrate(db)
       const reopened = new SqliteStorage(db)
       try {
-        expect(db.pragma('user_version', { simple: true })).toBe(3)
+        expect(db.pragma('user_version', { simple: true })).toBe(4)
         // 存量行标 'user'：用户可见数据不被未来 seed/sync 同步覆盖
         expect(rawRow(db, 'legacy-model')).toMatchObject({
           input_per_million: 5,

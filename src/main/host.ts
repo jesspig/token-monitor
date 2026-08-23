@@ -20,6 +20,7 @@ import { syncPricing, type SyncResult } from './services/modelsdev'
 import {
   backfillZeroCost,
   PricingServiceImpl,
+  recalcCachedInputCosts,
   seedPricing,
   type BackfillResult
 } from './services/pricing'
@@ -76,7 +77,8 @@ export interface Host {
   getBudgetStatus(): Promise<BudgetStatus>
   /**
    * 清理超过保留天数的明细（同步方法，返回删除条数）。
-   * 内部调 cleanupOldRecords(db, settings.get().retentionDays)；
+   * 内部调 cleanupOldRecords(db, settings.get().retentionDays)，仅清理、不含预回填
+   * （调度路径 runRetentionSweep 已保证每次清理前先尽力回填零成本明细）；
    * 宿主已内置调度：启动后延迟 RETENTION_SWEEP_DELAY_MS 执行一次，此后与兜底扫描同节奏周期执行
    * （均容错，失败仅记日志）；仍可手动调用，updateSettings 更新 retentionDays 时不立即触发。
    */
@@ -203,7 +205,19 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
   // —— 过期明细清理调度（docs/concepts/data-model.md → 保留策略）——
   // collector 内部定时回调无法从外部挂钩，宿主经同一 scheduler 以相同间隔独立触发，
   // 与兜底扫描同节奏；启动后延迟 RETENTION_SWEEP_DELAY_MS 先行一次。
-  function runRetentionSweep(): void {
+  // 每次清理前先尽力回填零成本明细：缺价行（cost 为空/'0'）一旦被删除，费用将永久无法回补
+  // （日聚合为镜像，明细没了便再也算不出）；回填失败仅记日志，不阻塞清理。
+  async function runRetentionSweep(): Promise<void> {
+    try {
+      const result = await backfillZeroCost(db, pricing)
+      if (result.updated > 0) {
+        console.log(
+          `[host] 清理前零成本回填完成: scanned=${result.scanned} updated=${result.updated}`
+        )
+      }
+    } catch (err) {
+      console.error('[host] 清理前零成本回填失败:', err)
+    }
     try {
       cleanupOldRecords(db, settings.get().retentionDays)
     } catch (err) {
@@ -266,6 +280,21 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
   void runZeroCostBackfill().catch((err) => {
     console.error('[host] 启动零成本回填失败:', err)
   })
+
+  // 计费语义修复的一次性存量修正：codex/gemini/grok 历史高估费用按活定价重算
+  // （重算一致零写入，天然幂等，故只随启动执行、不挂进 models.dev 同步链路）；
+  // opencode 的语义错标已由 v4 迁移直接修正。失败仅记日志，不阻塞启动。
+  void recalcCachedInputCosts(db, pricing)
+    .then((result) => {
+      if (result.updated > 0) {
+        console.log(
+          `[host] 存量缓存口径费用重算完成: scanned=${result.scanned} updated=${result.updated}`
+        )
+      }
+    })
+    .catch((err) => {
+      console.error('[host] 启动存量费用重算失败:', err)
+    })
 
   return {
     ctx,
