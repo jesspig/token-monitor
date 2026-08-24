@@ -376,7 +376,7 @@ let SETTINGS: AppSettings = {
   dataDir: '~/.config/token-monitor',
   dailyBudgetUsd: 10,
   monthlyBudgetUsd: 200,
-  statsRefreshIntervalMs: 5000,
+  statsRefreshIntervalMs: 30_000,
   pricingSyncIntervalMs: 300_000
 }
 

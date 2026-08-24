@@ -738,4 +738,51 @@ describe('model_pricing CRUD', () => {
     expect(await storage.getModelPricing()).toEqual([])
     await storage.deleteModelPricing('not-exist') // 幂等
   })
+
+  it('批量插入 N 条返回 N 且全表可查', async () => {
+    const { storage } = makeStorage()
+    const rows: ModelPricingRow[] = [
+      entry({ model_id: 'model-a', updated_at: 111 }),
+      entry({ model_id: 'model-b', updated_at: 222 }),
+      entry({ model_id: 'model-c', updated_at: 333 })
+    ]
+    expect(await storage.updateModelPricingBatch(rows, 'sync')).toBe(3)
+    const list = await storage.getModelPricing()
+    expect(list).toHaveLength(3)
+    expect(list.map((r) => r.model_id).sort()).toEqual(['model-a', 'model-b', 'model-c'])
+    expect(list.every((r) => r.source === 'sync')).toBe(true)
+  })
+
+  it('批量写入时 user 分级行不被 sync 行覆盖，其余行照常写入', async () => {
+    const { storage } = makeStorage()
+    // 预置 user 行（手动编辑缺省即 user）
+    await storage.updateModelPricing(entry({ input_per_million: 99, updated_at: 123 }), 'user')
+
+    const imported = await storage.updateModelPricingBatch(
+      [
+        entry({ model_id: 'claude-sonnet-4', input_per_million: 5, updated_at: 456 }),
+        entry({ model_id: 'other-model', updated_at: 456 })
+      ],
+      'sync'
+    )
+    expect(imported).toBe(2)
+
+    const list = await storage.getModelPricing()
+    expect(list).toHaveLength(2)
+    expect(list.find((r) => r.model_id === 'claude-sonnet-4')).toMatchObject({
+      source: 'user',
+      input_per_million: 99,
+      updated_at: 123
+    })
+    expect(list.find((r) => r.model_id === 'other-model')).toMatchObject({
+      source: 'sync',
+      updated_at: 456
+    })
+  })
+
+  it('批量空数组返回 0 且不产生任何行', async () => {
+    const { storage } = makeStorage()
+    expect(await storage.updateModelPricingBatch([], 'seed')).toBe(0)
+    expect(await storage.getModelPricing()).toEqual([])
+  })
 })

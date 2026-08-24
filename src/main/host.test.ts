@@ -475,8 +475,8 @@ describe('models.dev 定价目录（T8 主进程侧）', () => {
     const fetchMock = stubModelsDevFetch()
     const host = await createHost({ dataDir: ':memory:' })
     try {
-      // 启动序列立即同步一次并入库（sync 来源），覆盖 seed 兜底价
-      await vi.advanceTimersByTimeAsync(0)
+      // 启动序列在错峰延迟（10 秒）后同步一次并入库（sync 来源），覆盖 seed 兜底价
+      await vi.advanceTimersByTimeAsync(10_000)
       expect(fetchMock).toHaveBeenCalledTimes(1)
       expect(
         (await host.storage.getModelPricing()).find((r) => r.model_id === 'claude-test-model')
