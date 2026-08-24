@@ -34,7 +34,8 @@ const userMessageLine = (seq = 1): string =>
 const toolResultLine = (seq = 4): string =>
   JSON.stringify({ type: 'tool/result', seq, time: DSH_TS + 3000, data: { toolCallId: 't-1', result: 'ok' } })
 
-/** request/header 行（每步 dispatch 前写入，data.header.config 携带该步模型；seq/time/model 可覆盖） */
+/** request/header 行（仅在路由/配置变化时稀疏写入，reason ∈ initial/resume/change；
+ * data.header.config 携带该步模型；seq/time/model 可覆盖） */
 const requestHeaderLine = (
   o: { seq?: number; time?: number; provider?: string; model?: string } = {}
 ): string =>
@@ -59,9 +60,10 @@ const assistantChunkLine = (seq = 6): string =>
 
 /**
  * assistant 计费条目（TokenUsage 四桶 disjoint；reasoningTokens 为 output 子集应不加速率；
- * provider 为上游供应方标注，本插件丢弃）。message 默认不带 model（真实形态：120 文件 /
- * 6084 条实测均无自带 model，模型由 request/header 携带），传入 messageModel 时才写
- * message.model 用于测「自带优先」路径。role/time/usage 可覆盖。
+ * provider/source.provider 为上游供应方标注，本插件丢弃）。真实形态：模型由
+ * data.message.source.model 携带（AssistantProvenance，473/473 实测全部携带），顶层
+ * message.model 与请求头均为回退来源；传 sourceModel 写 message.source 结构测首选路径，
+ * 传 messageModel 才写顶层 message.model 测次级回退路径。role/time/usage 可覆盖。
  */
 const DEFAULT_USAGE = {
   inputTokens: 120,
@@ -76,6 +78,7 @@ const assistantMessageLine = (
     seq?: number
     time?: number | null
     role?: string
+    sourceModel?: string
     messageModel?: string
     provider?: string
     usage?: Record<string, unknown> | null
@@ -89,6 +92,9 @@ const assistantMessageLine = (
       message: {
         ...(o.role === undefined ? {} : { role: o.role }),
         ...(o.messageModel === undefined ? {} : { model: o.messageModel }),
+        ...(o.sourceModel === undefined
+          ? {}
+          : { source: { provider: o.provider ?? 'deepseek', model: o.sourceModel } }),
         provider: o.provider === undefined ? 'deepseek' : o.provider,
         content: '回答内容'
       },
@@ -266,9 +272,10 @@ describe('parseFile 增量解析（raw JSONL）', () => {
 
     const second = await dshPlugin.parseFile(ctx, file, first.nextLine)
     expect(second.records).toHaveLength(1)
-    // 续读窗口越过首行 header，会话状态缺失 → sessionId/requestId 不设置（与 pi 同语义）
-    expect(second.records[0].sessionId).toBeUndefined()
-    expect(second.records[0].source.requestId).toBeUndefined()
+    // sessionId/project 由模块级缓存恢复（上轮写回的 cursorLine 与 fromLine 精确衔接）
+    expect(second.records[0].sessionId).toBe(SESSION_ID)
+    expect(second.records[0].project).toBe(CWD)
+    expect(second.records[0].source.requestId).toBe(`${SESSION_ID}:4`)
     // currentModel 由窗口内的请求头（第 4 行）恢复
     expect(second.records[0].model).toBe('deepseek-v4-flash')
     expect(second.records[0].source.line).toBe(5)
@@ -293,7 +300,7 @@ describe('parseFile 增量解析（raw JSONL）', () => {
     expect(first.nextLine).toBe(4) // 半行为第 4 行，游标原地等待下次重试
     expect(first.eof).toBe(true)
 
-    // 写入器补全该行后，从停驻行重试；自带 model 以越过窗口外请求头缺失的 currentModel
+    // 写入器补全该行后，从停驻行重试；会话头状态由上轮写回的缓存恢复
     writeJsonl(file, [
       headerLine(), // 1
       requestHeaderLine({ seq: 1 }), // 2
@@ -301,11 +308,11 @@ describe('parseFile 增量解析（raw JSONL）', () => {
       assistantMessageLine({ seq: 9, time: DSH_TS + 6000, messageModel: 'deepseek-chat' }) // 4
     ])
     const retry = await dshPlugin.parseFile(ctx, file, first.nextLine)
-    // 续读窗口越过 session header 与 request/header → sessionId/currentModel 均缺失,
-    // requestId 不设置由 (file,line) 主键去重兜底不双算；模型取条目自带的 message.model
+    // 续读窗口越过 session header 与 request/header，但缓存游标（4）与 fromLine 精确衔接
+    // → sessionId/project/currentModel 均由缓存恢复，requestId 正常设置
     expect(retry.records).toHaveLength(1)
-    expect(retry.records[0].source.requestId).toBeUndefined()
-    expect(retry.records[0].sessionId).toBeUndefined()
+    expect(retry.records[0].source.requestId).toBe(`${SESSION_ID}:9`)
+    expect(retry.records[0].sessionId).toBe(SESSION_ID)
     expect(retry.records[0].model).toBe('deepseek-chat')
     expect(retry.records[0].source.line).toBe(4)
     expect(retry.nextLine).toBe(5)
@@ -368,25 +375,94 @@ describe('parseFile 增量解析（raw JSONL）', () => {
   })
 })
 
-describe('parseFile 模型两级来源（request/header 状态机）', () => {
-  it('矩阵 b：message 自带 model 时优先于请求头携带的模型', async () => {
+describe('parseFile 模型三级来源（source.model → message.model → request/header 状态机）', () => {
+  it('矩阵 b：message.source.model 优先于顶层 model 与请求头携带的模型', async () => {
     const file = path.join(tmpDir, 'session-own-model.jsonl')
     writeJsonl(file, [
       headerLine(), // 1
       requestHeaderLine({ seq: 1 }), // 2: deepseek-v4-flash
-      assistantMessageLine({ seq: 2, messageModel: 'glm-5' }), // 3: 自带优先
-      requestHeaderLine({ seq: 3 }), // 4
-      assistantMessageLine({ seq: 4 }) // 5: 回落请求头值
+      assistantMessageLine({ seq: 2, sourceModel: 'glm-5', messageModel: 'kimi-3' }), // 3: source.model 最高优先
+      assistantMessageLine({ seq: 3, messageModel: 'minimax-m2' }), // 4: 无 source.model 回落顶层 model
+      assistantMessageLine({ seq: 4 }), // 5: 均无回落请求头值
+      requestHeaderLine({ seq: 5, model: 'deepseek-reasoner' }), // 6: 切换请求头
+      assistantMessageLine({ seq: 6 }) // 7: 取新请求头值
     ])
 
     const res = await dshPlugin.parseFile(ctx, file, 0)
-    expect(res.records.map((r) => r.model)).toEqual(['glm-5', 'deepseek-v4-flash'])
-    expect(res.records.map((r) => r.source.line)).toEqual([3, 5])
-    expect(res.nextLine).toBe(6)
+    expect(res.records.map((r) => r.model)).toEqual([
+      'glm-5',
+      'minimax-m2',
+      'deepseek-v4-flash',
+      'deepseek-reasoner'
+    ])
+    expect(res.records.map((r) => r.rawModel)).toEqual([
+      'glm-5',
+      'minimax-m2',
+      'deepseek-v4-flash',
+      'deepseek-reasoner'
+    ])
+    expect(res.records.map((r) => r.source.line)).toEqual([3, 4, 5, 7])
+    expect(res.nextLine).toBe(8)
     expect(res.eof).toBe(true)
   })
 
-  it('矩阵 c：条目前无任何 request/header 时跳过；续读越过请求头同样跳过但水位照常推进', async () => {
+  it('核心回归：增量续读窗口无任何 session/request/header 行时由缓存恢复状态，用量不再漏采', async () => {
+    const file = path.join(tmpDir, 'session-resume-cache.jsonl')
+    writeJsonl(file, [
+      headerLine(), // 1
+      requestHeaderLine({ seq: 1, model: 'deepseek-reasoner' }), // 2
+      userMessageLine(2), // 3
+      assistantMessageLine({ seq: 3, time: DSH_TS + 3000 }) // 4
+    ])
+
+    const first = await dshPlugin.parseFile(ctx, file, 0)
+    expect(first.records.map((r) => r.model)).toEqual(['deepseek-reasoner'])
+    expect(first.nextLine).toBe(5)
+
+    // 追加续读段不含任何 session/request/header 行（request/header 仅路由/配置变化时写入）
+    fs.appendFileSync(
+      file,
+      '\n' +
+        [userMessageLine(4), assistantMessageLine({ seq: 5, time: DSH_TS + 8000 })].join('\n'),
+      'utf8'
+    )
+
+    const second = await dshPlugin.parseFile(ctx, file, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    // 模型取缓存 currentModel，sessionId/project/requestId 也由缓存恢复 → 用量不漏采
+    expect(second.records[0]).toMatchObject({
+      model: 'deepseek-reasoner',
+      sessionId: SESSION_ID,
+      project: CWD,
+      inputTokens: 120,
+      outputTokens: 60,
+      inputSemantics: 2
+    })
+    expect(second.records[0].source.requestId).toBe(`${SESSION_ID}:5`)
+    expect(second.records[0].source.line).toBe(6)
+    expect(second.nextLine).toBe(7)
+    expect(second.eof).toBe(true)
+  })
+
+  it('缓存 cursorLine 与传入 fromLine 不一致时不用缓存，状态缺失条目按现状跳过', async () => {
+    const file = path.join(tmpDir, 'session-cursor-drift.jsonl')
+    writeJsonl(file, [
+      headerLine(), // 1
+      requestHeaderLine({ seq: 1 }), // 2
+      assistantMessageLine({ seq: 2 }) // 3
+    ])
+    const first = await dshPlugin.parseFile(ctx, file, 0)
+    expect(first.nextLine).toBe(4)
+
+    // 游标被重置到 3（如文件 truncate），与缓存 cursorLine=4 不一致 → 弃用缓存按现状重建：
+    // 该条目无自带模型且会话状态缺失 → 跳过但水位照常推进
+    const resumed = await dshPlugin.parseFile(ctx, file, 3)
+    expect(resumed.records).toEqual([])
+    expect(resumed.nextLine).toBe(4)
+    expect(resumed.eof).toBe(true)
+  })
+
+  it('矩阵 c：条目前无任何 request/header 时跳过；缓存未衔接的续读同样跳过但水位照常推进', async () => {
     const file = path.join(tmpDir, 'session-no-request-header.jsonl')
     writeJsonl(file, [
       headerLine(), // 1
