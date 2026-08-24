@@ -2,8 +2,13 @@
 
 > 仅保留最近 7 天。详细按小时记录见 [changelog/](changelog/)。
 
+## 2026-08-24
+
+- **dsh 插件修复**：用户真实数据诊断发现 `assistant/message` 均不携带 `message.model`（6084 条实测为 0），模型实际由 `request/header.data.header.config` 携带——插件改为 request/header 状态机供模 + message 自带优先的两级来源，真实数据端到端验证 6084/6084 全部产出、0 跳过。typecheck / 349 项单测 / build 全部通过。
+
 ## 2026-08-23
 
+- **pi / zcode / dsh 三监控插件接入（内置插件 5 → 8）**：pi（JSONL 树解析，semantics=2，requestId=条目 id）、zcode（SQLite rowid 水位 + WAL 感知，实测 input 含缓存 semantics=1）、dsh（fzstd 纯 JS 解压 zstd 帧解析 event-sourced JSONL，semantics=2，preview 格式声明）；AppType 扩至八值，契约/徽标/版本探测同步。typecheck / 346 项单测 / build 全部通过。
 - **各 CLI 最新版日志格式核实与兼容**：联网核实五源——claude 当前版按 content block 逐行写 JSONL（共享 message.id、output 流式单调增长），插件新增 `foldById` 折叠消除约 2.4 倍高估；gemini 新版已迁移 append-only JSONL（首行 metadata + 消息行 + $set 更新行，subagent 嵌套目录），插件双格式兼容（chats 子树 .jsonl 任意层级 + legacy session-*.json 不变）；codex 经 codex-rs 源码定论 output_tokens 已含 reasoning（现有实现正确）、opencode/grok 无变化。typecheck / 297 项单测 / build 全部通过。
 - **第五轮迭代（对标 cc-switch 用量统计）**：计费语义修复——`calcCost` 对 semantics=1 的 codex/gemini/grok 先扣缓存再计价（旧公式重复计费高估费用），opencode 存量标注由 v4 迁移修正为 2、三源历史费用经 `recalcCachedInputCosts` 启动重算；fork/rewrite 语义去重接入——五插件产出稳定 requestId、入库事务内查写 dedup_ledger；opencode WAL mtime 感知与清理前预回填；定价归一化 8 步 + 五级匹配链（effort 后缀剥离、点转横线变体、家族兜底）；前端自定义时间档、趋势图渐变、token 数量级中文本地化。typecheck / 286 项单测 / build 全部通过。
 

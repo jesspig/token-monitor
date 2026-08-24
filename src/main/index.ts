@@ -40,7 +40,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
-  // 组装插件宿主：存储/定价/事件/调度/监听 + 5 个内置监控插件
+  // 组装插件宿主：存储/定价/事件/调度/监听 + 8 个内置监控插件
   host = await createHost({ dataDir: app.getPath('userData') })
 
   // 注册全部 IPC handler（含示例 ping，渲染进程经 preload 白名单调用）
