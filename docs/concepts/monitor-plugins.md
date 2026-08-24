@@ -4,13 +4,13 @@ title: 监控插件
 description: MonitorPlugin 统一接口与 8 个内置监控插件（claude/codex/opencode/gemini/grok/pi/zcode/dsh）实现清单。
 tags: [plugin, monitor, cli, claude, codex, opencode, gemini, grok, pi, zcode, dsh]
 resource: src/main/plugins/
-timestamp: 2026-08-24T02:22:00+08:00
+timestamp: 2026-08-24T16:58:00+08:00
 ---
 
 # 监控插件
 
 > [!note] 当前状态
-> **第一阶段 5 个内置插件已实现**（2026-08-20）：`src/main/plugins/{claude,codex,opencode,gemini,grok}.ts`，各有单测覆盖；解析格式均经联网核实。本页清单已按实际实现核对（2026-08-21）；CLI 版本探测于 2026-08-22 接入；语义请求 ID（requestId）与 opencode 语义标注修正/WAL 感知于 2026-08-23 接入；**claude 流式分片折叠与 gemini 新版 JSONL 双格式兼容于 2026-08-23 落地**（五源日志格式已按各 CLI 最新版联网复核）；**pi / zcode / dsh 三插件于 2026-08-23 接入，内置监控对象扩展至 8 个**（格式均经上游源码/社区实测核实）。
+> **第一阶段 5 个内置插件已实现**（2026-08-20）：`src/main/plugins/{claude,codex,opencode,gemini,grok}.ts`，各有单测覆盖；解析格式均经联网核实。本页清单已按实际实现核对（2026-08-21）；CLI 版本探测于 2026-08-22 接入；语义请求 ID（requestId）与 opencode 语义标注修正/WAL 感知于 2026-08-23 接入；**claude 流式分片折叠与 gemini 新版 JSONL 双格式兼容于 2026-08-23 落地**（五源日志格式已按各 CLI 最新版联网复核）；**pi / zcode / dsh 三插件于 2026-08-23 接入，内置监控对象扩展至 8 个**（格式均经上游源码/社区实测核实）；**dsh 插件模型来源升级为三级 + 会话头状态缓存于 2026-08-24 落地**（经 deepseek-harness 上游源码核实：`assistant/message` 的模型身份在 `data.message.source.model` 而非顶层字段；`request/header` 仅路由/配置变化时稀疏写入——旧两级来源在增量续读时因状态丢失漏采用量，现由 per-file 缓存消除）。
 
 ## `MonitorPlugin` 接口（实现于 shared/plugin.ts）
 
@@ -49,7 +49,7 @@ interface MonitorPlugin {
 | grok | `~/.grok`（`GROK_HOME`） | `logs/unified.jsonl` + `sessions/**/summary.json` | unified.jsonl 行 `msg=="shell.turn.inference_done"`：`ctx.prompt_tokens / completion_tokens / cached_prompt_tokens`（prompt 含缓存读，无 write 桶，`input_semantics=1`）；requestId = `<sid>:<loop_index>` 组合键（会话内推理循环序号）；模型来自 summary.json `current_model_id` 建立的 sessionId→模型映射，**listFiles 每轮无条件重建映射**（新增 summary.json 当轮即生效） |
 | pi | `~/.pi/agent/sessions`（`$PI_CODING_AGENT_DIR` 覆盖根） | sessions 子树递归 `*.jsonl`（按工作目录编码层组织） | JSONL 树结构：首行 header `{type:'session', id, cwd}` 建立会话状态；`type==='message'` 且 `role==='assistant'` 且含 usage 的条目产出——usage 四桶 input/output/cacheRead/cacheWrite **互不重叠**，`input_semantics=2`；上游自带 usage.cost 不采用（统一本地计价）；requestId = 条目 `id`（fork 提取分支跨文件收敛）；compaction/model_change 等条目天然跳过 |
 | zcode | `~/.zcode`（`$ZCODE_STORAGE_DIR` 重定位整个根） | 单数据源 `cli/db/db.sqlite`（SQLite 只读） | schema 核实自 CLI db v0.14.8（codeburn 实测）：`model_usage LEFT JOIN session` 取 directory；**input_tokens 已含缓存读写 → `input_semantics=1`**（直接计费约 8 倍高估）；reasoning_tokens 独立列不折入 output；时间戳 epoch 毫秒，createdAt = completed_at ?? started_at；游标 = **rowid 水位**（line=rowid 单调唯一）；WAL mtime max 感知；requestId = `model_usage.id`（每请求唯一） |
-| dsh | `~/.dsh/sessions`（`$DSH_HOME` 覆盖 home） | 子树递归固定名工件 `session.jsonl.zstd` / `session.jsonl`（SQLite 后端 `.db` 暂不支持，detect reason 提示） | `.jsonl.zstd` 经 **fzstd（纯 JS zstd 解压）** 整文件解压后逐行解析 event-sourced envelope `{type, seq, time, data}`（SESSION_FORMAT_VERSION=0 pre-release，破坏性变更时宽松解析+联网复核维护）；`assistant/message` 且 data.usage 产出——TokenUsage disjoint 约定（inputTokens 不含缓存），`input_semantics=2`；reasoningTokens 为 output 子集不加速率；**模型两级来源：message.model 缺失（120 会话/6084 条实测均无）时取此前最近 request/header 的 `data.header.config.model` 状态机**；requestId = `<sessionId>:<seq>`（fork seed 继承跨文件稳定）。已用真实数据端到端验证：6084/6084 全部产出、0 跳过 |
+| dsh | `~/.dsh/sessions`（`$DSH_HOME` 覆盖 home） | 子树递归固定名工件 `session.jsonl.zstd` / `session.jsonl`（SQLite 后端 `.db` 暂不支持，detect reason 提示） | `.jsonl.zstd` 经 **fzstd（纯 JS zstd 解压）** 整文件解压后逐行解析 event-sourced envelope `{type, seq, time, data}`（SESSION_FORMAT_VERSION=0 pre-release，破坏性变更时宽松解析+联网复核维护）；`assistant/message` 且 data.usage 产出——TokenUsage disjoint 约定（inputTokens 不含缓存），`input_semantics=2`；reasoningTokens 为 output 子集不加速率；**模型三级来源：`data.message.source.model` 首选（上游 AssistantProvenance per-message 自带，473/473 实测全携带、增量续读永不丢）→ `data.message.model` 兜底（兼容上游未来恢复顶层字段，实测 0 条携带）→ 此前最近 request/header 的 `data.header.config.model` 状态机（header 仅在路由/配置变化时写入 reason ∈ initial/resume/change，远稀疏于计费条目）**；request/header 稀疏导致的增量续读状态盲区由模块级 **per-file 会话头状态缓存**消除（key=filePath，上限 512 条近似 LRU 淘汰：fromLine ≤ 1 全量重读时重置、与缓存 cursorLine 精确衔接时恢复 sessionId/project/currentModel 并于轮末连同 nextLine 写回、不衔接如文件被 truncate 时弃用重建）；requestId = `<sessionId>:<seq>`（fork seed 继承跨文件稳定）。已用真实数据端到端验证：6084/6084 全部产出、0 跳过 |
 
 各插件共同行为：
 

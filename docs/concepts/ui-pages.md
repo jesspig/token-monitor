@@ -4,7 +4,7 @@ title: UI 页面规划
 description: 渲染层页面：Dashboard（预算横幅）、趋势（渐变面积双轴）、日志（模型/项目/自定义时间筛选）、统计、定价（只读列表+全量同步）、监控源（含 CLI 版本）、设置。
 tags: [ui, react, dashboard, recharts, budget]
 resource: src/renderer/src/
-timestamp: 2026-08-23T03:15:00+08:00
+timestamp: 2026-08-24T16:58:00+08:00
 ---
 
 # UI 页面规划
@@ -38,7 +38,7 @@ timestamp: 2026-08-23T03:15:00+08:00
 ## 实时刷新
 
 - `hooks/useUsageEvents.ts` 订阅 `usage-updated` 事件，失效 6 个用量 queryKey（`usage-summary` / `daily-trends` / `request-logs` / `stats-by-model` / `stats-by-app` / `budget-status`），TanStack Query 自动重新拉取。
-- QueryClient 全局 `refetchInterval` 为**函数形式**，经 `lib/settings-cache.ts` 动态读取设置项 `statsRefreshIntervalMs`（默认 5000ms）作为兜底轮询节奏，窗口失焦自动暂停；`useSettings` 拉取后填充缓存，保存设置后立即生效。
+- QueryClient 全局 `refetchInterval` 为**函数形式**，经 `lib/settings-cache.ts` 动态读取设置项 `statsRefreshIntervalMs`（默认 30000ms，2026-08-24 由 5000ms 上调——实时性由 usage-updated 推送保证、轮询仅兜底）作为兜底轮询节奏，窗口失焦自动暂停；`useSettings` 拉取后填充缓存，保存设置后立即生效。
 
 ## 布局与样式
 

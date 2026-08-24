@@ -4,7 +4,7 @@
 
 - Electron + TypeScript 桌面工具：监控多个 AI 编程 CLI 的 Token 用量与费用；采集方式为扫描各 CLI 本地会话日志，**不做代理拦截**。
 - **改代码前先读 `docs/index.md`**：`docs/` 知识库是唯一设计依据，全部概念页已与实现对齐（2026-08-21 审计 + 2026-08-23 第五轮迭代同步）。既定技术栈（Electron / electron-vite / React + Tailwind + TanStack Query + Recharts / better-sqlite3 / chokidar）勿擅自更改。
-- 第一阶段已交付：插件宿主 + 5 个内置监控插件（claude / codex / opencode / gemini / grok）；2026-08-23 第五轮迭代（对标 cc-switch）完成计费语义修复、语义去重接入、定价匹配增强，并完成各 CLI 最新版日志格式联网复核与兼容（claude 按 message.id 折叠流式分片；gemini 双格式兼容新版 append-only JSONL；codex output 已含 reasoning 勿加速率）；同日接入 pi / zcode / dsh 三个监控插件（内置 8 个；dsh 引入纯 JS 解压依赖 fzstd，禁止 napi 系 zstd 包以防 ABI 坑）。当前 typecheck / 346 单测 / 构建全部通过。
+- 第一阶段已交付：插件宿主 + 5 个内置监控插件（claude / codex / opencode / gemini / grok）；2026-08-23 第五轮迭代（对标 cc-switch）完成计费语义修复、语义去重接入、定价匹配增强，并完成各 CLI 最新版日志格式联网复核与兼容（claude 按 message.id 折叠流式分片；gemini 双格式兼容新版 append-only JSONL；codex output 已含 reasoning 勿加速率）；同日接入 pi / zcode / dsh 三个监控插件（内置 8 个；dsh 引入纯 JS 解压依赖 fzstd，禁止 napi 系 zstd 包以防 ABI 坑）；2026-08-24 完成主进程防阻塞性能优化（采集 mtime 短路 + watcher 定向同步 syncPlugin + 启动错峰 + 定价写入单事务批量化 + 渲染端轮询默认 30s）与 dsh 模型三级来源（source.model 优先）+ 会话头状态缓存。当前 typecheck / 361 单测 / 构建全部通过。
 
 ## 命令
 
