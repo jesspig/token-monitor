@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import type { StorageService } from '../../../shared/context'
 import type { UsageRecord } from '../../../shared/dto'
 import type { ModelPricingRow } from '../../../shared/tables'
 import type { SqliteDatabase } from './db'
@@ -659,5 +660,291 @@ describe('recalcCachedInputCosts', () => {
     const detail = db.prepare('SELECT cost_usd FROM usage_records').get() as { cost_usd: string | null }
     expect(detail.cost_usd).toBe('0.045')
     expect(db.prepare('SELECT COUNT(*) AS c FROM usage_daily_rollups').get() as { c: number }).toMatchObject({ c: 0 })
+  })
+})
+
+describe('匹配索引降复杂度一致性', () => {
+  function oracleHasBoundaryChar(ch: string | undefined): boolean {
+    return ch === '-' || ch === '.' || /\d/.test(ch ?? '')
+  }
+
+  function oracleShortIdPrefix(
+    map: Map<string, ModelPricingRow>,
+    id: string
+  ): ModelPricingRow | undefined {
+    let best: ModelPricingRow | undefined
+    let bestLen = -1
+    for (const [key, row] of map) {
+      if (id.length <= key.length || key.length <= bestLen) continue
+      if (!id.startsWith(key)) continue
+      if (!oracleHasBoundaryChar(id[key.length])) continue
+      best = row
+      bestLen = key.length
+    }
+    return best
+  }
+
+  function oracleMatchPrice(
+    map: Map<string, ModelPricingRow>,
+    model: string
+  ): ModelPricingRow | undefined {
+    const exact = map.get(model)
+    if (exact) return exact
+    const dotted = model.replace(/\./g, '-')
+    const viaDotsExact = dotted !== model ? map.get(dotted) : undefined
+    if (viaDotsExact) return viaDotsExact
+    const prefixed =
+      oracleShortIdPrefix(map, model) ??
+      (dotted !== model ? oracleShortIdPrefix(map, dotted) : undefined)
+    if (prefixed) return prefixed
+    if (model.length < 3) return undefined
+    let fallback: ModelPricingRow | undefined
+    let fallbackKey = ''
+    for (const [key, row] of map) {
+      if (model.length >= key.length || !key.startsWith(model)) continue
+      if (!oracleHasBoundaryChar(key[model.length])) continue
+      if (
+        !fallback ||
+        key.length < fallbackKey.length ||
+        (key.length === fallbackKey.length && key < fallbackKey)
+      ) {
+        fallback = row
+        fallbackKey = key
+      }
+    }
+    return fallback
+  }
+
+  async function expectOracleAgreement(storage: StorageService, queries: string[]): Promise<void> {
+    const svc = createPricingService(storage)
+    const rows = await storage.getModelPricing()
+    const map = new Map<string, ModelPricingRow>()
+    for (const row of rows) map.set(normalizeModelId(row.model_id), row)
+    for (const query of queries) {
+      expect(await svc.getPrice(query)).toEqual(oracleMatchPrice(map, normalizeModelId(query)))
+    }
+  }
+
+  it('seed 全表：各级匹配（精确/dotted 精确/短 ID/家族兜底）与 O(n) 原实现逐条一致', async () => {
+    const storage = openStorage(':memory:')
+    await seedPricing(storage)
+    await expectOracleAgreement(storage, [
+      'claude-sonnet-4-5',
+      'Anthropic/CLAUDE-SONNET-4-5-20250929',
+      'claude-opus-4.5',
+      'gemini-2.5-pro',
+      'claude-sonnet-4[1m]',
+      'gpt-4o-latest',
+      'gemini-2.5-flash-001',
+      'gemini-2-5-pro-001',
+      'grok-4-fast-reasoning-xhigh',
+      'kimi-k2-thinking-turbo-high',
+      'glm-5-xhigh',
+      'minimax-m2.7-extra',
+      'deepseek-chat-v3',
+      'qwen-plus-latest',
+      'o4-mini-fast',
+      'gpt',
+      'codex',
+      'claude',
+      'ab',
+      'unknown-model-xyz'
+    ])
+  })
+
+  it('seed 全表关键语义锚定：家族最短同长取字典序、横线式查询点号表不误配', async () => {
+    const storage = openStorage(':memory:')
+    await seedPricing(storage)
+    const svc = createPricingService(storage)
+    expect((await svc.getPrice('claude'))?.model_id).toBe('claude-opus-4')
+    expect((await svc.getPrice('gpt'))?.model_id).toBe('gpt-5')
+    expect((await svc.getPrice('codex'))?.model_id).toBe('codex-mini-latest')
+    expect(await svc.getPrice('gemini-2-5-pro-001')).toBeUndefined()
+  })
+
+  it('合成表：短 ID 最长优先、数字/点边界、家族同长字典序与 O(n) 原实现一致', async () => {
+    const storage = openStorage(':memory:')
+    const makeRow = (modelId: string, inputPerMillion: number): ModelPricingRow => ({
+      model_id: modelId,
+      provider: 'test',
+      input_per_million: inputPerMillion,
+      output_per_million: inputPerMillion * 2,
+      cache_read_per_million: 0,
+      cache_creation_per_million: 0,
+      currency: 'USD',
+      cost_multiplier: 1,
+      updated_at: 1
+    })
+    await storage.updateModelPricing(makeRow('key-b-extra', 2), 'user')
+    await storage.updateModelPricing(makeRow('key-a', 1), 'user')
+    await storage.updateModelPricing(makeRow('fam-m', 3), 'user')
+    await storage.updateModelPricing(makeRow('fam-z', 4), 'user')
+    await storage.updateModelPricing(makeRow('fam-zz', 5), 'user')
+    await storage.updateModelPricing(makeRow('alpha.beta', 6), 'user')
+    await storage.updateModelPricing(makeRow('alpha-beta', 7), 'user')
+    await storage.updateModelPricing(makeRow('m1', 8), 'user')
+    await storage.updateModelPricing(makeRow('m1-sub', 9), 'user')
+    await storage.updateModelPricing(makeRow('v2', 10), 'user')
+    await storage.updateModelPricing(makeRow('v25', 11), 'user')
+
+    await expectOracleAgreement(storage, [
+      'key',
+      'key-b',
+      'fam',
+      'fam-m2',
+      'alpha.beta.x',
+      'alpha-beta.x',
+      'alpha-betax',
+      'm1-long',
+      'm1-sub2',
+      'v25x',
+      'v25-1',
+      'ke',
+      'KEY-A',
+      'zzz'
+    ])
+
+    const svc = createPricingService(storage)
+    expect((await svc.getPrice('m1-sub2'))?.input_per_million).toBe(9)
+    expect((await svc.getPrice('v25x'))?.input_per_million).toBe(10)
+    expect((await svc.getPrice('fam'))?.input_per_million).toBe(3)
+    expect((await svc.getPrice('alpha.beta.x'))?.input_per_million).toBe(6)
+  })
+
+  it('invalidateCache 重建排序索引后新增/删除定价即时生效（短 ID 与家族路径）', async () => {
+    const storage = openStorage(':memory:')
+    const makeRow = (modelId: string, inputPerMillion: number): ModelPricingRow => ({
+      model_id: modelId,
+      provider: 'test',
+      input_per_million: inputPerMillion,
+      output_per_million: inputPerMillion * 2,
+      cache_read_per_million: 0,
+      cache_creation_per_million: 0,
+      currency: 'USD',
+      cost_multiplier: 1,
+      updated_at: 1
+    })
+    const svc = createPricingService(storage) as PricingServiceImpl
+    expect(await svc.getPrice('bnm-1')).toBeUndefined()
+
+    await storage.updateModelPricing(makeRow('bnm', 42), 'user')
+    svc.invalidateCache()
+    expect((await svc.getPrice('bnm-1'))?.input_per_million).toBe(42)
+    expect(await svc.getPrice('bnmx')).toBeUndefined()
+
+    await storage.deleteModelPricing('bnm')
+    svc.invalidateCache()
+    expect(await svc.getPrice('bnm-1')).toBeUndefined()
+  })
+})
+
+describe('calcCostBatch', () => {
+  async function makeSeededSvc() {
+    const storage = openStorage(':memory:')
+    await seedPricing(storage)
+    return { storage, svc: createPricingService(storage) as PricingServiceImpl }
+  }
+
+  it('混合用例（semantics=0/1/2、扣穿、无价、raw 归一化、dotted、effort）与逐条 calcCost 深度相等', async () => {
+    const { svc } = await makeSeededSvc()
+    const records = [
+      makeRecord({
+        model: 'claude-sonnet-4-5',
+        inputTokens: 1000,
+        outputTokens: 2000,
+        cacheReadTokens: 3000,
+        inputSemantics: 2
+      }),
+      makeRecord({
+        appType: 'codex',
+        model: 'gpt-5',
+        inputTokens: 100_000,
+        outputTokens: 1000,
+        cacheReadTokens: 80_000,
+        inputSemantics: 1
+      }),
+      makeRecord({
+        model: 'claude-sonnet-4-5',
+        inputTokens: 1000,
+        outputTokens: 2000,
+        cacheReadTokens: 3000,
+        cacheCreationTokens: 2000,
+        inputSemantics: 1
+      }),
+      makeRecord({
+        model: 'claude-sonnet-4-5',
+        inputTokens: 1000,
+        cacheReadTokens: 800,
+        inputSemantics: 0
+      }),
+      makeRecord({ model: 'unknown-model-xyz', inputTokens: 100, inputSemantics: 1 }),
+      makeRecord({
+        model: 'anthropic/claude-sonnet-4-5-20250929',
+        inputTokens: 1000,
+        inputSemantics: 2
+      }),
+      makeRecord({ model: 'claude-opus-4.5', inputTokens: 1000, inputSemantics: 2 }),
+      makeRecord({ model: 'gpt-5-high', inputTokens: 1000, inputSemantics: 2 }),
+      makeRecord({ model: 'gemini-2.5-pro', inputTokens: 1_000_000, inputSemantics: 2 })
+    ]
+
+    const batched = await svc.calcCostBatch(records)
+    const sequential = await Promise.all(records.map((r) => svc.calcCost(r)))
+
+    expect(batched).toEqual(sequential)
+    expect(batched[0]).toBe('0.0339')
+    expect(batched[1]).toBe('0.045')
+    expect(batched[2]).toBe('0.0384')
+    expect(batched[3]).toBe('0.00324')
+    expect(batched[4]).toBeUndefined()
+    expect(batched[5]).toBe('0.003')
+    expect(batched[6]).toBe('0.005')
+    expect(batched[7]).toBe('0.00125')
+    expect(batched[8]).toBe('1.25')
+  })
+
+  it('cost_multiplier 行为与逐条一致', async () => {
+    const { storage, svc } = await makeSeededSvc()
+    const row = (await svc.getPrice('claude-sonnet-4-5')) as ModelPricingRow
+    await storage.updateModelPricing({ ...row, cost_multiplier: 2, updated_at: Date.now() })
+    svc.invalidateCache()
+    const records = [makeRecord({ inputTokens: 1000 }), makeRecord({ inputTokens: 2000 })]
+
+    const batched = await svc.calcCostBatch(records)
+
+    expect(batched).toEqual(['0.006', '0.012'])
+  })
+
+  it('确定性批量循环（120 条混合模型/语义）与逐条结果一致', async () => {
+    const { svc } = await makeSeededSvc()
+    const models = [
+      'claude-sonnet-4-5',
+      'gpt-5.1-xhigh',
+      'grok-4-fast-reasoning',
+      'gemini-2.5-flash-lite',
+      'no-such-model'
+    ]
+    const bulk = Array.from({ length: 120 }, (_, i) =>
+      makeRecord({
+        model: models[i % models.length],
+        inputTokens: i * 137,
+        outputTokens: i * 31,
+        cacheReadTokens: (i % 7) * 900,
+        cacheCreationTokens: (i % 3) * 400,
+        inputSemantics: i % 3,
+        source: { filePath: '/tmp/bulk.jsonl', line: i + 1 }
+      })
+    )
+
+    const batched = await svc.calcCostBatch(bulk)
+    const sequential: (string | undefined)[] = []
+    for (const record of bulk) sequential.push(await svc.calcCost(record))
+
+    expect(batched).toEqual(sequential)
+  })
+
+  it('空数组返回空数组，且不触发索引构建外的额外查询', async () => {
+    const { svc } = await makeSeededSvc()
+    expect(await svc.calcCostBatch([])).toEqual([])
   })
 })

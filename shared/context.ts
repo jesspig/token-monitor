@@ -23,10 +23,13 @@ export interface StorageService {
   recordUsage(records: UsageRecord[]): Promise<number>
   /** 读取增量游标（未同步过返回 null） */
   getCursor(filePath: string): Promise<number | null>
-  /** 读取增量游标元信息（未同步过返回 null），供采集器 mtime 短路判定 */
-  getCursorMeta(filePath: string): Promise<{ lineOffset: number; fileMtime: number } | null>
-  /** 推进增量游标；fileMtime 用于检测文件被 truncate/替换时重置 */
-  setCursor(filePath: string, line: number, fileMtime?: number): Promise<void>
+  /** 读取增量游标元信息（未同步过返回 null），供采集器 mtime 短路判定；byteOffset 为压缩字节游标（NULL=未知） */
+  getCursorMeta(filePath: string): Promise<{ lineOffset: number; fileMtime: number; byteOffset?: number | null } | null>
+  /**
+   * 推进增量游标；fileMtime 用于检测文件被 truncate/替换时重置；
+   * byteOffset 缺省时保留现值，显式传入（含 null）时覆盖。
+   */
+  setCursor(filePath: string, line: number, fileMtime?: number, byteOffset?: number | null): Promise<void>
   getModelPricing(): Promise<ModelPricingRow[]>
   /**
    * upsert 单条定价；source 标记来源分级（user > seed/sync）：
@@ -44,6 +47,8 @@ export interface PricingService {
   normalizeModelId(rawModel: string): Promise<string>
   /** 估算费用（USD，字符串避免浮点误差）；无定价项时返回 undefined */
   calcCost(record: UsageRecord): Promise<string | undefined>
+  /** 批量估算费用：单次取定价索引后按位对应逐条计算；无定价项为 undefined；空数组短路返回 [] */
+  calcCostBatch(records: UsageRecord[]): Promise<(string | undefined)[]>
   getPrice(modelId: string): Promise<ModelPricingRow | undefined>
 }
 

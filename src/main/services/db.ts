@@ -256,6 +256,19 @@ const MIGRATIONS: Migration[] = [
       // LIKE 模式按 Windows 路径分隔符精确匹配 ~/.dsh/sessions 子树。
       db.prepare('DELETE FROM sync_cursors WHERE file_path LIKE ?').run('%\\.dsh\\sessions%')
     }
+  },
+  {
+    version: 6,
+    up(db) {
+      // dsh zstd 尾部增量解压的字节游标：记录上次已安全消费到的压缩字节偏移，
+      // 续读时从该偏移起仅解压新增帧；可空（NULL=未知），存量行与非法/脏偏移
+      // 一律回退整块解压，靠主键幂等去重兜底，不丢数据。
+      // 列已存在即跳过（schema 级幂等）：ALTER 重放会报 duplicate column，
+      // 与 v3/v4/v5 的数据级幂等一致，保证 user_version 回拨重放历史迁移安全。
+      const columns = db.pragma('table_info(sync_cursors)') as { name: string }[]
+      if (columns.some((c) => c.name === 'byte_offset')) return
+      db.exec('ALTER TABLE sync_cursors ADD COLUMN byte_offset INTEGER')
+    }
   }
 ]
 

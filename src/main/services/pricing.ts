@@ -91,18 +91,32 @@ function hasBoundaryChar(ch: string | undefined): boolean {
   return ch === '-' || ch === '.' || /\d/.test(ch ?? '')
 }
 
-/** 短 ID 前缀匹配：取最长前缀 key（如 gpt-4o-latest → gpt-4o），要求边界后继 */
-function shortIdPrefix(map: Map<string, ModelPricingRow>, id: string): ModelPricingRow | undefined {
-  let best: ModelPricingRow | undefined
-  let bestLen = -1
-  for (const [key, row] of map) {
-    if (id.length <= key.length || key.length <= bestLen) continue
-    if (!id.startsWith(key)) continue
-    if (!hasBoundaryChar(id[key.length])) continue
-    best = row
-    bestLen = key.length
+interface PricingIndex {
+  map: Map<string, ModelPricingRow>
+  keys: string[]
+}
+
+function lowerBound(sortedKeys: string[], target: string): number {
+  let lo = 0
+  let hi = sortedKeys.length
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1
+    if (sortedKeys[mid] < target) lo = mid + 1
+    else hi = mid
   }
-  return best
+  return lo
+}
+
+function shortIdPrefix(index: PricingIndex, id: string): ModelPricingRow | undefined {
+  const { map, keys } = index
+  for (let len = id.length - 1; len >= 1; len--) {
+    const key = id.slice(0, len)
+    const idx = lowerBound(keys, key)
+    if (idx >= keys.length || keys[idx] !== key) continue
+    if (!hasBoundaryChar(id[len])) continue
+    return map.get(key)
+  }
+  return undefined
 }
 
 /**
@@ -119,7 +133,9 @@ function shortIdPrefix(map: Map<string, ModelPricingRow>, id: string): ModelPric
  * 否则 claude-sonnet-4.5 会被短 ID 'claude-sonnet-4' 截胡（边界字符 '.' 通过判定），
  * 错配到上一代模型价格（如 opus-4.5 → opus-4，单价差 3 倍）。
  */
-function matchPrice(map: Map<string, ModelPricingRow>, model: string): ModelPricingRow | undefined {
+function matchPrice(index: PricingIndex, model: string): ModelPricingRow | undefined {
+  const { map, keys } = index
+
   // 级 1：原样精确
   const exact = map.get(model)
   if (exact) return exact
@@ -131,22 +147,24 @@ function matchPrice(map: Map<string, ModelPricingRow>, model: string): ModelPric
 
   // 级 3/4：短 ID 前缀（原样优先于 dotted 变体）
   const prefixed =
-    shortIdPrefix(map, model) ?? (dotted !== model ? shortIdPrefix(map, dotted) : undefined)
+    shortIdPrefix(index, model) ?? (dotted !== model ? shortIdPrefix(index, dotted) : undefined)
   if (prefixed) return prefixed
 
   // 级 5 家族兜底：key 以 model 为前缀且后继为边界字符，取最短 key
   if (model.length < MIN_FAMILY_MODEL_LENGTH) return undefined
   let fallback: ModelPricingRow | undefined
   let fallbackKey = ''
-  for (const [key, row] of map) {
-    if (model.length >= key.length || !key.startsWith(model)) continue
+  for (let i = lowerBound(keys, model); i < keys.length; i++) {
+    const key = keys[i]
+    if (!key.startsWith(model)) break
+    if (model.length >= key.length) continue
     if (!hasBoundaryChar(key[model.length])) continue
     if (
       !fallback ||
       key.length < fallbackKey.length ||
       (key.length === fallbackKey.length && key < fallbackKey)
     ) {
-      fallback = row
+      fallback = map.get(key)
       fallbackKey = key
     }
   }
@@ -156,6 +174,24 @@ function matchPrice(map: Map<string, ModelPricingRow>, model: string): ModelPric
 /** 微美元 → USD 字符串（与 storage 聚合口径一致：toFixed(6) 后去尾零） */
 function toCostString(micro: number): string {
   return (micro / 1_000_000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0'
+}
+
+function computeCost(index: PricingIndex, record: UsageRecord): string | undefined {
+  const pricing = matchPrice(index, normalizeModelId(record.model))
+  if (!pricing) return undefined
+
+  const mult = pricing.cost_multiplier ?? 1
+  const freshInput =
+    record.inputSemantics === 1
+      ? Math.max(0, record.inputTokens - record.cacheReadTokens - record.cacheCreationTokens)
+      : record.inputTokens
+  const micro = Math.round(
+    freshInput * pricing.input_per_million * mult +
+      record.outputTokens * pricing.output_per_million * mult +
+      record.cacheReadTokens * pricing.cache_read_per_million * mult +
+      record.cacheCreationTokens * pricing.cache_creation_per_million * mult
+  )
+  return toCostString(micro)
 }
 
 /** 内置模型定价 seed 项（价格为每百万 token USD 通用公开参考价） */
@@ -1026,7 +1062,7 @@ export async function seedPricing(storage: StorageService): Promise<void> {
  * 写入/删除定价后调用 invalidateCache() 使其失效。
  */
 export class PricingServiceImpl implements PricingService {
-  private priceMap: Map<string, ModelPricingRow> | null = null
+  private priceIndex: PricingIndex | null = null
 
   constructor(private readonly storage: StorageService) {}
 
@@ -1035,8 +1071,8 @@ export class PricingServiceImpl implements PricingService {
   }
 
   async getPrice(modelId: string): Promise<ModelPricingRow | undefined> {
-    const map = await this.getPriceMap()
-    return matchPrice(map, normalizeModelId(modelId))
+    const index = await this.getPriceIndex()
+    return matchPrice(index, normalizeModelId(modelId))
   }
 
   /**
@@ -1055,38 +1091,31 @@ export class PricingServiceImpl implements PricingService {
    * cost_multiplier 保持逐项相乘。
    */
   async calcCost(record: UsageRecord): Promise<string | undefined> {
-    const map = await this.getPriceMap()
-    const pricing = matchPrice(map, normalizeModelId(record.model))
-    if (!pricing) return undefined
+    const index = await this.getPriceIndex()
+    return computeCost(index, record)
+  }
 
-    const mult = pricing.cost_multiplier ?? 1
-    const freshInput =
-      record.inputSemantics === 1
-        ? Math.max(0, record.inputTokens - record.cacheReadTokens - record.cacheCreationTokens)
-        : record.inputTokens
-    const micro = Math.round(
-      freshInput * pricing.input_per_million * mult +
-        record.outputTokens * pricing.output_per_million * mult +
-        record.cacheReadTokens * pricing.cache_read_per_million * mult +
-        record.cacheCreationTokens * pricing.cache_creation_per_million * mult
-    )
-    return toCostString(micro)
+  async calcCostBatch(records: UsageRecord[]): Promise<(string | undefined)[]> {
+    if (records.length === 0) return []
+    const index = await this.getPriceIndex()
+    return records.map((record) => computeCost(index, record))
   }
 
   /** 使内存索引失效（storage 定价写入/删除后调用，getModelPricing 变化后缓存即失效） */
   invalidateCache(): void {
-    this.priceMap = null
+    this.priceIndex = null
   }
 
-  private async getPriceMap(): Promise<Map<string, ModelPricingRow>> {
-    if (this.priceMap) return this.priceMap
+  private async getPriceIndex(): Promise<PricingIndex> {
+    if (this.priceIndex) return this.priceIndex
     const rows = await this.storage.getModelPricing()
     const map = new Map<string, ModelPricingRow>()
     for (const row of rows) {
       map.set(normalizeModelId(row.model_id), row)
     }
-    this.priceMap = map
-    return map
+    const index: PricingIndex = { map, keys: Array.from(map.keys()).sort() }
+    this.priceIndex = index
+    return index
   }
 }
 
