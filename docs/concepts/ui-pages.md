@@ -4,13 +4,13 @@ title: UI 页面规划
 description: 渲染层页面：Dashboard（预算横幅）、趋势（渐变面积双轴）、日志（模型/项目/自定义时间筛选）、统计、定价（只读列表+全量同步）、监控源（含 CLI 版本）、设置。
 tags: [ui, react, dashboard, recharts, budget]
 resource: src/renderer/src/
-timestamp: 2026-08-24T16:58:00+08:00
+timestamp: 2026-08-26T00:21:00+08:00
 ---
 
 # UI 页面规划
 
 > [!note] 当前状态
-> **第一阶段已实现**（2026-08-20）：渲染层 7 个页面落地于 `src/renderer/src/`。数据层经 `api.ts` 封装 `window.api`（对齐 `shared/ipc.ts` RendererApi 契约，现 17 方法），主进程 IPC 未就绪时自动回退 `mock.ts` Mock 数据。**2026-08-22 增强**：实时刷新订阅 + 可配置轮询、今日小时桶后端化、日志页模型/项目筛选、Dashboard 预算横幅、定价页只读化（列表 + 一键全量同步，目录浏览/手动改价已下线）、监控源页 CLI 版本展示、固定侧边导航布局与全局深色滚动条；同日第四轮迭代——时间范围扩为五档（today/24h/7d/14d/30d）、统计页「按模型」视图移除应用列、轮询与价格同步间隔改为设置可配。**2026-08-23 增强**：时间范围新增「自定义」档（起止日期面板）、趋势页 Token 主图四序列渐变面积、token 数量级中文本地化（亿/万）。
+> **第一阶段已实现**（2026-08-20）：渲染层 7 个页面落地于 `src/renderer/src/`。数据层经 `api.ts` 封装 `window.api`（对齐 `shared/ipc.ts` RendererApi 契约，现 17 方法），主进程 IPC 未就绪时自动回退 `mock.ts` Mock 数据（仅 dev 动态加载，生产构建整体剔除）。**2026-08-22 增强**：实时刷新订阅 + 可配置轮询、今日小时桶后端化、日志页模型/项目筛选、Dashboard 预算横幅、定价页只读化（列表 + 一键全量同步，目录浏览/手动改价已下线）、监控源页 CLI 版本展示、固定侧边导航布局与全局深色滚动条；同日第四轮迭代——时间范围扩为五档（today/24h/7d/14d/30d）、统计页「按模型」视图移除应用列、轮询与价格同步间隔改为设置可配。**2026-08-23 增强**：时间范围新增「自定义」档（起止日期面板）、趋势页 Token 主图四序列渐变面积、token 数量级中文本地化（亿/万）。**2026-08-26 秒开优化**：内联骨架屏、七页 React.lazy 懒加载 + manualChunks 分包、事件失效冷却节流、QueryClient gcTime 30 分钟、定价表分页、模型筛选候选渲染上限（详见「加载性能」）。
 
 ## 页面清单
 
@@ -20,7 +20,7 @@ timestamp: 2026-08-24T16:58:00+08:00
 | 趋势 | 请求趋势折线 + Token 趋势（输入/输出/缓存创建/缓存命中四序列**渐变面积**堆叠 + 成本虚线右轴）；today 与 24h 范围由后端返回小时桶，其余范围按天 | ✅ `TrendsPage.tsx` |
 | 请求日志 | 分页表格 + 筛选（应用/模型多选/项目/时间/状态）+ 行详情；自定义区间应用时重置分页 | ✅ `RequestLogsPage.tsx` |
 | 统计 | 按应用 / 按模型两个聚合表 tab（维度各自独立，「按模型」视图不含应用列，表格最小宽度 800px） | ✅ `StatsPage.tsx` |
-| 定价配置 | 模型价格**只读列表**（含来源列 seed/sync/user）+「立即全量同步」按钮；增删改与在线目录浏览已下线 | ✅ `PricingPage.tsx` |
+| 定价配置 | 模型价格**只读列表**（含来源列 seed/sync/user，50/页分页 `PRICING_PAGE_SIZE`）+「立即全量同步」按钮；增删改与在线目录浏览已下线 | ✅ `PricingPage.tsx` |
 | 监控源 | 各 CLI 适配器状态（已检测/未安装/**CLI 版本**/最近同步时间/错误数） | ✅ `SourcesPage.tsx` |
 | 设置 | 同步间隔、数据保留策略、日/月预算字段、统计自动刷新间隔（秒）/ 价格同步间隔（分钟）、数据目录等（定价自动同步无启停开关，仅暴露同步间隔） | ✅ `SettingsPage.tsx` |
 
@@ -37,8 +37,16 @@ timestamp: 2026-08-24T16:58:00+08:00
 
 ## 实时刷新
 
-- `hooks/useUsageEvents.ts` 订阅 `usage-updated` 事件，失效 6 个用量 queryKey（`usage-summary` / `daily-trends` / `request-logs` / `stats-by-model` / `stats-by-app` / `budget-status`），TanStack Query 自动重新拉取。
-- QueryClient 全局 `refetchInterval` 为**函数形式**，经 `lib/settings-cache.ts` 动态读取设置项 `statsRefreshIntervalMs`（默认 30000ms，2026-08-24 由 5000ms 上调——实时性由 usage-updated 推送保证、轮询仅兜底）作为兜底轮询节奏，窗口失焦自动暂停；`useSettings` 拉取后填充缓存，保存设置后立即生效。
+- `hooks/useUsageEvents.ts` 订阅 `usage-updated` 事件，失效 6 个用量 queryKey（`usage-summary` / `daily-trends` / `request-logs` / `stats-by-model` / `stats-by-app` / `budget-status`），TanStack Query 自动重新拉取；失效带 **1000ms 冷却节流**（`INVALIDATE_COOLDOWN_MS`，2026-08-26）：冷却窗口内到达的事件合并为窗口结束后的单次失效（trailing 必发不丢尾），卸载时清理 timer——高频采集下不再每次推送都触发全量重取。
+- QueryClient 全局 `refetchInterval` 为**函数形式**，经 `lib/settings-cache.ts` 动态读取设置项 `statsRefreshIntervalMs`（默认 30000ms，2026-08-24 由 5000ms 上调——实时性由 usage-updated 推送保证、轮询仅兜底）作为兜底轮询节奏，窗口失焦自动暂停；`useSettings` 拉取后填充缓存，保存设置后立即生效。查询缓存 `gcTime` 为 **30 分钟**（`QUERY_CACHE_GC_TIME`，2026-08-26），懒加载页切走后数据不立即丢弃，切回即时渲染。
+
+## 加载性能（2026-08-26）
+
+- **骨架屏**：`index.html` 内联纯 CSS 骨架（侧边栏 + 页头 + 五卡网格 + 图表占位，配色 #0a0a0a/#262626 对齐主题）直接置于 `#root` 内，React render 后自动替换；BrowserWindow `backgroundColor: '#0a0a0a'` 消除白闪。
+- **路由级代码分割**：`App.tsx` 七页全部 `React.lazy` + `Suspense`（PAGES 类型 `LazyExoticComponent<ComponentType>`），切页按需加载 chunk。
+- **分包**：`electron.vite.config.ts` renderer 段 manualChunks——charts（recharts/d3-/victory-vendor）/ query（@tanstack）/ vendor（react|react-dom|scheduler）；首屏 entry JS 由 1574.8KB 降至 20.66KB，recharts（862.36KB）随懒加载页按需请求。
+- **Mock 生产剔除**：`mock.ts` 仅 dev 经 `import.meta.env.DEV` 守卫动态 import，生产构建整体剔除（bundle 无 mock 符号）；`api.ts` 的 isMock 判定改为 bridge 存在性探测（校验 `window.api` 方法签名），api 门面的 mock 路径惰性加载。
+- **重渲染与大数据量治理**：`TrendChart` 包 React.memo；日志页模型筛选候选渲染上限 200 条（`MODEL_FILTER_RENDER_LIMIT`）+ 输入过滤（过滤作用于全量候选、仅渲染切片截断）。
 
 ## 布局与样式
 
@@ -48,7 +56,7 @@ timestamp: 2026-08-24T16:58:00+08:00
 ## 组件拆分
 
 - 共享组件（`components/`）：`HeroCard` / `StatCard` / `RangeSelector`（含可选自定义日期面板）/ `EmptyState`（Mock 模式下提示「等待真实数据」）/ `Card` / `PageHeader` / `TrendChart`。
-- 数据层：`api.ts`（RendererApi 门面 + Mock 自动回退）、`hooks/`（TanStack Query 封装 + useUsageEvents 实时刷新）、`mock.ts`（确定性 Mock 数据集，汇总/趋势/日志/统计互相一致）、`lib/range.ts`（RangeKey 六档 → LogFilters + CustomRange 解析）、`lib/settings-cache.ts`（设置内存缓存，供 refetchInterval 等非组件路径动态读取）、`lib/format.ts`（数字/金额/时间格式化 + 数量级本地化）。
+- 数据层：`api.ts`（RendererApi 门面 + Mock 自动回退，mock 路径惰性加载、生产剔除）、`hooks/`（TanStack Query 封装 + useUsageEvents 实时刷新）、`mock.ts`（确定性 Mock 数据集，汇总/趋势/日志/统计互相一致，仅 dev 加载）、`lib/range.ts`（RangeKey 六档 → LogFilters + CustomRange 解析）、`lib/settings-cache.ts`（设置内存缓存，供 refetchInterval 等非组件路径动态读取）、`lib/format.ts`（数字/金额/时间格式化 + 数量级本地化）。
 
 > [!todo] 待补充
 > 页面的精细化交互（日志行详情联动、插件启停确认等）待后续视觉与交互迭代继续打磨。

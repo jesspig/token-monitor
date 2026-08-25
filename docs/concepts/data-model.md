@@ -4,13 +4,13 @@ title: 数据模型
 description: SQLite 五张核心表：明细、日聚合、定价、同步游标、去重账本。
 tags: [data-model, sqlite, schema, usage]
 resource: src/main/services/db.ts
-timestamp: 2026-08-25T04:54:00+08:00
+timestamp: 2026-08-26T00:21:00+08:00
 ---
 
 # 数据模型
 
 > [!note] 当前状态
-> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5）。五张表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
+> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5；2026-08-26 升级至 v6）。五张表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；v6 为 `sync_cursors` 增可空列 `byte_offset` 字节游标；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
 
 ## 表清单
 
@@ -19,7 +19,7 @@ timestamp: 2026-08-25T04:54:00+08:00
 | `usage_records` | 用量明细 | `id`（去重 key = `data_source:file_path:line`） |
 | `usage_daily_rollups` | 日聚合镜像（`recordUsage` 实时维护，聚合查询优先读它，见下方「查询语义」） | `(date, app_type, model)` |
 | `model_pricing` | 定价（含 `source` 来源分级：`seed`/`sync`/`user`） | `model_id` |
-| `sync_cursors` | 增量同步游标 | `file_path` |
+| `sync_cursors` | 增量同步游标（v6 起含可空 `byte_offset` 压缩字节游标，dsh zstd 用） | `file_path` |
 | `dedup_ledger` | 去重账本（**已接入写入路径**，2026-08-23；fork/rewrite 语义去重生效） | `(data_source, request_id)` |
 
 索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`。
@@ -43,6 +43,13 @@ timestamp: 2026-08-25T04:54:00+08:00
 - 一次性 `DELETE FROM sync_cursors WHERE file_path LIKE '%\.dsh\sessions%'`，清除 dsh 会话文件的脏游标。
 - 成因：dsh 初版适配器模型两级来源在真实数据上全部失效（`data.message.model` 全量缺失、request/header 兜底未命中），解析零产出但采集器照常把游标推进到文件末尾；后续三级来源修复又被 mtime 短路（游标与 mtime 一致即跳过）挡住，历史文件永不重析——清游标是绕过短路的自愈入口（见 [同步与去重](sync-mechanism.md)）。
 - 重放安全性：迁移执行时 `usage_records` 无任何 dsh 行、`dedup_ledger` 为空；重析后 `INSERT OR IGNORE` 主键幂等 + requestId 语义去重收敛，无重复计数风险。实测两轮启动完成全量重析：120/120 个 dsh 会话文件游标回写，6084 条 dsh 记录入库（与上游 assistant/message 总数精确吻合），dedup_ledger 同步 6084 条。
+
+## v6 字节游标列迁移（已实现，幂等）
+
+- `ALTER TABLE sync_cursors ADD COLUMN byte_offset INTEGER`（可空）：为 dsh `.jsonl.zstd` 工件记录「已安全消费到的压缩字节偏移」，续读只解压新增帧（见 [监控插件](monitor-plugins.md)）。
+- 可空语义：NULL = 未知（存量行与非法/脏偏移一律），消费方回退整块解压自愈，靠主键幂等去重兜底不丢数据。
+- schema 级幂等：ALTER 前以 `pragma table_info(sync_cursors)` 做列存在性守卫，列已存在即跳过——ALTER 重放会报 duplicate column，与 v3/v4/v5 的数据级幂等一致，保证 `user_version` 回拨重放历史迁移安全。
+- DAO 配套（storage.ts）：`getCursorMeta` 返回 `byteOffset`；`setCursor(filePath, line, fileMtime?, byteOffset?)` 缺省保留现值、显式传入（含 null）覆盖、truncate 重置时行号与 byte_offset 双清（单语句 upsert，@keep_byte_offset / @reset_cursor 控制位）；truncate 判定收紧——既有 `file_mtime = 0`（占位）不参与变化判定。
 
 ## 明细表要点
 

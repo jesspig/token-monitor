@@ -4,13 +4,13 @@ title: 定价与费用
 description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填与存量缓存口径重算；费用 = fresh_input × input 价 + 其余 token × 各自价格，input 按 semantics 三态扣减。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-08-24T16:58:00+08:00
+timestamp: 2026-08-26T00:21:00+08:00
 ---
 
 # 定价与费用
 
 > [!note] 当前状态
-> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）；2026-08-23 第五轮迭代接入输入语义计费（v4 迁移 + 存量重算）并增强匹配兜底链；**2026-08-24 定价写入批量化（seed 播种与 models.dev 同步均收敛为单事务批量 upsert，数千次独立 fsync → 1 次）与启动错峰（models.dev 首次同步延迟 10s）落地**。
+> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）；2026-08-23 第五轮迭代接入输入语义计费（v4 迁移 + 存量重算）并增强匹配兜底链；2026-08-24 定价写入批量化（seed 播种与 models.dev 同步均收敛为单事务批量 upsert，数千次独立 fsync → 1 次）与启动错峰（models.dev 首次同步延迟 10s）落地；**2026-08-26：定价索引升级排序数组 + 二分查找（短 ID/家族匹配 O(n·L) → O(L·log n)）、新增批量计费 calcCostBatch**。
 
 ## 定价表（v2，已实现）
 
@@ -27,6 +27,8 @@ timestamp: 2026-08-24T16:58:00+08:00
 ## 费用计算（已实现，按输入语义扣减）
 
 估算费用 = `fresh_input × input 价 + output × output 价 + cacheRead × read 价 + cacheCreation × write 价`（全部乘 cost_multiplier），按微美元整数精度求和后输出 USD 字符串；未找到定价项返回 undefined（记录照常入库，costUsd 为空）。
+
+**批量计费 `calcCostBatch(records)`（2026-08-26，采集主路径）**：单次取定价索引后对 records 同步逐条计算（内部复用与 `calcCost` 相同的 computeCost 纯函数），返回按位对应的费用数组——无价 undefined、空数组短路、异常向上抛；`collector.syncOne` 由逐条 await calcCost 改为一次批量调用 + 按位回填（undefined 跳过），行为与逐条完全一致。`PricingService` 契约（shared/context.ts）已同步新增该方法。
 
 **fresh_input 按 `record.inputSemantics` 三态区分口径**（SSOT 定义，与 data-model.md 一致）：
 
@@ -53,13 +55,15 @@ timestamp: 2026-08-24T16:58:00+08:00
 
 ## 定价匹配策略（已实现，五级兜底链）
 
+内存索引为 `PricingIndex{ map, keys }`：map 为归一化 ID → 定价行，keys 为**字典序排序**的 key 数组（缓存重建时排序一次，`invalidateCache` 后随重建刷新）。前缀类匹配经 `lowerBound` 二分定位（2026-08-26，短 ID/家族匹配由 O(n·L) 线性扫描降为 O(L·log n)）。
+
 `matchPrice` 按序尝试，命中即返回：
 
 1. **精确**匹配归一化 ID；
 2. **点转横线变体的精确匹配**（`claude-sonnet-4.5 → claude-sonnet-4-5`）：仅作查价尝试，不进入 normalizeModelId——Gemini 等官方 id 自带点号，无条件转换会破坏精确命中；
-3. **短 ID 匹配带版本/后缀项**（请求 ID 以定价 key 为前缀且后继为边界字符 `-`/`.`/数字时命中，取最长 key，避免家族误配）；
+3. **短 ID 匹配带版本/后缀项**（请求 ID 以定价 key 为前缀且后继为边界字符 `-`/`.`/数字时命中，取最长 key，避免家族误配）：从长到短枚举请求 ID 的真前缀，每个候选经二分判存在；
 4. 点转横线变体的短 ID 匹配（同规则作用于 dotted 变体）；
-5. **家族兜底**：定价 key 以请求 ID 为前缀且后继为边界字符时取**最短 key**（避免过专分档误配），仅当请求 ID 长度 ≥3 才启用。
+5. **家族兜底**：定价 key 以请求 ID 为前缀且后继为边界字符时取**最短 key**（避免过专分档误配），仅当请求 ID 长度 ≥3 才启用；在排序数组上从 lowerBound 起连续段扫描，最短优先、同长取字典序。
 
 > 排序约束：级 2 必须先于级 3——否则 `claude-opus-4.5` 会被短 ID `claude-opus-4` 截胡（`.` 通过边界判定），错配上一代价格（单价差 3 倍）；有防回归用例。
 
