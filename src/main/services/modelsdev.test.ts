@@ -68,16 +68,19 @@ function userRow(modelId: string): ModelPricingRow {
   }
 }
 
-/** 包装真实存储：仅对指定 model_id 的写入抛错，其余透传 */
-function withWriteFailure(inner: SqliteStorage, failOnModelId: string): StorageService {
+/** 包装真实存储：updateModelPricingBatch 整体抛错，其余透传 */
+function withBatchWriteFailure(inner: SqliteStorage): StorageService {
   return {
     recordUsage: (records) => inner.recordUsage(records),
     getCursor: (filePath) => inner.getCursor(filePath),
+    getCursorMeta: (filePath) => inner.getCursorMeta(filePath),
     setCursor: (filePath, line, fileMtime) => inner.setCursor(filePath, line, fileMtime),
     getModelPricing: () => inner.getModelPricing(),
     updateModelPricing: async (entry, source) => {
-      if (entry.model_id === failOnModelId) throw new Error('simulated write failure')
       await inner.updateModelPricing(entry, source)
+    },
+    updateModelPricingBatch: async () => {
+      throw new Error('simulated batch write failure')
     },
     deleteModelPricing: (modelId) => inner.deleteModelPricing(modelId)
   }
@@ -262,24 +265,16 @@ describe('syncPricing 经真实 SqliteStorage（:memory:）', () => {
     }
   })
 
-  it('单条写入异常计入 skipped 且不中断其余导入', async () => {
+  it('批量写入异常向上抛出且不落库', async () => {
     // Arrange
     const { storage, db } = makeStorage()
     try {
-      const flaky = withWriteFailure(storage, 'claude-haiku')
+      const flaky = withBatchWriteFailure(storage)
       stubFetch(FIXTURE)
 
-      // Act
-      const result = await syncPricing(flaky)
-
-      // Assert：解析丢弃 4 + 写入异常 1 = skipped 5
-      expect(result.fetched).toBe(7)
-      expect(result.imported).toBe(2)
-      expect(result.skipped).toBe(5)
-      const ids = (await flaky.getModelPricing()).map((r) => r.model_id)
-      expect(ids).not.toContain('claude-haiku')
-      expect(ids).toContain('claude-opus-4-1')
-      expect(ids).toContain('key-only-model')
+      // Act & Assert：批量失败 = 全失败，与「网络失败直接抛」同级
+      await expect(syncPricing(flaky)).rejects.toThrow('simulated batch write failure')
+      expect(await flaky.getModelPricing()).toHaveLength(0)
     } finally {
       db.close()
     }

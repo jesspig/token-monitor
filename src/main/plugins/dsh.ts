@@ -23,11 +23,15 @@ import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../s
  *   inputSemantics=2（与 pi/opencode 同模式）；reasoningTokens 为 outputTokens 子集，
  *   不加速率（与 token-meter 同口径）；
  * - packed chunk rows 仅出现在 assistant/chunk 流水，按 type 白名单过滤天然跳过；
- * - 计费条目模型取两级来源：data.message.model 非空时优先（兼容上游未来恢复字段），
- *   否则取最近一条 type==='request/header' 行的 data.header.config.model（每步 dispatch
- *   前写入日志；实测 ~/.dsh/sessions 全量 120 个会话 / 6084 条 assistant/message 中
- *   message.model 0 条存在而 data.usage 100% 存在，模型仅随请求头携带），两者皆无则跳过；
- * - data.message.provider 为供应方，UsageRecord 无对应字段故丢弃。
+ * - 计费条目模型取三级来源：data.message.source.model 非空时优先（AssistantProvenance
+ *   per-message 自带，实测 473/473 全部携带，增量续读永不丢），其次 data.message.model
+ *   （兼容上游未来恢复顶层字段；120 文件 / 6084 条实测 0 条携带），最后回落最近一条
+ *   type==='request/header' 行的 data.header.config.model 兜底（header 仅在路由/配置变化
+ *   时写入，reason ∈ initial/resume/change，远稀疏于计费条目），三者皆无则跳过；
+ * - request/header 稀疏造成的增量续读状态盲区由模块级会话头状态缓存（sessionStateCache）
+ *   消除：每轮结束时把 sessionId/project/currentModel 连同游标写回（key=filePath，
+ *   上限 512 条淘汰最早插入），下轮起点与缓存游标精确衔接时恢复，不衔接则弃用重建；
+ * - data.message.provider / source.provider 为供应方标注，UsageRecord 无对应字段故丢弃。
  */
 
 /** 数据根下 sessions 目录：$DSH_HOME 覆盖 dsh home（trim 非空才用），默认 ~/.dsh/sessions */
@@ -123,9 +127,10 @@ const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(
 /**
  * 单条 storage record envelope → UsageRecord。
  * 仅 type==='assistant/message'、message.role 无 assistant 异值（宽松：role 缺失放行）
- * 且 usage 为对象时产出。模型两级来源：data.message.model 非空时优先（兼容上游未来
- * 恢复字段），否则取 session.currentModel（此前最近一条 request/header 的
- * data.header.config.model；120 文件 / 6084 条实测 message 均无自带 model）；两者皆无
+ * 且 usage 为对象时产出。模型三级来源：data.message.source.model 非空时优先（宽松判对象
+ * 取字符串 trim 非空才用；per-message 自带，473/473 实测全部携带，续读永不丢），其次
+ * data.message.model（兼容上游未来恢复顶层字段），最后回落 session.currentModel（此前
+ * 最近一条 request/header 的 data.header.config.model）；三者皆无
  * 返回 null（跳过该条，不阻塞整体）。
  * requestId 取 `<sessionId>:<seq>`：seq 为会话内单调序号，跨 fork 文件（seed 继承）稳定，
  * 同一逻辑请求复制进新文件时由 storage 按 (data_source, request_id) 语义判重收敛；
@@ -150,9 +155,12 @@ function toUsageRecord(
   // 宽松 role 校验：上游 AssistantMessage role 恒为 'assistant'，仅显式异值才拒收
   if (msg.role !== undefined && msg.role !== 'assistant') return null
 
-  // 两级模型来源：message 自带 model 优先，缺失回落当前请求头模型，皆无则跳过
+  // 三级模型来源：message.source.model → message.model → 当前请求头模型，任一非空即用
+  const source =
+    msg.source && typeof msg.source === 'object' ? (msg.source as Record<string, unknown>) : undefined
+  const sourceModel = source && typeof source.model === 'string' ? source.model.trim() : ''
   const ownModel = typeof msg.model === 'string' ? msg.model.trim() : ''
-  const model = ownModel || session.currentModel || ''
+  const model = sourceModel || ownModel || session.currentModel || ''
   if (!model) return null
 
   const usage = d.usage
@@ -191,6 +199,24 @@ function toUsageRecord(
   }
 }
 
+/** 会话头状态：sessionId/project 来自 header 行，currentModel 来自最近的 request/header 行 */
+interface SessionHeadState {
+  sessionId?: string
+  project?: string
+  currentModel?: string
+  cursorLine: number
+}
+
+/** 会话头状态缓存上限：超限淘汰最早插入条目（Map 保持插入序） */
+const SESSION_STATE_CACHE_MAX = 512
+
+/**
+ * per-file 会话头状态缓存（key=filePath）：request/header 稀疏（仅路由/配置变化时写入），
+ * 增量续读窗口常不含任何 header 行，靠上轮写回的状态消除续读盲区。
+ * Node 单线程串行解析，无需锁。
+ */
+const sessionStateCache = new Map<string, SessionHeadState>()
+
 /**
  * 增量解析：从 fromLine 行（1-based 行号，0 表示从文件开头）续读。
  * - .jsonl.zstd 结尾的工件先经 fzstd 解压（zstd 标准帧拼接可整文件解压）再逐行解析；
@@ -199,9 +225,10 @@ function toUsageRecord(
  *   时游标停在该行下次重试，避免丢失正在写入的内容；
  * - 会话状态机：首条 type==='session' 行取 id（sessionId）与 cwd（project），
  *   type==='request/header' 行取 data.header.config.model（当前模型，供其后的
- *   assistant/message 计费条目回落使用）；增量续读越过 session header 或 request/header
- *   时对应状态缺失：sessionId/project 保持 undefined，无自带模型的计费条目被跳过且水位
- *   照常推进（与 pi/gemini JSONL 越过 header 的语义一致）。
+ *   assistant/message 计费条目回落使用）；fromLine ≤ 1 全量重读时重置缓存，
+ *   fromLine > 1 且与缓存的 cursorLine 精确衔接时恢复上轮状态，不衔接（如文件被
+ *   truncate 游标重置）则弃用缓存按现状从头重建；本轮结束把最终状态连同 nextLine
+ *   写回缓存，供下轮续读使用。
  */
 async function parseFile(_ctx: PluginContext, filePath: string, fromLine: number): Promise<ParsedResult> {
   let content: string
@@ -225,6 +252,18 @@ async function parseFile(_ctx: PluginContext, filePath: string, fromLine: number
   let sessionId: string | undefined
   let project: string | undefined
   let currentModel: string | undefined
+  // fromLine ≤ 1 视为全量重读重置缓存；fromLine > 1 且与缓存游标精确衔接时恢复上轮状态，
+  // 不衔接（如文件被 truncate 游标重置）则弃用缓存按现状从头重建
+  const cached = sessionStateCache.get(filePath)
+  if (fromLine <= 1) {
+    sessionStateCache.delete(filePath)
+  } else if (cached && cached.cursorLine === fromLine) {
+    // 命中后先删除再于轮末重写回：活跃文件的插入位刷新到最新，近似 LRU 淘汰
+    sessionStateCache.delete(filePath)
+    sessionId = cached.sessionId
+    project = cached.project
+    currentModel = cached.currentModel
+  }
   let headerSeen = false
   let nextLine = fromLine
   let eof = false
@@ -289,6 +328,13 @@ async function parseFile(_ctx: PluginContext, filePath: string, fromLine: number
 
   // 读到文件结尾即 EOF（尾部不完整行分支已置 eof）
   if (!eof) eof = true
+
+  // 最终会话头状态连同游标写回缓存，供下轮续读衔接；超限淘汰最早插入条目
+  sessionStateCache.set(filePath, { sessionId, project, currentModel, cursorLine: nextLine })
+  if (sessionStateCache.size > SESSION_STATE_CACHE_MAX) {
+    const oldest = sessionStateCache.keys().next().value
+    if (oldest !== undefined) sessionStateCache.delete(oldest)
+  }
 
   return { records, nextLine, eof }
 }

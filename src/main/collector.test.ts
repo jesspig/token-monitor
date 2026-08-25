@@ -47,9 +47,11 @@ function makeCtx(): { ctx: PluginContext; recorded: UsageRecord[] } {
         return records.length
       }),
       getCursor: vi.fn(async () => null),
+      getCursorMeta: vi.fn(async () => null),
       setCursor: vi.fn(async () => undefined),
       getModelPricing: vi.fn(async () => []),
       updateModelPricing: vi.fn(async () => undefined),
+      updateModelPricingBatch: vi.fn(async (entries: unknown[]) => entries.length),
       deleteModelPricing: vi.fn(async () => undefined)
     },
     pricing: {
@@ -152,5 +154,164 @@ describe('getPluginStatus CLI 版本接线', () => {
 
     expect(statuses[0].id).toBe('grok')
     expect('cliVersion' in statuses[0]).toBe(false)
+  })
+})
+
+describe('syncAll mtime 短路', () => {
+  it('游标 mtime 与文件一致且均非 0 时跳过：不解析、不入库、不推游标', async () => {
+    // Arrange
+    const { ctx } = makeCtx()
+    vi.mocked(ctx.storage.getCursorMeta).mockResolvedValue({
+      lineOffset: 5,
+      fileMtime: 1000
+    })
+    const parseSpy = vi.fn(async () => ({ records: [], nextLine: 5, eof: true }))
+    const collector = createCollector(ctx, [
+      makePlugin([], {
+        listFiles: async () => [{ path: FAKE_FILE, mtime: 1000 }],
+        parseFile: parseSpy
+      })
+    ])
+
+    // Act
+    const result = await collector.syncAll()
+
+    // Assert
+    expect(parseSpy).toHaveBeenCalledTimes(0)
+    expect(ctx.storage.recordUsage).toHaveBeenCalledTimes(0)
+    expect(ctx.storage.setCursor).toHaveBeenCalledTimes(0)
+    expect(result.imported).toBe(0)
+    expect(result.addedRecords).toBe(0)
+  })
+
+  it('mtime 变化后照常解析，parseFile 以游标 lineOffset 续读', async () => {
+    // Arrange
+    const { ctx, recorded } = makeCtx()
+    vi.mocked(ctx.storage.getCursorMeta).mockResolvedValue({
+      lineOffset: 7,
+      fileMtime: 1000
+    })
+    const record = makeRecord({ source: { filePath: FAKE_FILE, line: 8 } })
+    const parseSpy = vi.fn(async () => ({ records: [record], nextLine: 8, eof: true }))
+    const collector = createCollector(ctx, [
+      makePlugin([], {
+        listFiles: async () => [{ path: FAKE_FILE, mtime: 2000 }],
+        parseFile: parseSpy
+      })
+    ])
+
+    // Act
+    const result = await collector.syncAll()
+
+    // Assert
+    expect(parseSpy).toHaveBeenCalledTimes(1)
+    expect(parseSpy).toHaveBeenCalledWith(ctx, FAKE_FILE, 7)
+    expect(recorded).toEqual([record])
+    expect(ctx.storage.setCursor).toHaveBeenCalledWith(FAKE_FILE, 8, 2000)
+    expect(result.addedRecords).toBe(1)
+  })
+
+  it('file.mtime 与游标 fileMtime 均为 0 时不短路，照常解析', async () => {
+    // Arrange
+    const { ctx } = makeCtx()
+    vi.mocked(ctx.storage.getCursorMeta).mockResolvedValue({ lineOffset: 5, fileMtime: 0 })
+    const record = makeRecord({ source: { filePath: FAKE_FILE, line: 6 } })
+    const parseSpy = vi.fn(async () => ({ records: [record], nextLine: 6, eof: true }))
+    const collector = createCollector(ctx, [
+      makePlugin([], {
+        listFiles: async () => [{ path: FAKE_FILE, mtime: 0 }],
+        parseFile: parseSpy
+      })
+    ])
+
+    // Act
+    await collector.syncAll()
+
+    // Assert
+    expect(parseSpy).toHaveBeenCalledTimes(1)
+    expect(parseSpy).toHaveBeenCalledWith(ctx, FAKE_FILE, 5)
+    expect(ctx.storage.setCursor).toHaveBeenCalledWith(FAKE_FILE, 6, 0)
+  })
+
+  it('游标不存在（getCursorMeta 返回 null）时从第 0 行全量解析', async () => {
+    // Arrange
+    const { ctx } = makeCtx()
+    const record = makeRecord({ source: { filePath: FAKE_FILE, line: 1 } })
+    const parseSpy = vi.fn(async () => ({ records: [record], nextLine: 1, eof: true }))
+    const collector = createCollector(ctx, [makePlugin([], { parseFile: parseSpy })])
+
+    // Act
+    await collector.syncAll()
+
+    // Assert
+    expect(parseSpy).toHaveBeenCalledWith(ctx, FAKE_FILE, 0)
+  })
+})
+
+describe('syncPlugin 定向同步', () => {
+  it('只同步目标插件：另一插件的 detect/listFiles/parseFile 完全不被触碰', async () => {
+    // Arrange
+    const { ctx, recorded } = makeCtx()
+    const recordA = makeRecord({ source: { filePath: FAKE_FILE, line: 1 } })
+    const untouchedFns = {
+      detect: vi.fn(async () => ({ available: true, sessionDir: '/tmp/other' })),
+      listFiles: vi.fn(async () => [{ path: '/tmp/other/session.jsonl', mtime: 1 }]),
+      parseFile: vi.fn(async () => ({ records: [], nextLine: 0, eof: true }))
+    }
+    const collector = createCollector(ctx, [
+      makePlugin([recordA]),
+      makePlugin([], { id: 'grok', ...untouchedFns })
+    ])
+
+    // Act
+    const result = await collector.syncPlugin('opencode')
+
+    // Assert
+    expect(result.imported).toBe(1)
+    expect(result.addedRecords).toBe(1)
+    expect(recorded).toEqual([recordA])
+    expect(untouchedFns.detect).toHaveBeenCalledTimes(0)
+    expect(untouchedFns.listFiles).toHaveBeenCalledTimes(0)
+    expect(untouchedFns.parseFile).toHaveBeenCalledTimes(0)
+  })
+
+  it('对不存在的插件 id 返回零值结果且不抛错', async () => {
+    // Arrange
+    const { ctx } = makeCtx()
+    const collector = createCollector(ctx, [makePlugin([])])
+
+    // Act
+    const result = await collector.syncPlugin('codex')
+
+    // Assert
+    expect(result).toEqual({ imported: 0, errors: 0, addedRecords: 0 })
+    expect(ctx.storage.recordUsage).toHaveBeenCalledTimes(0)
+  })
+
+  it('有新增记录时推 usage-updated；无新增时不推', async () => {
+    // Arrange
+    const { ctx } = makeCtx()
+    const record = makeRecord({ source: { filePath: FAKE_FILE, line: 1 } })
+    const collector = createCollector(ctx, [makePlugin([record])])
+
+    // Act
+    const first = await collector.syncPlugin('opencode')
+
+    // Assert
+    expect(first.addedRecords).toBe(1)
+    expect(ctx.events.emit).toHaveBeenCalledWith(
+      'usage-updated',
+      expect.objectContaining({ addedRecords: 1 })
+    )
+
+    // Arrange：mtime 短路后无新增
+    vi.mocked(ctx.storage.getCursorMeta).mockResolvedValue({ lineOffset: 1, fileMtime: 1 })
+
+    // Act
+    const second = await collector.syncPlugin('opencode')
+
+    // Assert
+    expect(second.addedRecords).toBe(0)
+    expect(ctx.events.emit).toHaveBeenCalledTimes(1)
   })
 })

@@ -41,13 +41,17 @@ import { watcherService } from './services/watcher'
 
 const DEFAULT_SYNC_INTERVAL_MS = 300_000
 const DEFAULT_RETENTION_DAYS = 90
-/** 统计自动刷新间隔默认值（ms），渲染端查询轮询用 */
-const DEFAULT_STATS_REFRESH_INTERVAL_MS = 5_000
+/** 统计自动刷新间隔默认值（ms），渲染端查询轮询兜底用；实时性由 usage-updated 推送保证 */
+const DEFAULT_STATS_REFRESH_INTERVAL_MS = 30_000
 /** models.dev 定价自动同步默认周期（ms）：默认权威数据源，每 5 分钟全量同步一次 */
 const DEFAULT_PRICING_SYNC_INTERVAL_MS = 300_000
 const SETTINGS_FILENAME = 'settings.json'
 /** 启动后延迟执行的首次过期明细清理（ms） */
 const RETENTION_SWEEP_DELAY_MS = 30_000
+/** 启动错峰延迟（ms）：首次立即同步之外的非关键任务依次错开，避免与首轮采集争抢 IO */
+const STARTUP_PRICING_SYNC_DELAY_MS = 10_000
+const STARTUP_ZERO_COST_BACKFILL_DELAY_MS = 20_000
+const STARTUP_RECALC_COSTS_DELAY_MS = 30_000
 
 export interface HostOptions {
   /** 数据目录；省略则用内存库（:memory:），适合测试 */
@@ -184,7 +188,7 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
   })
 
   // 以 LifecyclePlugin 包装内置插件：装载时把该插件探测到的会话目录注册进 watcher，
-  // 目录内文件变更即触发全量同步（debounce 500ms 合并高频事件）
+  // 目录内文件变更即触发该插件的定向同步（debounce 500ms 合并高频事件）
   const plugins: LifecyclePlugin[] = BUILTIN_PLUGINS.map((p) => ({
     ...p,
     onMount: async (pctx): Promise<(() => void) | undefined> => {
@@ -195,7 +199,7 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
         return undefined
       }
       if (!det.available || !det.sessionDir) return undefined
-      return pctx.watcher.registerWatcher(det.sessionDir, () => void collector.syncAll(), {
+      return pctx.watcher.registerWatcher(det.sessionDir, () => void collector.syncPlugin(p.id), {
         debounceMs: 500
       })
     }
@@ -280,27 +284,34 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
   }
 
   startPricingAutoSync()
-  void syncModelsDevPricing().catch((err) => {
-    console.error('[host] 启动 models.dev 定价同步失败:', err)
-  })
-  void runZeroCostBackfill().catch((err) => {
-    console.error('[host] 启动零成本回填失败:', err)
-  })
+  // 启动错峰：定价同步/零成本回填/存量费用重算延迟触发，不与首轮采集同一时刻点火
+  const startupPricingSyncTimer = setTimeout(() => {
+    void syncModelsDevPricing().catch((err) => {
+      console.error('[host] 启动 models.dev 定价同步失败:', err)
+    })
+  }, STARTUP_PRICING_SYNC_DELAY_MS)
+  const startupZeroCostBackfillTimer = setTimeout(() => {
+    void runZeroCostBackfill().catch((err) => {
+      console.error('[host] 启动零成本回填失败:', err)
+    })
+  }, STARTUP_ZERO_COST_BACKFILL_DELAY_MS)
 
   // 计费语义修复的一次性存量修正：codex/gemini/grok 历史高估费用按活定价重算
   // （重算一致零写入，天然幂等，故只随启动执行、不挂进 models.dev 同步链路）；
   // opencode 的语义错标已由 v4 迁移直接修正。失败仅记日志，不阻塞启动。
-  void recalcCachedInputCosts(db, pricing)
-    .then((result) => {
-      if (result.updated > 0) {
-        console.log(
-          `[host] 存量缓存口径费用重算完成: scanned=${result.scanned} updated=${result.updated}`
-        )
-      }
-    })
-    .catch((err) => {
-      console.error('[host] 启动存量费用重算失败:', err)
-    })
+  const startupRecalcCostsTimer = setTimeout(() => {
+    void recalcCachedInputCosts(db, pricing)
+      .then((result) => {
+        if (result.updated > 0) {
+          console.log(
+            `[host] 存量缓存口径费用重算完成: scanned=${result.scanned} updated=${result.updated}`
+          )
+        }
+      })
+      .catch((err) => {
+        console.error('[host] 启动存量费用重算失败:', err)
+      })
+  }, STARTUP_RECALC_COSTS_DELAY_MS)
 
   return {
     ctx,
@@ -338,6 +349,9 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
     runZeroCostBackfill,
     dispose() {
       clearTimeout(startupSweepTimer)
+      clearTimeout(startupPricingSyncTimer)
+      clearTimeout(startupZeroCostBackfillTimer)
+      clearTimeout(startupRecalcCostsTimer)
       stopRetentionSweep?.()
       stopRetentionSweep = null
       stopPricingAutoSync?.()

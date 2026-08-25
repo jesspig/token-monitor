@@ -245,6 +245,17 @@ const MIGRATIONS: Migration[] = [
          WHERE app_type = 'opencode' AND input_semantics = 1`
       ).run()
     }
+  },
+  {
+    version: 5,
+    up(db) {
+      // dsh 初版适配器模型来源失效（message.model 实测全量缺失）导致「零记录
+      // 但游标推满」的脏状态；三级来源修复后历史文件又被 mtime 短路挡住无法
+      // 重析。清除 dsh 会话游标让下轮同步全量重析：usage_records 无 dsh 行且
+      // dedup_ledger 空，INSERT OR IGNORE 主键幂等，重放无重复计数风险。
+      // LIKE 模式按 Windows 路径分隔符精确匹配 ~/.dsh/sessions 子树。
+      db.prepare('DELETE FROM sync_cursors WHERE file_path LIKE ?').run('%\\.dsh\\sessions%')
+    }
   }
 ]
 

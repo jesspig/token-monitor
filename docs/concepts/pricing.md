@@ -4,13 +4,13 @@ title: 定价与费用
 description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填与存量缓存口径重算；费用 = fresh_input × input 价 + 其余 token × 各自价格，input 按 semantics 三态扣减。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-08-23T03:15:00+08:00
+timestamp: 2026-08-24T16:58:00+08:00
 ---
 
 # 定价与费用
 
 > [!note] 当前状态
-> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）；2026-08-23 第五轮迭代接入输入语义计费（v4 迁移 + 存量重算）并增强匹配兜底链。
+> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）；2026-08-23 第五轮迭代接入输入语义计费（v4 迁移 + 存量重算）并增强匹配兜底链；**2026-08-24 定价写入批量化（seed 播种与 models.dev 同步均收敛为单事务批量 upsert，数千次独立 fsync → 1 次）与启动错峰（models.dev 首次同步延迟 10s）落地**。
 
 ## 定价表（v2，已实现）
 
@@ -65,15 +65,15 @@ timestamp: 2026-08-23T03:15:00+08:00
 
 ## 内置 seed 价格清单（已实现）
 
-启动时 `seedPricing` 以 `source='seed'` upsert 写入 **99 个主流模型**（币种 USD，公开参考价；已存在的非 user 行按分级覆盖规则更新）。**seed 仅作离线兜底**：启动序列在 seed 后立即执行一次 models.dev 全量同步，权威价格以 sync 价为准。完整清单以源码为准（`src/main/services/pricing.ts` 的 seed 数据），此处不再逐条罗列。
+启动时 `seedPricing` 以 `source='seed'` **单事务批量** upsert 写入 **99 个主流模型**（币种 USD，公开参考价；已存在的非 user 行按分级覆盖规则更新）。**seed 仅作离线兜底**：启动序列在 seed 后执行一次 models.dev 全量同步，权威价格以 sync 价为准。完整清单以源码为准（`src/main/services/pricing.ts` 的 seed 数据），此处不再逐条罗列。
 
 ## models.dev 自动同步（已实现，无启停开关，间隔可配）
 
-落地于 `src/main/services/modelsdev.ts`：拉取 models.dev `api.json` 全量目录并把条目映射为定价行写入（`source='sync'`）。cost 四档（input / output / cache_read / cache_creation）直接映射；**cost 档缺失补 0**；input/output 缺失的条目整条丢弃。目录拉取是同步的内部步骤，不再暴露独立的在线浏览通道。
+落地于 `src/main/services/modelsdev.ts`：拉取 models.dev `api.json` 全量目录并把条目映射为定价行写入（`source='sync'`）。cost 四档（input / output / cache_read / cache_creation）直接映射；**cost 档缺失补 0**；input/output 缺失的条目整条丢弃。写入经 `storage.updateModelPricingBatch` **单事务批量 upsert**（2026-08-24 由逐条独立事务改批，数千次 fsync 收敛为 1 次；user 分级保护在批量路径同样生效；批量失败即整体失败向上抛）。目录拉取是同步的内部步骤，不再暴露独立的在线浏览通道。
 
 同步完全自动化（宿主 `host.ts`）：
 
-- 启动序列 seed 定价后**立即执行一次**全量同步；
+- 启动序列 seed 定价后**延迟 10 秒**执行一次全量同步（2026-08-24 启动错峰，避免与首轮采集同帧争抢 IO）；
 - 此后经 scheduler 按 `pricingSyncIntervalMs` 周期执行（默认 `300000` = 5 分钟），设置变更时即时重启调度；无启停开关，UI 仅在设置页暴露间隔输入（分钟）；
 - PricingPage 仅保留「立即全量同步」按钮，手动触发同一宿主入口。
 

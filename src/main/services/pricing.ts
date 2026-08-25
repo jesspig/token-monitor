@@ -1000,28 +1000,24 @@ export const SEED_MODELS: SeedModelDef[] = [
 
 /**
  * 向 storage 写入内置模型定价（docs/concepts/pricing.md）。
- * 经 storage.updateModelPricing 逐条 upsert，来源标记为 'seed'：
+ * 构造全部行后经 storage.updateModelPricingBatch 单事务批量 upsert，来源标记为 'seed'：
  * 已存在的 seed/sync 行会被覆盖刷新（重启重播幂等），不会产生重复行；
  * 'user' 行受分级保护不被覆盖；未存在的则插入。
  */
 export async function seedPricing(storage: StorageService): Promise<void> {
   const now = Date.now()
-  for (const m of SEED_MODELS) {
-    await storage.updateModelPricing(
-      {
-        model_id: m.model_id,
-        provider: m.provider,
-        input_per_million: m.input_per_million,
-        output_per_million: m.output_per_million,
-        cache_read_per_million: m.cache_read_per_million,
-        cache_creation_per_million: m.cache_creation_per_million,
-        currency: 'USD',
-        cost_multiplier: 1,
-        updated_at: now
-      },
-      'seed'
-    )
-  }
+  const rows: ModelPricingRow[] = SEED_MODELS.map((m) => ({
+    model_id: m.model_id,
+    provider: m.provider,
+    input_per_million: m.input_per_million,
+    output_per_million: m.output_per_million,
+    cache_read_per_million: m.cache_read_per_million,
+    cache_creation_per_million: m.cache_creation_per_million,
+    currency: 'USD',
+    cost_multiplier: 1,
+    updated_at: now
+  }))
+  await storage.updateModelPricingBatch(rows, 'seed')
 }
 
 /**

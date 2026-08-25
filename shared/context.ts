@@ -23,6 +23,8 @@ export interface StorageService {
   recordUsage(records: UsageRecord[]): Promise<number>
   /** 读取增量游标（未同步过返回 null） */
   getCursor(filePath: string): Promise<number | null>
+  /** 读取增量游标元信息（未同步过返回 null），供采集器 mtime 短路判定 */
+  getCursorMeta(filePath: string): Promise<{ lineOffset: number; fileMtime: number } | null>
   /** 推进增量游标；fileMtime 用于检测文件被 truncate/替换时重置 */
   setCursor(filePath: string, line: number, fileMtime?: number): Promise<void>
   getModelPricing(): Promise<ModelPricingRow[]>
@@ -31,6 +33,8 @@ export interface StorageService {
    * user 行不被非 user 写入覆盖，缺省视为 'user'（向后兼容旧调用）。
    */
   updateModelPricing(entry: ModelPricingRow, source?: PricingSource): Promise<void>
+  /** 单事务批量 upsert 定价（分级保护规则与 updateModelPricing 完全一致）；返回实际写入条数 */
+  updateModelPricingBatch(entries: ModelPricingRow[], source: PricingSource): Promise<number>
   deleteModelPricing(modelId: string): Promise<void>
 }
 
