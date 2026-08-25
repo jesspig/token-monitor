@@ -4,13 +4,13 @@ title: 数据模型
 description: SQLite 五张核心表：明细、日聚合、定价、同步游标、去重账本。
 tags: [data-model, sqlite, schema, usage]
 resource: src/main/services/db.ts
-timestamp: 2026-08-23T03:15:00+08:00
+timestamp: 2026-08-25T04:54:00+08:00
 ---
 
 # 数据模型
 
 > [!note] 当前状态
-> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4）。五张表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
+> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5）。五张表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
 
 ## 表清单
 
@@ -37,6 +37,12 @@ timestamp: 2026-08-23T03:15:00+08:00
 - 一次性 `DELETE` 明细表中 input / output / cache_read / cache_creation **四项全 0** 的历史脏数据。
 - 对受影响日期：先清空 `usage_daily_rollups` 当日全部桶，再按剩余明细 GROUP BY 重建（聚合口径与 `recordUsage` 一致，保持 rollup ≡ 组内明细和的不变量）。
 - `sync_cursors` 游标**不动**，不影响后续增量同步；重复执行时无全零行即无操作。
+
+## v5 脏游标清除迁移（已实现，幂等）
+
+- 一次性 `DELETE FROM sync_cursors WHERE file_path LIKE '%\.dsh\sessions%'`，清除 dsh 会话文件的脏游标。
+- 成因：dsh 初版适配器模型两级来源在真实数据上全部失效（`data.message.model` 全量缺失、request/header 兜底未命中），解析零产出但采集器照常把游标推进到文件末尾；后续三级来源修复又被 mtime 短路（游标与 mtime 一致即跳过）挡住，历史文件永不重析——清游标是绕过短路的自愈入口（见 [同步与去重](sync-mechanism.md)）。
+- 重放安全性：迁移执行时 `usage_records` 无任何 dsh 行、`dedup_ledger` 为空；重析后 `INSERT OR IGNORE` 主键幂等 + requestId 语义去重收敛，无重复计数风险。实测两轮启动完成全量重析：120/120 个 dsh 会话文件游标回写，6084 条 dsh 记录入库（与上游 assistant/message 总数精确吻合），dedup_ledger 同步 6084 条。
 
 ## 明细表要点
 

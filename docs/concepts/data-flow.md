@@ -4,7 +4,7 @@ title: 数据流
 description: 会话日志经插件增量解析、双层去重、按输入语义计费后写入明细与日聚合，再供前端查询。
 tags: [data-flow, pipeline, usage, sqlite, plugin]
 resource: src/main/collector.ts
-timestamp: 2026-08-24T16:58:00+08:00
+timestamp: 2026-08-25T04:54:00+08:00
 ---
 
 # 数据流
@@ -31,7 +31,7 @@ CLI 会话文件(JSONL / JSON / SQLite)
 
 ## 关键机制（核心设计）
 
-1. **增量同步**：`sync_cursors` 记录每文件 `mtime + 行偏移`，只解析新增行；mtime 变化（truncate/替换）时游标重置为 0 重读；**mtime 未变且均非 0 时整文件短路跳过（2026-08-24）**；opencode db 源 mtime 取主库与 `-wal` 较大值。
+1. **增量同步**：`sync_cursors` 记录每文件 `mtime + 行偏移`，只解析新增行；mtime 变化（truncate/替换）时游标重置为 0 重读；**mtime 未变且均非 0 时整文件短路跳过（2026-08-24）**；opencode db 源 mtime 取主库与 `-wal` 较大值。脏游标（旧适配器零产出却推进游标）会被短路永久跳过，自愈路径 = 迁移清游标触发全量重析（v5，dsh 案例），重放安全由主键幂等 + 语义去重保证。
 2. **双层去重**：主键幂等——记录 id = `data_source:file_path:line`，`INSERT OR IGNORE`；fork/rewrite 语义去重——插件产出的 `source.requestId` 经 `dedup_ledger` 按 `(data_source, request_id)` 判重，命中即跳过且不累计聚合。
 3. **Token 语义归一化**：`input_semantics`（0=未知 / 1=含缓存总量需扣减 / 2=纯新输入）；费用计算按语义先扣缓存再乘价。
 4. **模型 ID 归一化**：8 步清洗（前缀、冒号、[1m]、@、包装前缀、日期/版本后缀、effort 后缀）+ 五级匹配兜底链，见 [定价与费用](pricing.md)。
