@@ -210,6 +210,56 @@ interface SessionHeadState {
 /** 会话头状态缓存上限：超限淘汰最早插入条目（Map 保持插入序） */
 const SESSION_STATE_CACHE_MAX = 512
 
+/** zstd 帧魔数（小端 0xFD2FB528，字节序列 28 B5 2F FD） */
+const ZSTD_MAGIC = 0xfd2fb528
+const ZSTD_MAGIC_LENGTH = 4
+const ZSTD_MAGIC_BYTES = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+
+interface FrameScanSuccess {
+  ok: true
+  text: string
+  consumedEnd: number
+}
+
+interface FrameScanFailure {
+  ok: false
+}
+
+type FrameScan = FrameScanSuccess | FrameScanFailure
+
+function hasZstdMagicAt(buf: Buffer, offset: number): boolean {
+  return offset >= 0 && offset + ZSTD_MAGIC_LENGTH <= buf.length && buf.readUInt32LE(offset) === ZSTD_MAGIC
+}
+
+/**
+ * 从 from 起扫描解压 zstd 拼接流：快路径整段交给 fzstd decompress 内建多帧循环，
+ * 其按各帧头声明的帧内容长度逐帧推进，天然免疫帧内容（压缩随机字节）中出现的伪
+ * magic；仅整体解压失败时（典型为 EOF 处正在写入的半帧）才从尾部向前用 magic 找
+ * 「安全切割点」cut 做前缀解压：cut 为真帧边界则 [from, cut) 全为完整帧必成功，
+ * cut 为伪 magic 则真实帧被截断必失败自动跳过，无需显式区分真伪；cut 收敛到 from
+ * （无消费进展）同样视为失败继续向前。全部候选耗尽仍失败 → ok:false（真损坏），
+ * 调用方维持现状：空结果、游标不推进。
+ */
+function scanZstdFrames(buf: Buffer, from: number): FrameScan {
+  const decoder = new TextDecoder('utf-8')
+  try {
+    return { ok: true, text: decoder.decode(decompress(buf.subarray(from))), consumedEnd: buf.length }
+  } catch {}
+  let cut = buf.length
+  while (cut > from) {
+    const candidate = buf.lastIndexOf(ZSTD_MAGIC_BYTES, cut - 1)
+    if (candidate < from) return { ok: false }
+    try {
+      const text = decoder.decode(decompress(buf.subarray(from, candidate)))
+      if (candidate > from) {
+        return { ok: true, text, consumedEnd: candidate }
+      }
+    } catch {}
+    cut = candidate
+  }
+  return { ok: false }
+}
+
 /**
  * per-file 会话头状态缓存（key=filePath）：request/header 稀疏（仅路由/配置变化时写入），
  * 增量续读窗口常不含任何 header 行，靠上轮写回的状态消除续读盲区。
@@ -219,10 +269,17 @@ const sessionStateCache = new Map<string, SessionHeadState>()
 
 /**
  * 增量解析：从 fromLine 行（1-based 行号，0 表示从文件开头）续读。
- * - .jsonl.zstd 结尾的工件先经 fzstd 解压（zstd 标准帧拼接可整文件解压）再逐行解析；
- *   解压失败（损坏帧）或读取失败 → 该文件本轮返回空结果且游标不推进（eof=true），不阻塞整体；
- * - 失败行宽松跳过不阻塞；仅「尾部不完整行」（JSON.parse 失败且其后仅剩空行）
- *   时游标停在该行下次重试，避免丢失正在写入的内容；
+ * - .jsonl.zstd 结尾的工件按 zstd 帧增量解压：首读从 0 起整流逐帧解压；续读
+ *   （fromLine>1 且游标 byteOffset 为合法帧边界）仅从该压缩字节偏移起解压新增帧，
+ *   与既有行游标接续（片段首行全局行号 = fromLine）；偏移非法/中途坏帧时回退
+ *   整块重析，宁可重复解析靠幂等去重兜底，不丢数据；EOF 尾部半帧（正在写入）
+ *   不消费，byteOffset 只推进到最后一个完整帧末尾，其文本随补全后下轮产出；
+ *   解压彻底失败 → 该文件本轮返回空结果且游标不推进（eof=true），不阻塞整体；
+ * - 本轮成功解析后把安全消费到的压缩字节偏移经 storage.setCursor 写回游标
+ *   （byte_offset 列，mtime 缺省保留现值、由采集器的写回负责 mtime/truncate 语义）；
+ *   裸 .jsonl 工件无字节游标概念，不写回；
+ * - 失败行宽松跳过不阻塞；仅「尾部不完整行」（JSON.parse 失败且其后仅剩空行，
+ *   仅裸 JSONL 场景可能出现）时游标停在该行下次重试，避免丢失正在写入的内容；
  * - 会话状态机：首条 type==='session' 行取 id（sessionId）与 cwd（project），
  *   type==='request/header' 行取 data.header.config.model（当前模型，供其后的
  *   assistant/message 计费条目回落使用）；fromLine ≤ 1 全量重读时重置缓存，
@@ -230,20 +287,53 @@ const sessionStateCache = new Map<string, SessionHeadState>()
  *   truncate 游标重置）则弃用缓存按现状从头重建；本轮结束把最终状态连同 nextLine
  *   写回缓存，供下轮续读使用。
  */
-async function parseFile(_ctx: PluginContext, filePath: string, fromLine: number): Promise<ParsedResult> {
-  let content: string
-  try {
-    if (filePath.endsWith('.jsonl.zstd')) {
-      // zstd 物理编码为标准 Zstandard 帧拼接（header 一帧 + 每 batch 一帧），整文件解压
-      const compressed = await fs.promises.readFile(filePath)
-      const bytes = decompress(new Uint8Array(compressed))
-      content = new TextDecoder('utf-8').decode(bytes)
-    } else {
-      content = await fs.promises.readFile(filePath, 'utf8')
+async function parseFile(ctx: PluginContext, filePath: string, fromLine: number): Promise<ParsedResult> {
+  let content = ''
+  // lines[startIndex] 的全局物理行号：整块路径 = startIndex+1；增量片段路径 = fromLine
+  let startIndex = fromLine > 0 ? fromLine - 1 : 0
+  let firstLineNumber = startIndex + 1
+  let incremental = false
+  let consumedByteOffset: number | null = null
+
+  if (filePath.endsWith('.jsonl.zstd')) {
+    let compressed: Buffer
+    try {
+      compressed = await fs.promises.readFile(filePath)
+    } catch {
+      return { records: [], nextLine: fromLine, eof: true }
     }
-  } catch {
-    // 读取失败/损坏 zstd 帧：空结果、游标不动、按 EOF 处理
-    return { records: [], nextLine: fromLine, eof: true }
+
+    let scan: FrameScanSuccess | null = null
+    if (fromLine > 1) {
+      const meta = await ctx.storage.getCursorMeta(filePath)
+      const saved = meta?.byteOffset
+      if (typeof saved === 'number' && Number.isFinite(saved) && hasZstdMagicAt(compressed, saved)) {
+        const partial = scanZstdFrames(compressed, saved)
+        if (partial.ok) {
+          scan = partial
+          incremental = true
+        }
+      }
+    }
+    if (scan === null) {
+      const full = scanZstdFrames(compressed, 0)
+      if (!full.ok) {
+        return { records: [], nextLine: fromLine, eof: true }
+      }
+      scan = full
+    }
+    content = scan.text
+    consumedByteOffset = scan.consumedEnd
+    if (incremental) {
+      firstLineNumber = fromLine
+      startIndex = 0
+    }
+  } else {
+    try {
+      content = await fs.promises.readFile(filePath, 'utf8')
+    } catch {
+      return { records: [], nextLine: fromLine, eof: true }
+    }
   }
 
   const lines = content.split('\n')
@@ -264,14 +354,17 @@ async function parseFile(_ctx: PluginContext, filePath: string, fromLine: number
     project = cached.project
     currentModel = cached.currentModel
   }
+  if (incremental && content.trim() === '') {
+    await ctx.storage.setCursor(filePath, fromLine, undefined, consumedByteOffset)
+    sessionStateCache.set(filePath, { sessionId, project, currentModel, cursorLine: fromLine })
+    return { records: [], nextLine: fromLine, eof: true }
+  }
   let headerSeen = false
   let nextLine = fromLine
   let eof = false
 
-  // fromLine/nextLine 均为 1-based 行号（0 = 从开头）；换算为 0-based 数组索引
-  const startIndex = fromLine > 0 ? fromLine - 1 : 0
   for (let i = startIndex; i < lines.length; i++) {
-    const lineNumber = i + 1 // 1-based 物理行号（去重键）
+    const lineNumber = firstLineNumber + (i - startIndex) // 1-based 物理行号（去重键）
     const raw = lines[i]
     if (raw.trim() === '') {
       nextLine = lineNumber + 1
@@ -328,6 +421,12 @@ async function parseFile(_ctx: PluginContext, filePath: string, fromLine: number
 
   // 读到文件结尾即 EOF（尾部不完整行分支已置 eof）
   if (!eof) eof = true
+
+  // 安全消费到的压缩字节偏移随游标写回（mtime 缺省保留现值，truncate/推进语义
+  // 由采集器随后的 setCursor 负责）；裸 JSONL 无字节游标概念，不写回
+  if (consumedByteOffset !== null) {
+    await ctx.storage.setCursor(filePath, nextLine, undefined, consumedByteOffset)
+  }
 
   // 最终会话头状态连同游标写回缓存，供下轮续读衔接；超限淘汰最早插入条目
   sessionStateCache.set(filePath, { sessionId, project, currentModel, cursorLine: nextLine })
