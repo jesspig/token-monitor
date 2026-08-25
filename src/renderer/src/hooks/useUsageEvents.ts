@@ -12,6 +12,8 @@ const USAGE_QUERY_KEYS = [
   'budget-status'
 ] as const
 
+const INVALIDATE_COOLDOWN_MS = 1000
+
 /**
  * 订阅主进程 usage-updated 推送（200ms 防抖），事件到达后失效用量相关查询，
  * 由 TanStack Query 立即重取，替代仅靠 staleTime 过期的被动刷新。
@@ -22,10 +24,25 @@ export function useUsageEvents(): void {
 
   useEffect(() => {
     if (typeof api.onUsageUpdated !== 'function') return undefined
-    return api.onUsageUpdated(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const invalidateAll = (): void => {
       for (const key of USAGE_QUERY_KEYS) {
         void queryClient.invalidateQueries({ queryKey: [key] })
       }
+    }
+    const unsubscribe = api.onUsageUpdated(() => {
+      if (timer !== null) return
+      timer = setTimeout(() => {
+        timer = null
+        invalidateAll()
+      }, INVALIDATE_COOLDOWN_MS)
     })
+    return () => {
+      unsubscribe()
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+    }
   }, [queryClient])
 }

@@ -5,12 +5,15 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import App from './App'
 import { getStatsRefreshInterval } from './lib/settings-cache'
 
+const QUERY_CACHE_GC_TIME = 30 * 60 * 1000
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       refetchInterval: () => getStatsRefreshInterval(),
       refetchOnWindowFocus: false,
       staleTime: 30_000,
+      gcTime: QUERY_CACHE_GC_TIME,
       retry: 1
     }
   }

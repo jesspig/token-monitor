@@ -1,4 +1,4 @@
-import type { ReactElement } from 'react'
+import { memo, type ReactElement } from 'react'
 import {
   Area,
   AreaChart,
@@ -16,7 +16,13 @@ export interface TrendPoint {
 }
 
 /** 请求 / Token 双轴迷你趋势图（Dashboard 与趋势页共用） */
-export function TrendChart({ data, height = 220 }: { data: TrendPoint[]; height?: number }): ReactElement {
+export const TrendChart = memo(function TrendChart({
+  data,
+  height = 220
+}: {
+  data: TrendPoint[]
+  height?: number
+}): ReactElement {
   return (
     <ResponsiveContainer width="100%" height={height}>
       <AreaChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
@@ -83,4 +89,4 @@ export function TrendChart({ data, height = 220 }: { data: TrendPoint[]; height?
       </AreaChart>
     </ResponsiveContainer>
   )
-}
+})
