@@ -3,7 +3,7 @@ import type { ModelPricingRow } from '../../../shared/tables'
 
 /**
  * models.dev 定价目录同步：拉取公开目录并展平为候选条目，
- * 经 storage.updateModelPricing 以 'sync' 来源分级 upsert（user 行受保护）。
+ * 经 storage.updateModelPricingBatch 以 'sync' 来源分级批量 upsert（user 行受保护）。
  * 本模块不做定时调度、不接线 IPC；网络/HTTP/JSON 解析失败直接抛出由调用方兜底。
  */
 
@@ -127,35 +127,26 @@ export async function fetchCatalog(): Promise<CatalogParseResult> {
 }
 
 /**
- * 全量同步：fetchCatalog → 逐条以 'sync' 来源分级 upsert。
- * - fetched = 发现的模型条目总数；imported = upsert 执行成功数；
- *   skipped = 解析丢弃 + 单条写入异常（单条失败不中断整体同步）；
+ * 全量同步：fetchCatalog → 构造全部行后单事务批量以 'sync' 来源分级 upsert。
+ * - fetched = 发现的模型条目总数；imported = 批量写入条数；
+ *   skipped 仅含解析丢弃数（批量失败即整体失败，直接向上抛）；
  * - 被 user 分级行挡住的写入不会抛错，仍计入 imported（是否生效由存储层裁决）；
- * - 网络/HTTP/JSON 失败直接抛出，由调用方兜底。
+ * - 网络/HTTP/JSON/批量写入失败直接抛出，由调用方兜底。
  */
 export async function syncPricing(storage: StorageService): Promise<SyncResult> {
   const catalog = await fetchCatalog()
   const updatedAt = Date.now()
-  let imported = 0
-  let writeFailed = 0
-  for (const item of catalog.entries) {
-    const row: ModelPricingRow = {
-      model_id: item.modelId,
-      provider: item.provider,
-      input_per_million: item.inputPerMillion,
-      output_per_million: item.outputPerMillion,
-      cache_read_per_million: item.cacheReadPerMillion,
-      cache_creation_per_million: item.cacheCreationPerMillion,
-      currency: 'USD',
-      cost_multiplier: 1,
-      updated_at: updatedAt
-    }
-    try {
-      await storage.updateModelPricing(row, 'sync')
-      imported += 1
-    } catch {
-      writeFailed += 1
-    }
-  }
-  return { fetched: catalog.total, imported, skipped: catalog.skipped + writeFailed }
+  const rows: ModelPricingRow[] = catalog.entries.map((item) => ({
+    model_id: item.modelId,
+    provider: item.provider,
+    input_per_million: item.inputPerMillion,
+    output_per_million: item.outputPerMillion,
+    cache_read_per_million: item.cacheReadPerMillion,
+    cache_creation_per_million: item.cacheCreationPerMillion,
+    currency: 'USD',
+    cost_multiplier: 1,
+    updated_at: updatedAt
+  }))
+  const imported = await storage.updateModelPricingBatch(rows, 'sync')
+  return { fetched: catalog.total, imported, skipped: catalog.skipped }
 }

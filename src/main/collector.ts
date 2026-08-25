@@ -47,6 +47,8 @@ export interface SyncResult {
 export interface Collector {
   /** 全量/增量同步一遍所有已启用且可用的插件 */
   syncAll(): Promise<SyncResult>
+  /** 定向同步单个插件（watcher 回调用）；未注册或已禁用时静默返回零值结果 */
+  syncPlugin(id: AppType): Promise<SyncResult>
   /** 定时兜底扫描（scheduler）+ 首次立即同步 */
   start(intervalMs: number): void
   /** 停止定时兜底扫描（可逆清理 disposer） */
@@ -81,65 +83,88 @@ export function createCollector(
     return r
   }
 
+  /** 单插件一轮同步：探测 → 列文件 → 增量解析 → 计费入库 → 推游标 */
+  async function syncOne(plugin: MonitorPlugin): Promise<SyncResult> {
+    let imported = 0
+    let errors = 0
+    let addedRecords = 0
+
+    if (!isEnabled(plugin.id)) return { imported, errors, addedRecords }
+
+    // 探测：CLI 未安装/无会话目录 → 跳过该插件（available 以 detect 为准）
+    let det: Detection
+    try {
+      det = await plugin.detect(ctx)
+    } catch (err) {
+      getRuntime(plugin.id).errorCount++
+      errors++
+      onError(plugin.id, err)
+      return { imported, errors, addedRecords }
+    }
+    if (!det.available) return { imported, errors, addedRecords }
+
+    let files: FileEntry[]
+    try {
+      files = await plugin.listFiles(ctx)
+    } catch (err) {
+      getRuntime(plugin.id).errorCount++
+      errors++
+      onError(plugin.id, err)
+      return { imported, errors, addedRecords }
+    }
+
+    for (const file of files) {
+      try {
+        // 增量：读游标元信息（未同步过为 null）
+        const meta = await ctx.storage.getCursorMeta(file.path)
+        // mtime 短路：文件未变更（游标与文件 mtime 一致且均非 0）则跳过解析与入库
+        if (
+          meta !== null &&
+          file.mtime > 0 &&
+          meta.fileMtime === file.mtime &&
+          meta.lineOffset > 0
+        ) {
+          continue
+        }
+        const parsed = await plugin.parseFile(ctx, file.path, meta?.lineOffset ?? 0)
+        const records = parsed.records.filter((record) => !isAllZeroUsage(record))
+
+        // 费用计算回填 costUsd（无定价项则保持 undefined）
+        for (const record of records) {
+          const cost = await ctx.pricing.calcCost(record)
+          if (cost !== undefined) record.costUsd = cost
+        }
+
+        const added = await ctx.storage.recordUsage(records)
+        // 游标始终按 parseFile 的 nextLine 推进，避免丢行；去重由 storage 处理
+        await ctx.storage.setCursor(file.path, parsed.nextLine, file.mtime)
+
+        imported += records.length
+        addedRecords += added
+      } catch (err) {
+        // 单文件解析抛错：宽松兜底，不阻塞其它文件/插件
+        getRuntime(plugin.id).errorCount++
+        errors++
+        onError(plugin.id, err)
+      }
+    }
+
+    // 该插件一轮处理结束：刷新最近同步时间
+    getRuntime(plugin.id).lastSyncAt = Date.now()
+
+    return { imported, errors, addedRecords }
+  }
+
   async function syncAll(): Promise<SyncResult> {
     let imported = 0
     let errors = 0
     let addedRecords = 0
 
     for (const plugin of plugins) {
-      if (!isEnabled(plugin.id)) continue
-
-      // 探测：CLI 未安装/无会话目录 → 跳过该插件（available 以 detect 为准）
-      let det: Detection
-      try {
-        det = await plugin.detect(ctx)
-      } catch (err) {
-        getRuntime(plugin.id).errorCount++
-        errors++
-        onError(plugin.id, err)
-        continue
-      }
-      if (!det.available) continue
-
-      let files: FileEntry[]
-      try {
-        files = await plugin.listFiles(ctx)
-      } catch (err) {
-        getRuntime(plugin.id).errorCount++
-        errors++
-        onError(plugin.id, err)
-        continue
-      }
-
-      for (const file of files) {
-        try {
-          // 增量：从游标续读（未同步过为 0）
-          const cursor = (await ctx.storage.getCursor(file.path)) ?? 0
-          const parsed = await plugin.parseFile(ctx, file.path, cursor)
-          const records = parsed.records.filter((record) => !isAllZeroUsage(record))
-
-          // 费用计算回填 costUsd（无定价项则保持 undefined）
-          for (const record of records) {
-            const cost = await ctx.pricing.calcCost(record)
-            if (cost !== undefined) record.costUsd = cost
-          }
-
-          const added = await ctx.storage.recordUsage(records)
-          // 游标始终按 parseFile 的 nextLine 推进，避免丢行；去重由 storage 处理
-          await ctx.storage.setCursor(file.path, parsed.nextLine, file.mtime)
-
-          imported += records.length
-          addedRecords += added
-        } catch (err) {
-          // 单文件解析抛错：宽松兜底，不阻塞其它文件/插件
-          getRuntime(plugin.id).errorCount++
-          errors++
-          onError(plugin.id, err)
-        }
-      }
-
-      // 该插件一轮处理结束：刷新最近同步时间
-      getRuntime(plugin.id).lastSyncAt = Date.now()
+      const r = await syncOne(plugin)
+      imported += r.imported
+      errors += r.errors
+      addedRecords += r.addedRecords
     }
 
     // 有新增才推事件（200ms 防抖由 EventBus 处理）
@@ -147,6 +172,18 @@ export function createCollector(
       ctx.events.emit('usage-updated', { updatedAt: Date.now(), addedRecords })
     }
     return { imported, errors, addedRecords }
+  }
+
+  async function syncPlugin(id: AppType): Promise<SyncResult> {
+    const plugin = plugins.find((p) => p.id === id)
+    if (!plugin) return { imported: 0, errors: 0, addedRecords: 0 }
+
+    const result = await syncOne(plugin)
+    // 有新增才推事件（200ms 防抖由 EventBus 处理）
+    if (result.addedRecords > 0) {
+      ctx.events.emit('usage-updated', { updatedAt: Date.now(), addedRecords: result.addedRecords })
+    }
+    return result
   }
 
   function start(intervalMs: number): void {
@@ -199,5 +236,5 @@ export function createCollector(
     return total
   }
 
-  return { syncAll, start, stop, getPluginStatus, getErrorCount }
+  return { syncAll, syncPlugin, start, stop, getPluginStatus, getErrorCount }
 }

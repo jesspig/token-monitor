@@ -300,6 +300,11 @@ export class SqliteStorage implements StorageService {
     return Promise.resolve(row ? row.line_offset : null)
   }
 
+  getCursorMeta(filePath: string): Promise<{ lineOffset: number; fileMtime: number } | null> {
+    const row = this.getCursorRowStmt.get(filePath) as SyncCursorRow | undefined
+    return Promise.resolve(row ? { lineOffset: row.line_offset, fileMtime: row.file_mtime } : null)
+  }
+
   setCursor(filePath: string, line: number, fileMtime?: number): Promise<void> {
     const runTx = this.db.transaction((fp: string, ln: number, mtime?: number) => {
       const existing = this.getCursorRowStmt.get(fp) as SyncCursorRow | undefined
@@ -347,6 +352,35 @@ export class SqliteStorage implements StorageService {
       source: resolvedSource
     })
     return Promise.resolve()
+  }
+
+  /**
+   * 单事务批量 upsert 定价：分级保护 WHERE（user 行不被非 user 写入覆盖）
+   * 复用与单条 upsert 相同的预编译语句，天然生效；
+   * 全部条目在一个事务内提交，仅一次 fsync。空数组不开事务直接返回 0。
+   */
+  updateModelPricingBatch(entries: ModelPricingRow[], source: PricingSource): Promise<number> {
+    if (entries.length === 0) return Promise.resolve(0)
+    const runTx = this.db.transaction((items: ModelPricingRow[], src: PricingSource): number => {
+      let count = 0
+      for (const entry of items) {
+        this.upsertPricingStmt.run({
+          model_id: entry.model_id,
+          provider: entry.provider,
+          input_per_million: entry.input_per_million,
+          output_per_million: entry.output_per_million,
+          cache_read_per_million: entry.cache_read_per_million,
+          cache_creation_per_million: entry.cache_creation_per_million,
+          currency: entry.currency,
+          cost_multiplier: entry.cost_multiplier,
+          updated_at: entry.updated_at ?? Date.now(),
+          source: src
+        })
+        count++
+      }
+      return count
+    })
+    return Promise.resolve(runTx(entries, source))
   }
 
   deleteModelPricing(modelId: string): Promise<void> {

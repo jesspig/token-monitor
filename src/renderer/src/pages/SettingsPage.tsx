@@ -41,7 +41,7 @@ export default function SettingsPage(): ReactElement {
   useEffect(() => {
     if (!data) return
     setSyncMin(String(data.syncIntervalMs / 60_000))
-    setStatsRefreshSec(String((data.statsRefreshIntervalMs ?? 5000) / 1000))
+    setStatsRefreshSec(String((data.statsRefreshIntervalMs ?? 30_000) / 1000))
     setRetentionDays(String(data.retentionDays))
     setPricingSyncMin(String((data.pricingSyncIntervalMs ?? 300_000) / 60_000))
     setDataDir(data.dataDir)
@@ -60,7 +60,7 @@ export default function SettingsPage(): ReactElement {
     setBudgetError('')
     const payload = {
       syncIntervalMs: (Math.max(1, Number(syncMin) || 5) * 60_000),
-      statsRefreshIntervalMs: Math.max(1, Number(statsRefreshSec) || 5) * 1000,
+      statsRefreshIntervalMs: Math.max(1, Number(statsRefreshSec) || 30) * 1000,
       retentionDays: Math.max(1, Number(retentionDays) || 30),
       pricingSyncIntervalMs: Math.max(1, Number(pricingSyncMin) || 5) * 60_000,
       dataDir: dataDir.trim() || data?.dataDir || '',

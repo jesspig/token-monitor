@@ -12,7 +12,10 @@ export const CLI_VERSION_COMMANDS: Record<AppType, string> = {
   codex: 'codex',
   opencode: 'opencode',
   gemini: 'gemini',
-  grok: 'grok'
+  grok: 'grok',
+  pi: 'pi',
+  zcode: 'zcode',
+  dsh: 'dsh'
 }
 
 const execFileAsync = promisify(execFile)

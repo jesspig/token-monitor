@@ -47,7 +47,7 @@ describe('数据库迁移', () => {
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(4)
+      expect(db.pragma('user_version', { simple: true })).toBe(5)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
@@ -301,7 +301,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     expect(db.pragma('user_version', { simple: true })).toBe(2)
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(4)
+    expect(db.pragma('user_version', { simple: true })).toBe(5)
 
     const zeroCount = db.prepare(`SELECT COUNT(*) AS c FROM usage_records WHERE ${ZERO_COND}`).get() as { c: number }
     expect(zeroCount.c).toBe(0)
@@ -376,7 +376,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     db.pragma('user_version = 2')
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(4)
+    expect(db.pragma('user_version', { simple: true })).toBe(5)
     expect(snapshot()).toEqual(before)
   })
 })
@@ -458,7 +458,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(4)
+      expect(db.pragma('user_version', { simple: true })).toBe(5)
       const rows = db
         .prepare('SELECT id, input_semantics FROM usage_records ORDER BY id')
         .all() as { id: string; input_semantics: number }[]
@@ -473,12 +473,12 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
     }
   })
 
-  it('全新库直接建至 v4，重复迁移幂等', () => {
+  it('全新库直接建至 v5，重复迁移幂等', () => {
     const db = createDatabase(':memory:')
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(4)
+      expect(db.pragma('user_version', { simple: true })).toBe(5)
     } finally {
       db.close()
     }
@@ -500,7 +500,69 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       db.pragma('user_version = 3')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(4)
+      expect(db.pragma('user_version', { simple: true })).toBe(5)
+      expect(snapshot()).toEqual(before)
+    } finally {
+      db.close()
+    }
+  })
+})
+
+describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
+  /** 已应用 v4 的库（回拨 user_version），migrate 即触发 v5 */
+  function makeDirtyV4Db(): SqliteDatabase {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    db.pragma('user_version = 4')
+    return db
+  }
+
+  it('v4 库升级到 v5：dsh 会话游标清除，其他源游标保留', () => {
+    const db = makeDirtyV4Db()
+    try {
+      const insert = db.prepare(
+        `INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, updated_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      insert.run(
+        'C:\\Users\\me\\.dsh\\sessions\\--proj--\\session-1\\session.jsonl.zstd',
+        '',
+        3710,
+        1000,
+        111
+      )
+      insert.run('/home/me/.claude/projects/x.jsonl', 'claude', 97, 2000, 222)
+
+      migrate(db)
+
+      expect(db.pragma('user_version', { simple: true })).toBe(5)
+      const dsh = db
+        .prepare('SELECT COUNT(*) AS c FROM sync_cursors WHERE file_path LIKE ?')
+        .get('%\\.dsh\\sessions%') as { c: number }
+      expect(dsh.c).toBe(0)
+      const kept = db.prepare('SELECT * FROM sync_cursors WHERE file_path LIKE ?').get('%claude%') as
+        | SyncCursorRow
+        | undefined
+      expect(kept).toMatchObject({ data_source: 'claude', line_offset: 97 })
+    } finally {
+      db.close()
+    }
+  })
+
+  it('幂等：回拨版本重跑 v5 后游标状态不变', () => {
+    const db = makeDirtyV4Db()
+    try {
+      migrate(db)
+      db.prepare(
+        `INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, updated_at)
+         VALUES ('/legacy/x.jsonl', 'codex', 5, 1000, 111)`
+      ).run()
+      const snapshot = () => db.prepare('SELECT * FROM sync_cursors ORDER BY file_path').all()
+      const before = snapshot()
+
+      db.pragma('user_version = 4')
+      migrate(db)
+      expect(db.pragma('user_version', { simple: true })).toBe(5)
       expect(snapshot()).toEqual(before)
     } finally {
       db.close()
@@ -737,5 +799,52 @@ describe('model_pricing CRUD', () => {
     await storage.deleteModelPricing('claude-sonnet-4')
     expect(await storage.getModelPricing()).toEqual([])
     await storage.deleteModelPricing('not-exist') // 幂等
+  })
+
+  it('批量插入 N 条返回 N 且全表可查', async () => {
+    const { storage } = makeStorage()
+    const rows: ModelPricingRow[] = [
+      entry({ model_id: 'model-a', updated_at: 111 }),
+      entry({ model_id: 'model-b', updated_at: 222 }),
+      entry({ model_id: 'model-c', updated_at: 333 })
+    ]
+    expect(await storage.updateModelPricingBatch(rows, 'sync')).toBe(3)
+    const list = await storage.getModelPricing()
+    expect(list).toHaveLength(3)
+    expect(list.map((r) => r.model_id).sort()).toEqual(['model-a', 'model-b', 'model-c'])
+    expect(list.every((r) => r.source === 'sync')).toBe(true)
+  })
+
+  it('批量写入时 user 分级行不被 sync 行覆盖，其余行照常写入', async () => {
+    const { storage } = makeStorage()
+    // 预置 user 行（手动编辑缺省即 user）
+    await storage.updateModelPricing(entry({ input_per_million: 99, updated_at: 123 }), 'user')
+
+    const imported = await storage.updateModelPricingBatch(
+      [
+        entry({ model_id: 'claude-sonnet-4', input_per_million: 5, updated_at: 456 }),
+        entry({ model_id: 'other-model', updated_at: 456 })
+      ],
+      'sync'
+    )
+    expect(imported).toBe(2)
+
+    const list = await storage.getModelPricing()
+    expect(list).toHaveLength(2)
+    expect(list.find((r) => r.model_id === 'claude-sonnet-4')).toMatchObject({
+      source: 'user',
+      input_per_million: 99,
+      updated_at: 123
+    })
+    expect(list.find((r) => r.model_id === 'other-model')).toMatchObject({
+      source: 'sync',
+      updated_at: 456
+    })
+  })
+
+  it('批量空数组返回 0 且不产生任何行', async () => {
+    const { storage } = makeStorage()
+    expect(await storage.updateModelPricingBatch([], 'seed')).toBe(0)
+    expect(await storage.getModelPricing()).toEqual([])
   })
 })
