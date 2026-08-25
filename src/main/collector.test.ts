@@ -57,6 +57,9 @@ function makeCtx(): { ctx: PluginContext; recorded: UsageRecord[] } {
     pricing: {
       normalizeModelId: vi.fn(async (rawModel: string) => rawModel),
       calcCost: vi.fn(async () => '0.006'),
+      calcCostBatch: vi.fn(async (records: UsageRecord[]) =>
+        Promise.all(records.map((record) => ctx.pricing.calcCost(record)))
+      ),
       getPrice: vi.fn(async () => undefined)
     },
     events: {

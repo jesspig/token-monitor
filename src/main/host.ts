@@ -70,6 +70,8 @@ export interface Host {
   pricing: PricingServiceImpl
   usageQuery: UsageQueryService
   events: EventBus
+  /** 阶段二（插件装载+调度注册）完成后 resolve；失败则 reject，消费方据此等待就绪 */
+  ready: Promise<void>
   /** 读取设置（syncIntervalMs/retentionDays/dataDir/预算限额/统计刷新与定价同步间隔） */
   getSettings(): AppSettings
   /**
@@ -159,7 +161,14 @@ const BUILTIN_PLUGINS: MonitorPlugin[] = [
   dshPlugin
 ]
 
-export async function createHost(options: HostOptions = {}): Promise<Host> {
+export interface HostBootstrap {
+  host: Host
+  /** 阶段二（插件装载+调度注册）完成后 resolve；失败则 reject，消费方据此等待就绪 */
+  ready: Promise<void>
+  startServices(): Promise<void>
+}
+
+export async function bootstrapHost(options: HostOptions = {}): Promise<HostBootstrap> {
   const dataDir = options.dataDir ?? ':memory:'
 
   // 建库：等价 openStorage，但保留 db 句柄供 usageQuery 使用
@@ -205,9 +214,6 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
     }
   }))
 
-  for (const p of plugins) registry.register(p)
-  for (const p of plugins) await lifecycle.mount(ctx, p)
-
   const usageQuery = createUsageQuery(db)
   let currentSyncIntervalMs = settings.get().syncIntervalMs
   let currentPricingSyncIntervalMs = settings.get().pricingSyncIntervalMs
@@ -241,9 +247,6 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
     stopRetentionSweep?.()
     stopRetentionSweep = scheduler.schedule(intervalMs, runRetentionSweep)
   }
-
-  startRetentionSweepLoop(currentSyncIntervalMs)
-  const startupSweepTimer = setTimeout(runRetentionSweep, RETENTION_SWEEP_DELAY_MS)
 
   // —— models.dev 定价目录（docs/concepts/pricing.md）——
   // 零成本回填：按当前定价重算 cost 为零/空的历史明细；启动时异步执行一次（不阻塞），
@@ -283,37 +286,72 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
     })
   }
 
-  startPricingAutoSync()
-  // 启动错峰：定价同步/零成本回填/存量费用重算延迟触发，不与首轮采集同一时刻点火
-  const startupPricingSyncTimer = setTimeout(() => {
-    void syncModelsDevPricing().catch((err) => {
-      console.error('[host] 启动 models.dev 定价同步失败:', err)
-    })
-  }, STARTUP_PRICING_SYNC_DELAY_MS)
-  const startupZeroCostBackfillTimer = setTimeout(() => {
-    void runZeroCostBackfill().catch((err) => {
-      console.error('[host] 启动零成本回填失败:', err)
-    })
-  }, STARTUP_ZERO_COST_BACKFILL_DELAY_MS)
+  let startupSweepTimer: NodeJS.Timeout | null = null
+  let startupPricingSyncTimer: NodeJS.Timeout | null = null
+  let startupZeroCostBackfillTimer: NodeJS.Timeout | null = null
+  let startupRecalcCostsTimer: NodeJS.Timeout | null = null
 
-  // 计费语义修复的一次性存量修正：codex/gemini/grok 历史高估费用按活定价重算
-  // （重算一致零写入，天然幂等，故只随启动执行、不挂进 models.dev 同步链路）；
-  // opencode 的语义错标已由 v4 迁移直接修正。失败仅记日志，不阻塞启动。
-  const startupRecalcCostsTimer = setTimeout(() => {
-    void recalcCachedInputCosts(db, pricing)
-      .then((result) => {
-        if (result.updated > 0) {
-          console.log(
-            `[host] 存量缓存口径费用重算完成: scanned=${result.scanned} updated=${result.updated}`
-          )
-        }
-      })
-      .catch((err) => {
-        console.error('[host] 启动存量费用重算失败:', err)
-      })
-  }, STARTUP_RECALC_COSTS_DELAY_MS)
+  let resolveReady!: () => void
+  let rejectReady!: (err: unknown) => void
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
 
-  return {
+  let servicesPromise: Promise<void> | null = null
+
+  function startServices(): Promise<void> {
+    if (!servicesPromise) {
+      servicesPromise = runServicesStartup()
+    }
+    return servicesPromise
+  }
+
+  async function runServicesStartup(): Promise<void> {
+    try {
+      for (const p of plugins) registry.register(p)
+      await Promise.all(plugins.map((p) => lifecycle.mount(ctx, p)))
+
+      startRetentionSweepLoop(currentSyncIntervalMs)
+      startupSweepTimer = setTimeout(runRetentionSweep, RETENTION_SWEEP_DELAY_MS)
+
+      startPricingAutoSync()
+      // 启动错峰：定价同步/零成本回填/存量费用重算延迟触发，不与首轮采集同一时刻点火
+      startupPricingSyncTimer = setTimeout(() => {
+        void syncModelsDevPricing().catch((err) => {
+          console.error('[host] 启动 models.dev 定价同步失败:', err)
+        })
+      }, STARTUP_PRICING_SYNC_DELAY_MS)
+      startupZeroCostBackfillTimer = setTimeout(() => {
+        void runZeroCostBackfill().catch((err) => {
+          console.error('[host] 启动零成本回填失败:', err)
+        })
+      }, STARTUP_ZERO_COST_BACKFILL_DELAY_MS)
+      // 计费语义修复的一次性存量修正：codex/gemini/grok 历史高估费用按活定价重算
+      // （重算一致零写入，天然幂等，故只随启动执行、不挂进 models.dev 同步链路）；
+      // opencode 的语义错标已由 v4 迁移直接修正。失败仅记日志，不阻塞启动。
+      startupRecalcCostsTimer = setTimeout(() => {
+        void recalcCachedInputCosts(db, pricing)
+          .then((result) => {
+            if (result.updated > 0) {
+              console.log(
+                `[host] 存量缓存口径费用重算完成: scanned=${result.scanned} updated=${result.updated}`
+              )
+            }
+          })
+          .catch((err) => {
+            console.error('[host] 启动存量费用重算失败:', err)
+          })
+      }, STARTUP_RECALC_COSTS_DELAY_MS)
+
+      resolveReady()
+    } catch (err) {
+      rejectReady(err)
+      throw err
+    }
+  }
+
+  const host: Host = {
     ctx,
     registry,
     lifecycle,
@@ -322,6 +360,7 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
     pricing,
     usageQuery,
     events,
+    ready,
     getSettings: settings.get,
     updateSettings(patch) {
       settings.update(patch)
@@ -348,17 +387,39 @@ export async function createHost(options: HostOptions = {}): Promise<Host> {
     syncModelsDevPricing,
     runZeroCostBackfill,
     dispose() {
-      clearTimeout(startupSweepTimer)
-      clearTimeout(startupPricingSyncTimer)
-      clearTimeout(startupZeroCostBackfillTimer)
-      clearTimeout(startupRecalcCostsTimer)
+      if (startupSweepTimer) {
+        clearTimeout(startupSweepTimer)
+        startupSweepTimer = null
+      }
+      if (startupPricingSyncTimer) {
+        clearTimeout(startupPricingSyncTimer)
+        startupPricingSyncTimer = null
+      }
+      if (startupZeroCostBackfillTimer) {
+        clearTimeout(startupZeroCostBackfillTimer)
+        startupZeroCostBackfillTimer = null
+      }
+      if (startupRecalcCostsTimer) {
+        clearTimeout(startupRecalcCostsTimer)
+        startupRecalcCostsTimer = null
+      }
       stopRetentionSweep?.()
       stopRetentionSweep = null
       stopPricingAutoSync?.()
       stopPricingAutoSync = null
       collector.stop()
-      for (const p of plugins) lifecycle.unmount(ctx, p)
+      for (const p of plugins) {
+        if (lifecycle.isMounted(p.id)) lifecycle.unmount(ctx, p)
+      }
       storage.close()
     }
   }
+
+  return { host, ready, startServices }
+}
+
+export async function createHost(options: HostOptions = {}): Promise<Host> {
+  const boot = await bootstrapHost(options)
+  await boot.startServices()
+  return boot.host
 }

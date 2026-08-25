@@ -27,6 +27,11 @@ export interface CollectorOptions {
   onError?: (id: AppType, err: unknown) => void
 }
 
+export interface CollectorStartOptions {
+  /** 首次同步的延迟（ms）；省略或 0 = 立即同步，用于启动错峰（窗口 show 后再触发） */
+  initialSyncDelayMs?: number
+}
+
 /** 单插件运行态（宿主侧维护） */
 interface PluginRuntime {
   lastSyncAt: number | null
@@ -49,8 +54,8 @@ export interface Collector {
   syncAll(): Promise<SyncResult>
   /** 定向同步单个插件（watcher 回调用）；未注册或已禁用时静默返回零值结果 */
   syncPlugin(id: AppType): Promise<SyncResult>
-  /** 定时兜底扫描（scheduler）+ 首次立即同步 */
-  start(intervalMs: number): void
+  /** 定时兜底扫描（scheduler）+ 首次同步（默认立即；initialSyncDelayMs 用于启动错峰） */
+  start(intervalMs: number, options?: CollectorStartOptions): void
   /** 停止定时兜底扫描（可逆清理 disposer） */
   stop(): void
   /** 各插件状态（shared/query.ts PluginStatus） */
@@ -73,6 +78,7 @@ export function createCollector(
 
   const runtime = new Map<AppType, PluginRuntime>()
   let disposer: (() => void) | null = null
+  let initialSyncTimer: NodeJS.Timeout | null = null
 
   function getRuntime(id: AppType): PluginRuntime {
     let r = runtime.get(id)
@@ -130,9 +136,10 @@ export function createCollector(
         const records = parsed.records.filter((record) => !isAllZeroUsage(record))
 
         // 费用计算回填 costUsd（无定价项则保持 undefined）
-        for (const record of records) {
-          const cost = await ctx.pricing.calcCost(record)
-          if (cost !== undefined) record.costUsd = cost
+        const costs = await ctx.pricing.calcCostBatch(records)
+        for (let i = 0; i < records.length; i++) {
+          const cost = costs[i]
+          if (cost !== undefined) records[i].costUsd = cost
         }
 
         const added = await ctx.storage.recordUsage(records)
@@ -186,13 +193,25 @@ export function createCollector(
     return result
   }
 
-  function start(intervalMs: number): void {
+  function start(intervalMs: number, options?: CollectorStartOptions): void {
     if (disposer) return
-    void syncAll() // 首次立即全量同步
+    const initialSyncDelayMs = options?.initialSyncDelayMs ?? 0
+    if (initialSyncDelayMs > 0) {
+      initialSyncTimer = setTimeout(() => {
+        initialSyncTimer = null
+        void syncAll()
+      }, initialSyncDelayMs)
+    } else {
+      void syncAll()
+    }
     disposer = ctx.scheduler.schedule(intervalMs, () => void syncAll())
   }
 
   function stop(): void {
+    if (initialSyncTimer) {
+      clearTimeout(initialSyncTimer)
+      initialSyncTimer = null
+    }
     if (disposer) {
       disposer()
       disposer = null

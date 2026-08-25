@@ -47,7 +47,11 @@ export function registerIpcHandlers(
   host: Host,
   getMainWindow: () => BrowserWindow | null
 ): void {
-  const on = (channel: string, fn: IpcHandler): void => ipcMain.handle(channel, fn)
+  const on = (channel: string, fn: IpcHandler): void =>
+    ipcMain.handle(channel, async (...args: any[]) => {
+      await host.ready
+      return fn(...args)
+    })
 
   // 1. 连通性检查（示例 IPC，返回 'pong'）
   on(IPC_CHANNELS.ping, () => 'pong')
