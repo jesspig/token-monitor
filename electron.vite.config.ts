@@ -4,7 +4,18 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()]
+    plugins: [externalizeDepsPlugin()],
+    build: {
+      rollupOptions: {
+        // 多入口：index = 主进程入口；zstd-worker = dsh 插件的解压线程
+        // （entry 名即产物文件名 out/main/zstd-worker.js，运行时经
+        // new Worker(join(__dirname, 'zstd-worker.js')) 拉起）
+        input: {
+          index: resolve('src/main/index.ts'),
+          'zstd-worker': resolve('src/main/workers/zstd-worker.ts')
+        }
+      }
+    }
   },
   preload: {
     plugins: [externalizeDepsPlugin()]

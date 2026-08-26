@@ -1,10 +1,17 @@
 import os from 'node:os'
 import path from 'node:path'
+import { join } from 'node:path'
 import fs from 'node:fs'
-import { decompress } from 'fzstd'
+import { Worker } from 'node:worker_threads'
 import type { MonitorPlugin } from '../../../shared/plugin'
 import type { PluginContext } from '../../../shared/context'
 import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../shared/dto'
+import {
+  hasZstdMagicAt,
+  scanZstdFrames,
+  type FrameScan,
+  type FrameScanSuccess
+} from '../workers/zstd-scan'
 
 /**
  * dsh 监控插件（DeepSeek Harness，DeepSeek AI 开源 agent harness，developer preview）。
@@ -82,6 +89,23 @@ function collectSubtree(dir: string, out: FileEntry[]): void {
 }
 
 /**
+ * 探测用存在性短路检查：找到首个会话工件即返回 true。
+ * detect 被 getPluginStatus 周期调用（监控源页轮询），不做全树枚举与逐文件 stat，
+ * 避免大会话树下的主进程同步 IO 阻塞；listFilesFromRoot 仅供同步链路使用。
+ */
+function hasSessionFile(dir: string): boolean {
+  for (const ent of safeReaddir(dir)) {
+    const p = path.join(dir, ent.name)
+    if (ent.isDirectory()) {
+      if (hasSessionFile(p)) return true
+    } else if (ent.isFile() && isSessionFile(ent.name)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
  * 列出会话文件（root 可注入，便于测试）：sessions 子树内任意层级的固定名会话工件。
  * fork 提取分支（seed 继承）会产生新文件但 seq 跨 fork 稳定，
  * 由 `<sessionId>:<seq>` 作 requestId 经语义去重收敛（见 toUsageRecord）。
@@ -111,7 +135,7 @@ export function detectFromRoot(root: string): Detection {
       sessionDir: root
     }
   }
-  if (listFilesFromRoot(root).length === 0) {
+  if (!hasSessionFile(root)) {
     return {
       available: false,
       reason: `会话目录下未发现 session.jsonl / session.jsonl.zstd 工件（DeepSeek Harness 尚未产生会话；${SQLITE_BACKEND_HINT}）`,
@@ -210,54 +234,102 @@ interface SessionHeadState {
 /** 会话头状态缓存上限：超限淘汰最早插入条目（Map 保持插入序） */
 const SESSION_STATE_CACHE_MAX = 512
 
-/** zstd 帧魔数（小端 0xFD2FB528，字节序列 28 B5 2F FD） */
-const ZSTD_MAGIC = 0xfd2fb528
-const ZSTD_MAGIC_LENGTH = 4
-const ZSTD_MAGIC_BYTES = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+/**
+ * zstd 解压执行线程管理：解压挪到 worker 线程（out/main/zstd-worker.js），
+ * 主线程只做 await，大会话文件解压不再冻结 Electron 事件循环。
+ * worker 懒创建；创建失败（如单测/异常环境无产物文件）或超时/故障时
+ * 回退主线程同步 scanZstdFrames——宁可阻塞也要产出正确结果，行为与
+ * 线程化之前完全一致。collector 对单插件串行解析，但 watcher 定向同步
+ * 与兜底扫描可能并发进入，故响应按请求 id 关联分发而非按序假设。
+ */
 
-interface FrameScanSuccess {
-  ok: true
-  text: string
-  consumedEnd: number
+/** 单次解压超时：超过视为 worker 卡死，销毁后本次回退主线程同步解压 */
+const ZSTD_WORKER_TIMEOUT_MS = 10_000
+
+let zstdWorker: Worker | null = null
+let zstdWorkerBroken = false
+let nextScanId = 0
+const pendingScans = new Map<
+  number,
+  { resolve: (scan: FrameScan) => void; reject: (err: unknown) => void }
+>()
+
+function failAllPendingScans(): void {
+  for (const pending of pendingScans.values()) pending.reject(new Error('zstd worker unavailable'))
+  pendingScans.clear()
 }
 
-interface FrameScanFailure {
-  ok: false
+async function destroyZstdWorker(): Promise<void> {
+  const worker = zstdWorker
+  zstdWorker = null
+  if (!worker) return
+  try {
+    await worker.terminate()
+  } catch {
+    // terminate 失败忽略：引用已弃置
+  }
 }
 
-type FrameScan = FrameScanSuccess | FrameScanFailure
-
-function hasZstdMagicAt(buf: Buffer, offset: number): boolean {
-  return offset >= 0 && offset + ZSTD_MAGIC_LENGTH <= buf.length && buf.readUInt32LE(offset) === ZSTD_MAGIC
+function ensureZstdWorker(): Worker | null {
+  if (zstdWorkerBroken) return null
+  if (zstdWorker) return zstdWorker
+  try {
+    // 运行时路径 = 构建产物目录（electron-vite 多入口输出 out/main/zstd-worker.js）
+    const worker = new Worker(join(__dirname, 'zstd-worker.js'))
+    worker.on('message', (res: { id?: number; scan?: FrameScan }) => {
+      if (!res || typeof res.id !== 'number' || !res.scan) return
+      const pending = pendingScans.get(res.id)
+      if (!pending) return
+      pendingScans.delete(res.id)
+      pending.resolve(res.scan)
+    })
+    worker.on('error', () => {
+      if (zstdWorker === worker) zstdWorker = null
+      // 启动失败（产物缺失）/运行故障：标记不可用并 reject 在途请求，
+      // 调用方 catch 后回退主线程同步解压，本进程内不再尝试 worker
+      zstdWorkerBroken = true
+      failAllPendingScans()
+    })
+    worker.on('exit', () => {
+      if (zstdWorker === worker) zstdWorker = null
+      failAllPendingScans()
+    })
+    zstdWorker = worker
+    return worker
+  } catch {
+    // 线程创建同步抛错：本进程内不再重试，恒走主线程回退
+    zstdWorkerBroken = true
+    return null
+  }
 }
 
 /**
- * 从 from 起扫描解压 zstd 拼接流：快路径整段交给 fzstd decompress 内建多帧循环，
- * 其按各帧头声明的帧内容长度逐帧推进，天然免疫帧内容（压缩随机字节）中出现的伪
- * magic；仅整体解压失败时（典型为 EOF 处正在写入的半帧）才从尾部向前用 magic 找
- * 「安全切割点」cut 做前缀解压：cut 为真帧边界则 [from, cut) 全为完整帧必成功，
- * cut 为伪 magic 则真实帧被截断必失败自动跳过，无需显式区分真伪；cut 收敛到 from
- * （无消费进展）同样视为失败继续向前。全部候选耗尽仍失败 → ok:false（真损坏），
- * 调用方维持现状：空结果、游标不推进。
+ * 经 worker 执行帧扫描解压；创建失败/超时/worker 故障时回退主线程同步
+ * scanZstdFrames——宁可阻塞也要产出正确结果，行为与线程化之前完全一致。
+ * 超时视为 worker 卡死，销毁重建（下次调用重新拉起）。
  */
-function scanZstdFrames(buf: Buffer, from: number): FrameScan {
-  const decoder = new TextDecoder('utf-8')
+async function scanZstdFramesAsync(buf: Buffer, from: number): Promise<FrameScan> {
+  const worker = ensureZstdWorker()
+  if (!worker) return scanZstdFrames(buf, from)
+  const id = ++nextScanId
+  let timer: NodeJS.Timeout | null = null
   try {
-    return { ok: true, text: decoder.decode(decompress(buf.subarray(from))), consumedEnd: buf.length }
-  } catch {}
-  let cut = buf.length
-  while (cut > from) {
-    const candidate = buf.lastIndexOf(ZSTD_MAGIC_BYTES, cut - 1)
-    if (candidate < from) return { ok: false }
-    try {
-      const text = decoder.decode(decompress(buf.subarray(from, candidate)))
-      if (candidate > from) {
-        return { ok: true, text, consumedEnd: candidate }
-      }
-    } catch {}
-    cut = candidate
+    return await new Promise<FrameScan>((resolve, reject) => {
+      pendingScans.set(id, { resolve, reject })
+      timer = setTimeout(() => {
+        if (pendingScans.delete(id)) {
+          reject(new Error(`zstd worker timeout (${ZSTD_WORKER_TIMEOUT_MS}ms)`))
+        }
+      }, ZSTD_WORKER_TIMEOUT_MS)
+      worker.postMessage({ id, buf, from })
+    })
+  } catch {
+    await destroyZstdWorker()
+    return scanZstdFrames(buf, from)
+  } finally {
+    if (timer) clearTimeout(timer)
+    pendingScans.delete(id)
   }
-  return { ok: false }
 }
 
 /**
@@ -308,7 +380,7 @@ async function parseFile(ctx: PluginContext, filePath: string, fromLine: number)
       const meta = await ctx.storage.getCursorMeta(filePath)
       const saved = meta?.byteOffset
       if (typeof saved === 'number' && Number.isFinite(saved) && hasZstdMagicAt(compressed, saved)) {
-        const partial = scanZstdFrames(compressed, saved)
+        const partial = await scanZstdFramesAsync(compressed, saved)
         if (partial.ok) {
           scan = partial
           incremental = true
@@ -316,7 +388,7 @@ async function parseFile(ctx: PluginContext, filePath: string, fromLine: number)
       }
     }
     if (scan === null) {
-      const full = scanZstdFrames(compressed, 0)
+      const full = await scanZstdFramesAsync(compressed, 0)
       if (!full.ok) {
         return { records: [], nextLine: fromLine, eof: true }
       }
@@ -456,5 +528,9 @@ export const dshPlugin: MonitorPlugin = {
   deps: ['storage', 'pricing', 'events'],
   detect,
   listFiles,
-  parseFile
+  parseFile,
+  dispose() {
+    // 卸载即销毁解压 worker（可逆生命周期）；在途请求由 exit 分支按失败兜底
+    void destroyZstdWorker()
+  }
 }
