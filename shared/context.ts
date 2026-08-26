@@ -64,8 +64,12 @@ export interface EventsService {
 
 /** scheduler 服务：定时兜底扫描（默认 5 分钟） */
 export interface SchedulerService {
-  /** 注册定时任务；返回 disposer，卸载时调用以可逆清理 */
-  schedule(intervalMs: number, task: () => void | Promise<void>): () => void
+  /**
+   * 注册定时任务；返回 disposer，卸载时调用以可逆清理。
+   * initialDelayMs 为首次触发延迟（省略 = intervalMs），用于多个同间隔任务错相点火，
+   * 避免同一时刻叠加执行阻塞主进程。
+   */
+  schedule(intervalMs: number, task: () => void | Promise<void>, initialDelayMs?: number): () => void
 }
 
 /** watcher 服务：chokidar 文件监听 */

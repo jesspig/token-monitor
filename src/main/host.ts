@@ -46,8 +46,10 @@ const DEFAULT_STATS_REFRESH_INTERVAL_MS = 30_000
 /** models.dev 定价自动同步默认周期（ms）：默认权威数据源，每 5 分钟全量同步一次 */
 const DEFAULT_PRICING_SYNC_INTERVAL_MS = 300_000
 const SETTINGS_FILENAME = 'settings.json'
-/** 启动后延迟执行的首次过期明细清理（ms） */
-const RETENTION_SWEEP_DELAY_MS = 30_000
+/** 启动后延迟执行的首次过期明细清理（ms）：错开 30s 处的存量费用重算，避免重活同刻叠加 */
+const RETENTION_SWEEP_DELAY_MS = 45_000
+/** 周期任务错相偏移：过期清理相对兜底扫描推迟半个周期点火，避免同一时刻叠加执行 */
+const RETENTION_SWEEP_PHASE_OFFSET_RATIO = 0.5
 /** 启动错峰延迟（ms）：首次立即同步之外的非关键任务依次错开，避免与首轮采集争抢 IO */
 const STARTUP_PRICING_SYNC_DELAY_MS = 10_000
 const STARTUP_ZERO_COST_BACKFILL_DELAY_MS = 20_000
@@ -245,7 +247,12 @@ export async function bootstrapHost(options: HostOptions = {}): Promise<HostBoot
 
   function startRetentionSweepLoop(intervalMs: number): void {
     stopRetentionSweep?.()
-    stopRetentionSweep = scheduler.schedule(intervalMs, runRetentionSweep)
+    // 错相半个周期点火：兜底扫描（collector）与清理回填都是主进程重活，错开执行窗口
+    stopRetentionSweep = scheduler.schedule(
+      intervalMs,
+      runRetentionSweep,
+      Math.floor(intervalMs * RETENTION_SWEEP_PHASE_OFFSET_RATIO)
+    )
   }
 
   // —— models.dev 定价目录（docs/concepts/pricing.md）——
