@@ -27,6 +27,7 @@ import {
   type CustomRange,
   type RangeKey
 } from '../lib/range'
+import { getStatsRefreshInterval } from '../lib/settings-cache'
 
 const tooltipStyle = {
   background: '#171717',
@@ -100,7 +101,8 @@ export default function TrendsPage(): ReactElement {
   const hourlyQuery = useQuery({
     queryKey: ['daily-trends', 'hourly', filters],
     queryFn: () => api.getHourlyTrends(filters),
-    enabled: range === 'today' || range === '24h'
+    enabled: range === 'today' || range === '24h',
+    refetchInterval: getStatsRefreshInterval
   })
 
   const rows = useMemo(() => {

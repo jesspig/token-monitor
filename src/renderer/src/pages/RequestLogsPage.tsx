@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { ReactElement, ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import clsx from 'clsx'
@@ -9,6 +9,7 @@ import { api } from '../api'
 import { EmptyState } from '../components/EmptyState'
 import { PageHeader } from '../components/PageHeader'
 import { RangeSelector } from '../components/RangeSelector'
+import { useDebouncedValue } from '../hooks/useDebouncedValue'
 import { useRequestLogs } from '../hooks/useRequestLogs'
 import {
   APP_META,
@@ -35,6 +36,9 @@ const TD = 'px-3 py-2 text-sm text-neutral-300'
 
 const MODEL_FILTER_RENDER_LIMIT = 200
 
+/** 关键字搜索防抖：keyword 翻译成 4 列前置通配 LIKE（无索引全表扫描），逐键即时查询会打满主进程 */
+const KEYWORD_DEBOUNCE_MS = 300
+
 /** 请求日志页：筛选栏 + 分页表格 + 行详情抽屉 */
 export default function RequestLogsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('30d')
@@ -46,6 +50,12 @@ export default function RequestLogsPage(): ReactElement {
   const [keyword, setKeyword] = useState('')
   const [page, setPage] = useState(1)
   const [expandedId, setExpandedId] = useState<string | null>(null)
+
+  // 查询用关键字防抖发布；发布后回到第 1 页（挂载时 setPage(1) 对相同值 bail out）
+  const debouncedKeyword = useDebouncedValue(keyword, KEYWORD_DEBOUNCE_MS)
+  useEffect(() => {
+    setPage(1)
+  }, [debouncedKeyword])
 
   // 筛选候选随数据同步缓慢变化，长 staleTime 避免每次进入页面都重复查询
   const { data: filterOptions } = useQuery({
@@ -65,12 +75,12 @@ export default function RequestLogsPage(): ReactElement {
       appTypes: appTypes.length > 0 ? appTypes : undefined,
       models: models.length > 0 ? models : undefined,
       status: status === 'all' ? undefined : status,
-      keyword: keyword.trim() ? keyword.trim() : undefined,
+      keyword: debouncedKeyword.trim() ? debouncedKeyword.trim() : undefined,
       project: knownProject,
       page,
       pageSize: 15
     }),
-    [range, customRange, appTypes, models, status, keyword, knownProject, page]
+    [range, customRange, appTypes, models, status, debouncedKeyword, knownProject, page]
   )
 
   const { data, isLoading } = useRequestLogs(filters)
@@ -169,10 +179,7 @@ export default function RequestLogsPage(): ReactElement {
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-neutral-600" />
           <input
             value={keyword}
-            onChange={(e) => {
-              setKeyword(e.target.value)
-              setPage(1)
-            }}
+            onChange={(e) => setKeyword(e.target.value)}
             placeholder="搜索模型 / 会话 / 项目…"
             className="w-56 rounded-lg border border-neutral-800 bg-neutral-900 py-1.5 pl-8 pr-3 text-xs text-neutral-200 placeholder:text-neutral-600 focus:border-neutral-600 focus:outline-none"
           />

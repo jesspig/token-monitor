@@ -21,6 +21,7 @@ import {
   type CustomRange,
   type RangeKey
 } from '../lib/range'
+import { getStatsRefreshInterval } from '../lib/settings-cache'
 
 /** HourlyStats.hour（0–23）→ 'HH:00' 横轴标签，与原 formatHour 视觉一致 */
 function hourLabel(hour: number): string {
@@ -93,12 +94,14 @@ export default function DashboardPage(): ReactElement {
   const hourlyQuery = useQuery({
     queryKey: ['daily-trends', 'hourly', filters],
     queryFn: () => api.getHourlyTrends(filters),
-    enabled: range === 'today' || range === '24h'
+    enabled: range === 'today' || range === '24h',
+    refetchInterval: getStatsRefreshInterval
   })
-  // 预算限额状态（全局维度，staleTime 与页面其他查询一致走全局默认）
+  // 预算限额状态（全局维度）；用量类查询按设置间隔轮询兜底
   const budgetQuery = useQuery({
     queryKey: ['budget-status'],
-    queryFn: () => api.getBudgetStatus()
+    queryFn: () => api.getBudgetStatus(),
+    refetchInterval: getStatsRefreshInterval
   })
 
   const banner = useMemo(() => deriveBudgetBanner(budgetQuery.data), [budgetQuery.data])
