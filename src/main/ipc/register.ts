@@ -101,6 +101,8 @@ export function registerIpcHandlers(
         host.lifecycle.unmount(host.ctx, plugin as LifecyclePlugin)
       }
     }
+    // 启停改变了 enabled 状态：失效状态缓存，保证监控源页下一次查询即时反映
+    host.collector.invalidateStatusCache()
   })
 
   // 13-14. 设置读取与更新（部分字段）

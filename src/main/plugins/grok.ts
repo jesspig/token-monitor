@@ -121,15 +121,23 @@ function readCurrentModel(p: string): string | undefined {
 /** sessionId → 模型 映射缓存（loadModelMap 重建，parseFile 消费；每轮同步经 listFiles 刷新） */
 let modelMap = new Map<string, string>()
 
+/** 上次映射构建时的 summary.json 清单签名（path:mtime 拼接）；一致则跳过重读重建 */
+let lastSummarySignature: string | null = null
+
 /**
  * 建立 sessionId → 模型 映射（root 可注入，便于测试）。
- * 递归读 ~/.grok/sessions/任意层级/summary.json，取 current_model_id；会话目录名即 sessionId。
- * 由本插件在每轮同步 listFiles 开始处重建；导出仅供测试直接调用。
+ * 递归收集 ~/.grok/sessions/任意层级/summary.json，取 current_model_id；会话目录名即 sessionId。
+ * 以「清单 path+mtime 签名」做增量短路：清单未变化时直接复用上次映射，
+ * 避免每轮同步对全部 summary.json 重读重析（listFiles 每轮调用，会话数多时为主进程热点）。
+ * 由本插件在每轮同步 listFiles 开始处刷新；导出仅供测试直接调用。
  */
 export async function loadModelMap(root: string): Promise<Map<string, string>> {
-  const map = new Map<string, string>()
   const summaries: FileEntry[] = []
   collectSummaries(path.join(root, 'sessions'), summaries)
+  const signature = summaries.map((e) => `${e.path}:${e.mtime}`).join('\n')
+  if (signature === lastSummarySignature) return modelMap
+
+  const map = new Map<string, string>()
   for (const e of summaries) {
     const sessionId = path.basename(path.dirname(e.path))
     if (!sessionId) continue
@@ -137,6 +145,7 @@ export async function loadModelMap(root: string): Promise<Map<string, string>> {
     if (model) map.set(sessionId, model)
   }
   modelMap = map
+  lastSummarySignature = signature
   return map
 }
 

@@ -64,6 +64,23 @@ function collectSubtree(dir: string, out: FileEntry[]): void {
 }
 
 /**
+ * 探测用存在性短路检查：找到首个会话文件即返回 true。
+ * detect 被 getPluginStatus 周期调用（监控源页轮询），不做全树枚举与逐文件 stat，
+ * 避免大会话树下的主进程同步 IO 阻塞；listFilesFromRoot 仅供同步链路使用。
+ */
+function hasSessionFile(dir: string): boolean {
+  for (const ent of safeReaddir(dir)) {
+    const p = path.join(dir, ent.name)
+    if (ent.isDirectory()) {
+      if (hasSessionFile(p)) return true
+    } else if (ent.isFile() && isSessionFile(ent.name)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
  * 列出会话文件（root 可注入，便于测试）：sessions 子树内任意层级的 *.jsonl。
  * fork 提取分支会创建新文件 → 同一逻辑条目可跨文件出现，
  * 由条目 id 作 requestId 经语义去重收敛（见 toUsageRecord）。
@@ -92,7 +109,7 @@ export function detectFromRoot(root: string): Detection {
       sessionDir: root
     }
   }
-  if (listFilesFromRoot(root).length === 0) {
+  if (!hasSessionFile(root)) {
     return {
       available: false,
       reason: '会话目录下未发现 *.jsonl 会话文件（Pi 尚未产生会话）',
