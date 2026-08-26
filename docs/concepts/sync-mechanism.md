@@ -4,13 +4,13 @@ title: 同步与去重
 description: 增量游标 + mtime 短路 + chokidar 定向监听 + 定时兜底扫描；主键幂等去重 + fork/rewrite 语义去重账本（requestId 直配）；清理前预回填。
 tags: [sync, dedup, cursor, mtime-shortcut, chokidar, watcher]
 resource: src/main/services/storage.ts
-timestamp: 2026-08-26T00:21:00+08:00
+timestamp: 2026-08-26T03:21:00+08:00
 ---
 
 # 同步与去重
 
 > [!note] 当前状态
-> **已实现**（2026-08-20）。游标/去重落地于 `storage.ts`，调度与监听于 `scheduler.ts`/`watcher.ts`，采集编排于 `collector.ts`；语义去重账本接入、opencode WAL mtime 感知与清理前预回填于 2026-08-23 落地；mtime 短路与 watcher 定向同步、启动错峰于 2026-08-24 落地（主进程事件循环防阻塞性能优化）；**dsh zstd 字节游标（v6）与 truncate 判定收紧、首轮采集延迟 1500ms 于 2026-08-26 落地**。
+> **已实现**（2026-08-20）。游标/去重落地于 `storage.ts`，调度与监听于 `scheduler.ts`/`watcher.ts`，采集编排于 `collector.ts`；语义去重账本接入、opencode WAL mtime 感知与清理前预回填于 2026-08-23 落地；mtime 短路与 watcher 定向同步、启动错峰于 2026-08-24 落地（主进程事件循环防阻塞性能优化）；**dsh zstd 字节游标（v6）与 truncate 判定收紧、首轮采集延迟 1500ms 于 2026-08-26 落地**；**同日防阻塞第二轮——外部 SQLite 只读连接 busy 短超时、调度 initialDelayMs 错相（retention sweep 45s 启动）、getPluginStatus 5s TTL 缓存、渲染端轮询收窄与失效改 1.5s 防抖**。
 
 ## 同步策略（已实现）
 
@@ -23,7 +23,13 @@ timestamp: 2026-08-26T00:21:00+08:00
   - 插件装载时把会话目录注册进 watcher（chokidar），文件变更**只定向触发对应插件的 `collector.syncPlugin(id)`**（**500ms 防抖**合并高频事件；不再全量扫描其余插件）；
   - 定时兜底扫描（默认 **5 分钟**，`syncIntervalMs=300000` 可在设置中调整，修改后即时重启扫描）仍走全量 `syncAll()`；
   - 首轮采集错峰（2026-08-26）：启动时**不再立即全量同步**——生产入口在「窗口 show 且宿主就绪（`host.ready`）」后经 `collector.start(intervalMs, { initialSyncDelayMs: 1500 })` 延迟触发首轮采集，窗口渲染与插件装载先行，周期兜底扫描不变；
-  - 启动期非关键任务错峰——models.dev 定价同步延迟 10s、零成本回填延迟 20s、存量费用重算延迟 30s（`host.ts` 常量），避免与首轮采集争抢 IO，dispose 时清理全部延迟句柄。
+   - 启动期非关键任务错峰——models.dev 定价同步延迟 10s、零成本回填延迟 20s、存量费用重算延迟 30s、过期保留清理（retention sweep）延迟 45s 触发首次清理（`RETENTION_SWEEP_DELAY_MS`，2026-08-26 由 30s 上调以错开 30s 处的存量费用重算），避免相互争抢 IO，dispose 时清理全部延迟句柄。
+
+## 主进程防阻塞配套（2026-08-26 第二轮）
+
+- **调度错相**：`SchedulerService.schedule(intervalMs, task, initialDelayMs?)` 增加可选第三参——首触到点立即执行一次再进周期，缺省 = intervalMs 与原 `setInterval` 语义一致。宿主过期清理调度经此错相半个周期点火（`RETENTION_SWEEP_PHASE_OFFSET_RATIO = 0.5`），与兜底扫描等主进程重活错开执行窗口。
+- **外部 SQLite 只读连接 busy 短超时**：opencode / zcode 插件打开上游 SQLite 库统一传 `EXTERNAL_DB_BUSY_TIMEOUT_MS = 250`——better-sqlite3 撞锁时在主线程同步忙等，默认 5000ms 会冻结整个应用；现撞锁约 250ms 即放弃本轮（返回空结果），由下轮兜底重试。
+- **状态查询 TTL 缓存**：`collector.getPluginStatus` 结果带 5s TTL 缓存（`STATUS_CACHE_TTL_MS = 5000`），监控源页高频拉取不再每轮对全部插件做 detect/版本探测；`invalidateStatusCache()` 供主动失效，`plugins:set-enabled` IPC 处理后即调（启停立即反映）。
 
 ## 去重策略（已实现，双层）
 
@@ -35,7 +41,7 @@ timestamp: 2026-08-26T00:21:00+08:00
 ## 实时刷新（已实现）
 
 - 一轮同步实际新增记录数 > 0 才发 `usage-updated` 事件（EventBus **200ms 防抖**窗口内合并，addedRecords 累加；语义去重命中不计入新增），经 IPC 推送前端。
-- 渲染端 `hooks/useUsageEvents.ts` 订阅该事件，失效 6 个用量 queryKey（`usage-summary` / `daily-trends` / `request-logs` / `stats-by-model` / `stats-by-app` / `budget-status`），由 TanStack Query 自动重新拉取；另有兜底轮询（`refetchInterval` 函数式读取设置项 `statsRefreshIntervalMs`，默认 30000ms——2026-08-24 由 5000ms 上调以降低主进程查询压力，实时性由推送保证、轮询仅兜底，失焦暂停）。
+- 渲染端 `hooks/useUsageEvents.ts` 订阅该事件，失效 6 个用量 queryKey（`usage-summary` / `daily-trends` / `request-logs` / `stats-by-model` / `stats-by-app` / `budget-status`），由 TanStack Query 自动重新拉取；失效合并策略为 **1500ms 防抖**（`INVALIDATE_DEBOUNCE_MS`，2026-08-26 由 1000ms 冷却节流改防抖——CLI 活跃期事件流安静 1.5s 后合并失效一次）。兜底轮询已收窄（2026-08-26）：QueryClient 全局默认 `refetchInterval` 移除，仅用量类查询显式轮询并读取设置项 `statsRefreshIntervalMs`（默认 30000ms），实时性由推送保证；其余细节见 [UI 页面](ui-pages.md)。
 
 ## 关联页面
 

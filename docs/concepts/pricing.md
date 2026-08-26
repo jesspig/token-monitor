@@ -4,13 +4,13 @@ title: 定价与费用
 description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填与存量缓存口径重算；费用 = fresh_input × input 价 + 其余 token × 各自价格，input 按 semantics 三态扣减。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-08-26T00:21:00+08:00
+timestamp: 2026-08-26T03:21:00+08:00
 ---
 
 # 定价与费用
 
 > [!note] 当前状态
-> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）；2026-08-23 第五轮迭代接入输入语义计费（v4 迁移 + 存量重算）并增强匹配兜底链；2026-08-24 定价写入批量化（seed 播种与 models.dev 同步均收敛为单事务批量 upsert，数千次独立 fsync → 1 次）与启动错峰（models.dev 首次同步延迟 10s）落地；**2026-08-26：定价索引升级排序数组 + 二分查找（短 ID/家族匹配 O(n·L) → O(L·log n)）、新增批量计费 calcCostBatch**。
+> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）；2026-08-23 第五轮迭代接入输入语义计费（v4 迁移 + 存量重算）并增强匹配兜底链；2026-08-24 定价写入批量化（seed 播种与 models.dev 同步均收敛为单事务批量 upsert，数千次独立 fsync → 1 次）与启动错峰（models.dev 首次同步延迟 10s）落地；**2026-08-26：定价索引升级排序数组 + 二分查找（短 ID/家族匹配 O(n·L) → O(L·log n)）、新增批量计费 calcCostBatch、零成本回填与存量重算改分批执行并命中 v7 部分索引**。
 
 ## 定价表（v2，已实现）
 
@@ -90,6 +90,7 @@ IPC 仅两通道：`pricing:list`（只读列表）/ `pricing:modelsdev-sync`（
 `pricing.backfillZeroCost(db, pricing)`：扫描明细表中 `cost_usd = 0` 或为空的行，用当前定价重算费用并增量修正对应 `usage_daily_rollups.cost_usd`。
 
 - 不变量：rollup 费用 ≡ 组内明细费用之和（增量修正而非重算全桶）；rollup 行缺失时不重建。
+- 分批执行（2026-08-26 防阻塞第二轮，与 recalcCachedInputCosts 同构）：rowid 游标按 `REPRICE_BATCH_SIZE = 500` 逐批扫描候选，每批「事务外取价计算 → 单事务原子提交」，批间 setImmediate 让出事件循环——消除一次性长事务对主进程的阻塞；候选查询命中 v7 部分索引 `idx_usage_records_zero_cost`（见 [数据模型](data-model.md)），稳态扫描成本从 O(全表) 降为 O(候选数)。
 - 触发时机：应用启动、每次 models.dev 全量同步之后（自动调度与手动按钮共用同一入口）。
 
 ## 存量缓存口径重算（已实现，recalcCachedInputCosts）
@@ -99,6 +100,7 @@ IPC 仅两通道：`pricing:list`（只读列表）/ `pricing:modelsdev-sync`（
 - 与迁移的分工：v4 迁移只做纯 SQL 的 opencode semantics 标注修正（1→2）；费用重算需要活定价而 migrate() 为同步纯 SQL,故落地为独立函数由宿主**启动序列**异步调用一次。
 - 幂等：重算值与现值一致（delta=0）即跳过零写入,重复调用 updated=0;阶段二 UPDATE 附带 `cost_usd IS ?` 乐观守卫（NULL 安全），防覆盖并发写入。
 - rollup 行缺失时不创建（同零成本回填口径）。
+- 分批执行（2026-08-26 防阻塞第二轮，与 backfillZeroCost 同构）：rowid 游标按 `REPRICE_BATCH_SIZE = 500` 逐批扫描，每批「事务外取价计算 → 单事务原子提交」，批间 setImmediate 让出事件循环；候选查询命中 v7 部分索引 `idx_usage_records_cached_input`（见 [数据模型](data-model.md)），稳态不再全表扫描。
 
 ## 关联页面
 
