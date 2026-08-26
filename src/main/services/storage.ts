@@ -163,12 +163,17 @@ export class SqliteStorage implements StorageService {
     `)
 
     this.upsertCursorStmt = db.prepare(`
-      INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, updated_at)
-      VALUES (@file_path, @data_source, @line_offset, @file_mtime, @updated_at)
+      INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, byte_offset, updated_at)
+      VALUES (@file_path, @data_source, @line_offset, @file_mtime, @byte_offset, @updated_at)
       ON CONFLICT(file_path) DO UPDATE SET
         data_source = excluded.data_source,
-        line_offset = excluded.line_offset,
+        line_offset = CASE WHEN @reset_cursor THEN 0 ELSE excluded.line_offset END,
         file_mtime  = excluded.file_mtime,
+        byte_offset = CASE
+          WHEN @reset_cursor THEN NULL
+          WHEN @keep_byte_offset THEN sync_cursors.byte_offset
+          ELSE excluded.byte_offset
+        END,
         updated_at  = excluded.updated_at
     `)
 
@@ -300,26 +305,40 @@ export class SqliteStorage implements StorageService {
     return Promise.resolve(row ? row.line_offset : null)
   }
 
-  getCursorMeta(filePath: string): Promise<{ lineOffset: number; fileMtime: number } | null> {
+  getCursorMeta(
+    filePath: string
+  ): Promise<{ lineOffset: number; fileMtime: number; byteOffset?: number | null } | null> {
     const row = this.getCursorRowStmt.get(filePath) as SyncCursorRow | undefined
-    return Promise.resolve(row ? { lineOffset: row.line_offset, fileMtime: row.file_mtime } : null)
+    return Promise.resolve(
+      row
+        ? { lineOffset: row.line_offset, fileMtime: row.file_mtime, byteOffset: row.byte_offset ?? null }
+        : null
+    )
   }
 
-  setCursor(filePath: string, line: number, fileMtime?: number): Promise<void> {
-    const runTx = this.db.transaction((fp: string, ln: number, mtime?: number) => {
-      const existing = this.getCursorRowStmt.get(fp) as SyncCursorRow | undefined
-      // 文件被 truncate/替换（mtime 变化）：游标重置到 0，下一轮从头部全量重读
-      const offset = existing && mtime != null && existing.file_mtime !== mtime ? 0 : ln
-      const finalMtime = mtime ?? existing?.file_mtime ?? 0
-      this.upsertCursorStmt.run({
-        file_path: fp,
-        data_source: existing?.data_source ?? '',
-        line_offset: offset,
-        file_mtime: finalMtime,
-        updated_at: Date.now()
-      })
-    })
-    runTx(filePath, line, fileMtime)
+  setCursor(filePath: string, line: number, fileMtime?: number, byteOffset?: number | null): Promise<void> {
+    const runTx = this.db.transaction(
+      (fp: string, ln: number, mtime?: number, byte?: number | null) => {
+        const existing = this.getCursorRowStmt.get(fp) as SyncCursorRow | undefined
+        // 文件被 truncate/替换（mtime 变化）：游标重置到 0，下一轮从头部全量重读；
+        // 既有 mtime 为 0（未知占位）时不参与判定，避免正常推进被误判为 truncate。
+        // byteOffset：缺省保留现值，显式传入（含 null）覆盖；truncate 重置时一并清空。
+        const reset =
+          existing != null && mtime != null && existing.file_mtime !== 0 && existing.file_mtime !== mtime
+        const finalMtime = mtime ?? existing?.file_mtime ?? 0
+        this.upsertCursorStmt.run({
+          file_path: fp,
+          data_source: existing?.data_source ?? '',
+          line_offset: ln,
+          file_mtime: finalMtime,
+          byte_offset: byte ?? null,
+          keep_byte_offset: byte === undefined ? 1 : 0,
+          reset_cursor: reset ? 1 : 0,
+          updated_at: Date.now()
+        })
+      }
+    )
+    runTx(filePath, line, fileMtime, byteOffset)
     return Promise.resolve()
   }
 

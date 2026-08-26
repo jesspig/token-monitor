@@ -552,8 +552,9 @@ describe('过期明细清理调度（清理前尽力回填）', () => {
       await host.storage.updateModelPricing(testPricing('unknown-model-x'))
       host.pricing.invalidateCache()
 
-      // 推过 RETENTION_SWEEP_DELAY_MS：启动 sweep 执行「先回填 → 后清理」
-      await vi.advanceTimersByTimeAsync(30_000)
+      // 推过 RETENTION_SWEEP_DELAY_MS（45s，错开 30s 处的存量费用重算）：
+      // 启动 sweep 执行「先回填 → 后清理」
+      await vi.advanceTimersByTimeAsync(45_000)
 
       // 明细已被清理……
       expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toBeNull()
@@ -584,7 +585,7 @@ describe('过期明细清理调度（清理前尽力回填）', () => {
       // 让回填第一步查价即抛错（该行零成本必命中候选，getPrice 必被调用）
       vi.spyOn(host.pricing, 'getPrice').mockRejectedValue(new Error('pricing unavailable'))
 
-      await vi.advanceTimersByTimeAsync(30_000)
+      await vi.advanceTimersByTimeAsync(45_000)
 
       // 回填失败仅记日志，清理照常执行
       expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toBeNull()

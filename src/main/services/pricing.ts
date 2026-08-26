@@ -91,18 +91,32 @@ function hasBoundaryChar(ch: string | undefined): boolean {
   return ch === '-' || ch === '.' || /\d/.test(ch ?? '')
 }
 
-/** 短 ID 前缀匹配：取最长前缀 key（如 gpt-4o-latest → gpt-4o），要求边界后继 */
-function shortIdPrefix(map: Map<string, ModelPricingRow>, id: string): ModelPricingRow | undefined {
-  let best: ModelPricingRow | undefined
-  let bestLen = -1
-  for (const [key, row] of map) {
-    if (id.length <= key.length || key.length <= bestLen) continue
-    if (!id.startsWith(key)) continue
-    if (!hasBoundaryChar(id[key.length])) continue
-    best = row
-    bestLen = key.length
+interface PricingIndex {
+  map: Map<string, ModelPricingRow>
+  keys: string[]
+}
+
+function lowerBound(sortedKeys: string[], target: string): number {
+  let lo = 0
+  let hi = sortedKeys.length
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1
+    if (sortedKeys[mid] < target) lo = mid + 1
+    else hi = mid
   }
-  return best
+  return lo
+}
+
+function shortIdPrefix(index: PricingIndex, id: string): ModelPricingRow | undefined {
+  const { map, keys } = index
+  for (let len = id.length - 1; len >= 1; len--) {
+    const key = id.slice(0, len)
+    const idx = lowerBound(keys, key)
+    if (idx >= keys.length || keys[idx] !== key) continue
+    if (!hasBoundaryChar(id[len])) continue
+    return map.get(key)
+  }
+  return undefined
 }
 
 /**
@@ -119,7 +133,9 @@ function shortIdPrefix(map: Map<string, ModelPricingRow>, id: string): ModelPric
  * 否则 claude-sonnet-4.5 会被短 ID 'claude-sonnet-4' 截胡（边界字符 '.' 通过判定），
  * 错配到上一代模型价格（如 opus-4.5 → opus-4，单价差 3 倍）。
  */
-function matchPrice(map: Map<string, ModelPricingRow>, model: string): ModelPricingRow | undefined {
+function matchPrice(index: PricingIndex, model: string): ModelPricingRow | undefined {
+  const { map, keys } = index
+
   // 级 1：原样精确
   const exact = map.get(model)
   if (exact) return exact
@@ -131,22 +147,24 @@ function matchPrice(map: Map<string, ModelPricingRow>, model: string): ModelPric
 
   // 级 3/4：短 ID 前缀（原样优先于 dotted 变体）
   const prefixed =
-    shortIdPrefix(map, model) ?? (dotted !== model ? shortIdPrefix(map, dotted) : undefined)
+    shortIdPrefix(index, model) ?? (dotted !== model ? shortIdPrefix(index, dotted) : undefined)
   if (prefixed) return prefixed
 
   // 级 5 家族兜底：key 以 model 为前缀且后继为边界字符，取最短 key
   if (model.length < MIN_FAMILY_MODEL_LENGTH) return undefined
   let fallback: ModelPricingRow | undefined
   let fallbackKey = ''
-  for (const [key, row] of map) {
-    if (model.length >= key.length || !key.startsWith(model)) continue
+  for (let i = lowerBound(keys, model); i < keys.length; i++) {
+    const key = keys[i]
+    if (!key.startsWith(model)) break
+    if (model.length >= key.length) continue
     if (!hasBoundaryChar(key[model.length])) continue
     if (
       !fallback ||
       key.length < fallbackKey.length ||
       (key.length === fallbackKey.length && key < fallbackKey)
     ) {
-      fallback = row
+      fallback = map.get(key)
       fallbackKey = key
     }
   }
@@ -156,6 +174,24 @@ function matchPrice(map: Map<string, ModelPricingRow>, model: string): ModelPric
 /** 微美元 → USD 字符串（与 storage 聚合口径一致：toFixed(6) 后去尾零） */
 function toCostString(micro: number): string {
   return (micro / 1_000_000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0'
+}
+
+function computeCost(index: PricingIndex, record: UsageRecord): string | undefined {
+  const pricing = matchPrice(index, normalizeModelId(record.model))
+  if (!pricing) return undefined
+
+  const mult = pricing.cost_multiplier ?? 1
+  const freshInput =
+    record.inputSemantics === 1
+      ? Math.max(0, record.inputTokens - record.cacheReadTokens - record.cacheCreationTokens)
+      : record.inputTokens
+  const micro = Math.round(
+    freshInput * pricing.input_per_million * mult +
+      record.outputTokens * pricing.output_per_million * mult +
+      record.cacheReadTokens * pricing.cache_read_per_million * mult +
+      record.cacheCreationTokens * pricing.cache_creation_per_million * mult
+  )
+  return toCostString(micro)
 }
 
 /** 内置模型定价 seed 项（价格为每百万 token USD 通用公开参考价） */
@@ -1026,7 +1062,7 @@ export async function seedPricing(storage: StorageService): Promise<void> {
  * 写入/删除定价后调用 invalidateCache() 使其失效。
  */
 export class PricingServiceImpl implements PricingService {
-  private priceMap: Map<string, ModelPricingRow> | null = null
+  private priceIndex: PricingIndex | null = null
 
   constructor(private readonly storage: StorageService) {}
 
@@ -1035,8 +1071,8 @@ export class PricingServiceImpl implements PricingService {
   }
 
   async getPrice(modelId: string): Promise<ModelPricingRow | undefined> {
-    const map = await this.getPriceMap()
-    return matchPrice(map, normalizeModelId(modelId))
+    const index = await this.getPriceIndex()
+    return matchPrice(index, normalizeModelId(modelId))
   }
 
   /**
@@ -1055,38 +1091,31 @@ export class PricingServiceImpl implements PricingService {
    * cost_multiplier 保持逐项相乘。
    */
   async calcCost(record: UsageRecord): Promise<string | undefined> {
-    const map = await this.getPriceMap()
-    const pricing = matchPrice(map, normalizeModelId(record.model))
-    if (!pricing) return undefined
+    const index = await this.getPriceIndex()
+    return computeCost(index, record)
+  }
 
-    const mult = pricing.cost_multiplier ?? 1
-    const freshInput =
-      record.inputSemantics === 1
-        ? Math.max(0, record.inputTokens - record.cacheReadTokens - record.cacheCreationTokens)
-        : record.inputTokens
-    const micro = Math.round(
-      freshInput * pricing.input_per_million * mult +
-        record.outputTokens * pricing.output_per_million * mult +
-        record.cacheReadTokens * pricing.cache_read_per_million * mult +
-        record.cacheCreationTokens * pricing.cache_creation_per_million * mult
-    )
-    return toCostString(micro)
+  async calcCostBatch(records: UsageRecord[]): Promise<(string | undefined)[]> {
+    if (records.length === 0) return []
+    const index = await this.getPriceIndex()
+    return records.map((record) => computeCost(index, record))
   }
 
   /** 使内存索引失效（storage 定价写入/删除后调用，getModelPricing 变化后缓存即失效） */
   invalidateCache(): void {
-    this.priceMap = null
+    this.priceIndex = null
   }
 
-  private async getPriceMap(): Promise<Map<string, ModelPricingRow>> {
-    if (this.priceMap) return this.priceMap
+  private async getPriceIndex(): Promise<PricingIndex> {
+    if (this.priceIndex) return this.priceIndex
     const rows = await this.storage.getModelPricing()
     const map = new Map<string, ModelPricingRow>()
     for (const row of rows) {
       map.set(normalizeModelId(row.model_id), row)
     }
-    this.priceMap = map
-    return map
+    const index: PricingIndex = { map, keys: Array.from(map.keys()).sort() }
+    this.priceIndex = index
+    return index
   }
 }
 
@@ -1121,6 +1150,38 @@ export interface BackfillResult {
   updated: number
 }
 
+/** 缓存口径存量重算结果统计 */
+export interface RecalcResult {
+  /** 扫描到的候选明细行数（codex/gemini/grok 且 semantics=1，含因无价或重算一致被跳过的行） */
+  scanned: number
+  /** 实际更新费用的明细行数 */
+  updated: number
+}
+
+/**
+ * 分批扫描批大小（两函数共用）：阶段一逐行取价计算为 CPU 密集工作，
+ * 候选集大时一次性处理会长时间冻结主进程事件循环；按批切分并在批间让出，
+ * 给 IPC/UI 留出响应窗口。稳态下配合 v7 部分索引候选集极小，单轮通常一批完成。
+ */
+const REPRICE_BATCH_SIZE = 500
+
+/** 阶段一扫描的明细候选行（rid = rowid，供分批游标推进；其余与 usage_records 列一一对应） */
+type RepriceCandidateRow = Pick<
+  UsageRecordRow,
+  | 'id'
+  | 'app_type'
+  | 'model'
+  | 'input_tokens'
+  | 'output_tokens'
+  | 'cache_read_tokens'
+  | 'cache_creation_tokens'
+  | 'input_semantics'
+  | 'cost_usd'
+  | 'created_at'
+  | 'file_path'
+  | 'line'
+> & { rid: number }
+
 /** 阶段一产出的待应用更新（阶段二在事务内消费） */
 interface PendingCostUpdate {
   id: string
@@ -1129,6 +1190,11 @@ interface PendingCostUpdate {
   dateKey: string
   appType: AppType
   model: string
+}
+
+/** 批间让出事件循环：setImmediate 排在 IPC/定时器之后执行，UI 不被连续占用阻塞 */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve))
 }
 
 /**
@@ -1140,129 +1206,119 @@ interface PendingCostUpdate {
  * 参数取 SqliteDatabase + PricingService 最小组合：SqliteStorage 不暴露 db 句柄，
  * 由持有两者的调用方注入，避免反向耦合存储实现。
  *
- * 分两阶段执行：PricingService 为异步签名而 better-sqlite3 事务回调必须同步，
- * 故在事务外完成取价与费用计算，全部写操作在单个同步事务内原子提交；
- * UPDATE 附带「仍为零成本」守卫，防止覆盖并发写入的真实费用。
+ * 分批执行：以 rowid 游标按 REPRICE_BATCH_SIZE 逐批扫描（候选查询命中 v7 部分
+ * 索引 idx_usage_records_zero_cost），每批「事务外取价计算 → 单同步事务原子提交」，
+ * 批间让出事件循环。游标只前进不回退，天然规避「本批处理后行离开候选集导致
+ * OFFSET 跳行」的问题；批间新入库的行 rowid 更大，会被后续批正常扫到。
  *
+ * UPDATE 附带「仍为零成本」守卫，防止覆盖并发写入的真实费用。
  * 幂等：更新后明细不再命中候选条件，重复调用 updated = 0。
  */
 export async function backfillZeroCost(
   db: SqliteDatabase,
   pricing: PricingService
 ): Promise<BackfillResult> {
-  const candidates = db
+  const selectBatchStmt = db
     .prepare(
       `
       SELECT id, app_type, model, input_tokens, output_tokens,
              cache_read_tokens, cache_creation_tokens, input_semantics,
-             cost_usd, created_at, file_path, line
+             cost_usd, created_at, file_path, line, rowid AS rid
       FROM usage_records
-      WHERE cost_usd IS NULL OR cost_usd = '0'
+      WHERE (cost_usd IS NULL OR cost_usd = '0') AND rowid > ?
+      ORDER BY rowid
+      LIMIT ?
       `
     )
-    .all() as Pick<
-    UsageRecordRow,
-    | 'id'
-    | 'app_type'
-    | 'model'
-    | 'input_tokens'
-    | 'output_tokens'
-    | 'cache_read_tokens'
-    | 'cache_creation_tokens'
-    | 'input_semantics'
-    | 'cost_usd'
-    | 'created_at'
-    | 'file_path'
-    | 'line'
-  >[]
-
-  // 阶段一（事务外）：逐行查价并重算费用。rollup 归桶用 model 原值（与 recordUsage 一致），计费才归一化。
-  const pending: PendingCostUpdate[] = []
-  for (const row of candidates) {
-    const priced = await pricing.getPrice(normalizeModelId(row.model))
-    if (!priced) continue
-    const allFree =
-      priced.input_per_million === 0 &&
-      priced.output_per_million === 0 &&
-      priced.cache_read_per_million === 0 &&
-      priced.cache_creation_per_million === 0
-    if (allFree) continue
-
-    const newCost = await pricing.calcCost({
-      appType: row.app_type,
-      model: row.model,
-      inputTokens: row.input_tokens,
-      outputTokens: row.output_tokens,
-      cacheReadTokens: row.cache_read_tokens,
-      cacheCreationTokens: row.cache_creation_tokens,
-      inputSemantics: row.input_semantics,
-      createdAt: row.created_at,
-      source: { filePath: row.file_path, line: row.line }
-    })
-    const newMicro = toMicroUsd(newCost)
-    if (newCost == null || newMicro === 0) continue
-
-    pending.push({
-      id: row.id,
-      newCost,
-      deltaMicro: newMicro - toMicroUsd(row.cost_usd),
-      dateKey: toDateKey(row.created_at),
-      appType: row.app_type,
-      model: row.model
-    })
-  }
-
-  // 阶段二：单同步事务内原子更新明细与日聚合
+  const updateRecordStmt = db.prepare(
+    `
+    UPDATE usage_records SET cost_usd = ?
+    WHERE id = ? AND (cost_usd IS NULL OR cost_usd = '0')
+    `
+  )
+  const getRollupStmt = db.prepare(
+    `
+    SELECT cost_usd FROM usage_daily_rollups
+    WHERE date = ? AND app_type = ? AND model = ?
+    `
+  )
+  const updateRollupStmt = db.prepare(
+    `
+    UPDATE usage_daily_rollups SET cost_usd = ?, updated_at = ?
+    WHERE date = ? AND app_type = ? AND model = ?
+    `
+  )
   let updated = 0
-  if (pending.length > 0) {
-    const updateRecordStmt = db.prepare(
-      `
-      UPDATE usage_records SET cost_usd = ?
-      WHERE id = ? AND (cost_usd IS NULL OR cost_usd = '0')
-      `
-    )
-    const getRollupStmt = db.prepare(
-      `
-      SELECT cost_usd FROM usage_daily_rollups
-      WHERE date = ? AND app_type = ? AND model = ?
-      `
-    )
-    const updateRollupStmt = db.prepare(
-      `
-      UPDATE usage_daily_rollups SET cost_usd = ?, updated_at = ?
-      WHERE date = ? AND app_type = ? AND model = ?
-      `
-    )
-    const runTx = db.transaction((items: PendingCostUpdate[], now: number) => {
-      for (const p of items) {
-        const info = updateRecordStmt.run(p.newCost, p.id)
-        if (info.changes === 0) continue
-        updated++
-        const rollup = getRollupStmt.get(p.dateKey, p.appType, p.model) as
-          | { cost_usd: string }
-          | undefined
-        if (!rollup) continue
-        updateRollupStmt.run(
-          toCostString(toMicroUsd(rollup.cost_usd) + p.deltaMicro),
-          now,
-          p.dateKey,
-          p.appType,
-          p.model
-        )
-      }
-    })
+  // 阶段二：单同步事务内原子更新明细与日聚合（每批一次）
+  const runTx = db.transaction((items: PendingCostUpdate[], now: number) => {
+    for (const p of items) {
+      const info = updateRecordStmt.run(p.newCost, p.id)
+      if (info.changes === 0) continue
+      updated++
+      const rollup = getRollupStmt.get(p.dateKey, p.appType, p.model) as
+        | { cost_usd: string }
+        | undefined
+      if (!rollup) continue
+      updateRollupStmt.run(
+        toCostString(toMicroUsd(rollup.cost_usd) + p.deltaMicro),
+        now,
+        p.dateKey,
+        p.appType,
+        p.model
+      )
+    }
+  })
+
+  let scanned = 0
+  let lastRid = 0
+  for (;;) {
+    const batch = selectBatchStmt.all(lastRid, REPRICE_BATCH_SIZE) as RepriceCandidateRow[]
+    if (batch.length === 0) break
+    scanned += batch.length
+
+    // 阶段一（事务外）：逐行查价并重算费用。rollup 归桶用 model 原值（与 recordUsage 一致），计费才归一化。
+    const pending: PendingCostUpdate[] = []
+    for (const row of batch) {
+      const priced = await pricing.getPrice(normalizeModelId(row.model))
+      if (!priced) continue
+      const allFree =
+        priced.input_per_million === 0 &&
+        priced.output_per_million === 0 &&
+        priced.cache_read_per_million === 0 &&
+        priced.cache_creation_per_million === 0
+      if (allFree) continue
+
+      const newCost = await pricing.calcCost({
+        appType: row.app_type,
+        model: row.model,
+        inputTokens: row.input_tokens,
+        outputTokens: row.output_tokens,
+        cacheReadTokens: row.cache_read_tokens,
+        cacheCreationTokens: row.cache_creation_tokens,
+        inputSemantics: row.input_semantics,
+        createdAt: row.created_at,
+        source: { filePath: row.file_path, line: row.line }
+      })
+      const newMicro = toMicroUsd(newCost)
+      if (newCost == null || newMicro === 0) continue
+
+      pending.push({
+        id: row.id,
+        newCost,
+        deltaMicro: newMicro - toMicroUsd(row.cost_usd),
+        dateKey: toDateKey(row.created_at),
+        appType: row.app_type,
+        model: row.model
+      })
+    }
+
     runTx(pending, Date.now())
+
+    lastRid = batch[batch.length - 1].rid
+    await yieldToEventLoop()
   }
 
-  return { scanned: candidates.length, updated }
-}
-
-/** 缓存口径存量重算结果统计 */
-export interface RecalcResult {
-  /** 扫描到的候选明细行数（codex/gemini/grok 且 semantics=1，含因无价或重算一致被跳过的行） */
-  scanned: number
-  /** 实际更新费用的明细行数 */
-  updated: number
+  return { scanned, updated }
 }
 
 /** 重算产出的待应用更新：在通用字段上追加旧费用原值，供阶段二乐观守卫 NULL 安全比对 */
@@ -1286,122 +1342,118 @@ interface PendingRecalcUpdate extends PendingCostUpdate {
  * 幂等：重算值与现值一致（delta = 0）即跳过，不产生任何写入，
  * 后续重复调用 updated = 0。候选行 semantics 不改写，重复扫描无害。
  *
- * 两阶段结构与守卫同 backfillZeroCost：阶段一在事务外逐行取价与计算，
- * 阶段二单同步事务原子提交；UPDATE 附带 cost_usd 原值的 IS 守卫
+ * 分批结构与守卫同 backfillZeroCost：rowid 游标按批扫描（候选查询命中 v7
+ * 部分索引 idx_usage_records_cached_input），每批事务外取价计算、单同步事务
+ * 原子提交，批间让出事件循环；UPDATE 附带 cost_usd 原值的 IS 守卫
  * （NULL 与非 NULL 统一判定），防止覆盖并发写入的真实费用。
  */
 export async function recalcCachedInputCosts(
   db: SqliteDatabase,
   pricing: PricingService
 ): Promise<RecalcResult> {
-  const candidates = db
-    .prepare(
-      `
-      SELECT id, app_type, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, input_semantics,
-             cost_usd, created_at, file_path, line
-      FROM usage_records
-      WHERE app_type IN ('codex', 'gemini', 'grok') AND input_semantics = 1
-      `
-    )
-    .all() as Pick<
-    UsageRecordRow,
-    | 'id'
-    | 'app_type'
-    | 'model'
-    | 'input_tokens'
-    | 'output_tokens'
-    | 'cache_read_tokens'
-    | 'cache_creation_tokens'
-    | 'input_semantics'
-    | 'cost_usd'
-    | 'created_at'
-    | 'file_path'
-    | 'line'
-  >[]
-
-  // 阶段一（事务外）：逐行查价并按新公式重算费用。rollup 归桶用 model 原值（与 recordUsage 一致），计费才归一化。
-  const pending: PendingRecalcUpdate[] = []
-  for (const row of candidates) {
-    const priced = await pricing.getPrice(normalizeModelId(row.model))
-    if (!priced) continue
-    const allFree =
-      priced.input_per_million === 0 &&
-      priced.output_per_million === 0 &&
-      priced.cache_read_per_million === 0 &&
-      priced.cache_creation_per_million === 0
-    if (allFree) continue
-
-    const newCost = await pricing.calcCost({
-      appType: row.app_type,
-      model: row.model,
-      inputTokens: row.input_tokens,
-      outputTokens: row.output_tokens,
-      cacheReadTokens: row.cache_read_tokens,
-      cacheCreationTokens: row.cache_creation_tokens,
-      inputSemantics: row.input_semantics,
-      createdAt: row.created_at,
-      source: { filePath: row.file_path, line: row.line }
-    })
-    if (newCost == null) continue
-
-    const newMicro = toMicroUsd(newCost)
-    const oldMicro = toMicroUsd(row.cost_usd)
-    // 重算一致即跳过：幂等关键，不产生任何写入
-    if (newMicro === oldMicro) continue
-
-    pending.push({
-      id: row.id,
-      newCost,
-      deltaMicro: newMicro - oldMicro,
-      dateKey: toDateKey(row.created_at),
-      appType: row.app_type,
-      model: row.model,
-      oldCostUsd: row.cost_usd
-    })
-  }
-
-  // 阶段二：单同步事务内原子更新明细与日聚合；IS 守卫对旧值 NULL/非 NULL 统一成立
+  const selectBatchStmt = db.prepare(
+    `
+    SELECT id, app_type, model, input_tokens, output_tokens,
+           cache_read_tokens, cache_creation_tokens, input_semantics,
+           cost_usd, created_at, file_path, line, rowid AS rid
+    FROM usage_records
+    WHERE app_type IN ('codex', 'gemini', 'grok') AND input_semantics = 1 AND rowid > ?
+    ORDER BY rowid
+    LIMIT ?
+    `
+  )
+  const updateRecordStmt = db.prepare(
+    `
+    UPDATE usage_records SET cost_usd = ?
+    WHERE id = ? AND cost_usd IS ?
+    `
+  )
+  const getRollupStmt = db.prepare(
+    `
+    SELECT cost_usd FROM usage_daily_rollups
+    WHERE date = ? AND app_type = ? AND model = ?
+    `
+  )
+  const updateRollupStmt = db.prepare(
+    `
+    UPDATE usage_daily_rollups SET cost_usd = ?, updated_at = ?
+    WHERE date = ? AND app_type = ? AND model = ?
+    `
+  )
   let updated = 0
-  if (pending.length > 0) {
-    const updateRecordStmt = db.prepare(
-      `
-      UPDATE usage_records SET cost_usd = ?
-      WHERE id = ? AND cost_usd IS ?
-      `
-    )
-    const getRollupStmt = db.prepare(
-      `
-      SELECT cost_usd FROM usage_daily_rollups
-      WHERE date = ? AND app_type = ? AND model = ?
-      `
-    )
-    const updateRollupStmt = db.prepare(
-      `
-      UPDATE usage_daily_rollups SET cost_usd = ?, updated_at = ?
-      WHERE date = ? AND app_type = ? AND model = ?
-      `
-    )
-    const runTx = db.transaction((items: PendingRecalcUpdate[], now: number) => {
-      for (const p of items) {
-        const info = updateRecordStmt.run(p.newCost, p.id, p.oldCostUsd)
-        if (info.changes === 0) continue
-        updated++
-        const rollup = getRollupStmt.get(p.dateKey, p.appType, p.model) as
-          | { cost_usd: string }
-          | undefined
-        if (!rollup) continue
-        updateRollupStmt.run(
-          toCostString(toMicroUsd(rollup.cost_usd) + p.deltaMicro),
-          now,
-          p.dateKey,
-          p.appType,
-          p.model
-        )
-      }
-    })
+  // 阶段二：单同步事务内原子更新明细与日聚合；IS 守卫对旧值 NULL/非 NULL 统一成立（每批一次）
+  const runTx = db.transaction((items: PendingRecalcUpdate[], now: number) => {
+    for (const p of items) {
+      const info = updateRecordStmt.run(p.newCost, p.id, p.oldCostUsd)
+      if (info.changes === 0) continue
+      updated++
+      const rollup = getRollupStmt.get(p.dateKey, p.appType, p.model) as
+        | { cost_usd: string }
+        | undefined
+      if (!rollup) continue
+      updateRollupStmt.run(
+        toCostString(toMicroUsd(rollup.cost_usd) + p.deltaMicro),
+        now,
+        p.dateKey,
+        p.appType,
+        p.model
+      )
+    }
+  })
+
+  let scanned = 0
+  let lastRid = 0
+  for (;;) {
+    const batch = selectBatchStmt.all(lastRid, REPRICE_BATCH_SIZE) as RepriceCandidateRow[]
+    if (batch.length === 0) break
+    scanned += batch.length
+
+    // 阶段一（事务外）：逐行查价并按新公式重算费用。rollup 归桶用 model 原值（与 recordUsage 一致），计费才归一化。
+    const pending: PendingRecalcUpdate[] = []
+    for (const row of batch) {
+      const priced = await pricing.getPrice(normalizeModelId(row.model))
+      if (!priced) continue
+      const allFree =
+        priced.input_per_million === 0 &&
+        priced.output_per_million === 0 &&
+        priced.cache_read_per_million === 0 &&
+        priced.cache_creation_per_million === 0
+      if (allFree) continue
+
+      const newCost = await pricing.calcCost({
+        appType: row.app_type,
+        model: row.model,
+        inputTokens: row.input_tokens,
+        outputTokens: row.output_tokens,
+        cacheReadTokens: row.cache_read_tokens,
+        cacheCreationTokens: row.cache_creation_tokens,
+        inputSemantics: row.input_semantics,
+        createdAt: row.created_at,
+        source: { filePath: row.file_path, line: row.line }
+      })
+      if (newCost == null) continue
+
+      const newMicro = toMicroUsd(newCost)
+      const oldMicro = toMicroUsd(row.cost_usd)
+      // 重算一致即跳过：幂等关键，不产生任何写入
+      if (newMicro === oldMicro) continue
+
+      pending.push({
+        id: row.id,
+        newCost,
+        deltaMicro: newMicro - oldMicro,
+        dateKey: toDateKey(row.created_at),
+        appType: row.app_type,
+        model: row.model,
+        oldCostUsd: row.cost_usd
+      })
+    }
+
     runTx(pending, Date.now())
+
+    lastRid = batch[batch.length - 1].rid
+    await yieldToEventLoop()
   }
 
-  return { scanned: candidates.length, updated }
+  return { scanned, updated }
 }

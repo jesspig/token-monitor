@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import type { ReactElement } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
+import type { ComponentType, LazyExoticComponent, ReactElement } from 'react'
 import clsx from 'clsx'
 import {
   Activity,
@@ -15,13 +15,13 @@ import { isMock } from './api'
 import { useSettings } from './hooks/useSettings'
 import { useUsageEvents } from './hooks/useUsageEvents'
 import { setCachedSettings } from './lib/settings-cache'
-import DashboardPage from './pages/DashboardPage'
-import TrendsPage from './pages/TrendsPage'
-import RequestLogsPage from './pages/RequestLogsPage'
-import StatsPage from './pages/StatsPage'
-import PricingPage from './pages/PricingPage'
-import SourcesPage from './pages/SourcesPage'
-import SettingsPage from './pages/SettingsPage'
+const DashboardPage = lazy(() => import('./pages/DashboardPage'))
+const TrendsPage = lazy(() => import('./pages/TrendsPage'))
+const RequestLogsPage = lazy(() => import('./pages/RequestLogsPage'))
+const StatsPage = lazy(() => import('./pages/StatsPage'))
+const PricingPage = lazy(() => import('./pages/PricingPage'))
+const SourcesPage = lazy(() => import('./pages/SourcesPage'))
+const SettingsPage = lazy(() => import('./pages/SettingsPage'))
 
 type PageKey = 'dashboard' | 'trends' | 'logs' | 'stats' | 'pricing' | 'sources' | 'settings'
 
@@ -35,7 +35,7 @@ const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: typeof LayoutDashboa
   { key: 'settings', label: '设置', icon: Settings }
 ]
 
-const PAGES: Record<PageKey, () => ReactElement> = {
+const PAGES: Record<PageKey, LazyExoticComponent<ComponentType>> = {
   dashboard: DashboardPage,
   trends: TrendsPage,
   logs: RequestLogsPage,
@@ -128,7 +128,15 @@ function App(): ReactElement {
         </header>
 
         <main className="w-full mx-auto max-w-6xl flex-1 overflow-y-auto p-6">
-          <ActivePage />
+          <Suspense
+            fallback={
+              <div className="flex w-full items-center justify-center py-24">
+                <div className="h-32 w-full max-w-lg animate-pulse rounded-xl bg-neutral-800/70" />
+              </div>
+            }
+          >
+            <ActivePage />
+          </Suspense>
         </main>
       </div>
     </div>

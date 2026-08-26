@@ -8,9 +8,193 @@
       content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
     />
     <title>Token Monitor</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #0a0a0a;
+      }
+      .sk {
+        display: block;
+        background: #262626;
+        border-radius: 8px;
+        animation: sk-breathe 1.6s ease-in-out infinite;
+      }
+      @keyframes sk-breathe {
+        0%,
+        100% {
+          opacity: 0.55;
+        }
+        50% {
+          opacity: 1;
+        }
+      }
+      .sk-app {
+        display: flex;
+        height: 100vh;
+        overflow: hidden;
+        background: #0a0a0a;
+      }
+      .sk-side {
+        width: 224px;
+        flex-shrink: 0;
+        border-right: 1px solid #262626;
+        background: rgba(23, 23, 23, 0.4);
+      }
+      .sk-brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 16px;
+        border-bottom: 1px solid #262626;
+      }
+      .sk-logo {
+        width: 32px;
+        height: 32px;
+        border-radius: 8px;
+      }
+      .sk-brand-text {
+        flex: 1;
+      }
+      .sk-brand-text .sk {
+        height: 12px;
+        margin: 4px 0;
+      }
+      .sk-brand-text .sk:first-child {
+        width: 80%;
+      }
+      .sk-brand-text .sk:last-child {
+        width: 55%;
+        height: 9px;
+      }
+      .sk-nav {
+        padding: 12px;
+      }
+      .sk-nav .sk {
+        height: 36px;
+        border-radius: 8px;
+        margin-bottom: 2px;
+      }
+      .sk-nav .sk:first-child {
+        width: 78%;
+      }
+      .sk-nav .sk:nth-child(2) {
+        width: 62%;
+      }
+      .sk-nav .sk:nth-child(3) {
+        width: 84%;
+      }
+      .sk-nav .sk:nth-child(4) {
+        width: 58%;
+      }
+      .sk-nav .sk:nth-child(5) {
+        width: 72%;
+      }
+      .sk-nav .sk:nth-child(6) {
+        width: 66%;
+      }
+      .sk-nav .sk:nth-child(7) {
+        width: 60%;
+      }
+      .sk-content {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+      }
+      .sk-main {
+        max-width: 1152px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .sk-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 24px;
+      }
+      .sk-head-title .sk {
+        height: 18px;
+        width: 120px;
+        margin-bottom: 8px;
+      }
+      .sk-head-title .sk-sub {
+        height: 12px;
+        width: 180px;
+        margin-bottom: 0;
+      }
+      .sk-filter {
+        width: 132px;
+        height: 34px;
+        border-radius: 8px;
+      }
+      .sk-grid {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 16px;
+        margin-bottom: 24px;
+      }
+      .sk-card {
+        height: 104px;
+      }
+      .sk-chart {
+        height: 320px;
+        border-radius: 8px;
+      }
+      @media (max-width: 1279px) {
+        .sk-grid {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+      @media (max-width: 1023px) {
+        .sk-side {
+          display: none;
+        }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="sk-app">
+        <aside class="sk-side">
+          <div class="sk-brand">
+            <span class="sk sk-logo"></span>
+            <div class="sk-brand-text">
+              <span class="sk"></span>
+              <span class="sk"></span>
+            </div>
+          </div>
+          <nav class="sk-nav">
+            <span class="sk"></span>
+            <span class="sk"></span>
+            <span class="sk"></span>
+            <span class="sk"></span>
+            <span class="sk"></span>
+            <span class="sk"></span>
+            <span class="sk"></span>
+          </nav>
+        </aside>
+        <div class="sk-content">
+          <main class="sk-main">
+            <div class="sk-head">
+              <div class="sk-head-title">
+                <span class="sk"></span>
+                <span class="sk sk-sub"></span>
+              </div>
+              <span class="sk sk-filter"></span>
+            </div>
+            <div class="sk-grid">
+              <span class="sk sk-card"></span>
+              <span class="sk sk-card"></span>
+              <span class="sk sk-card"></span>
+              <span class="sk sk-card"></span>
+              <span class="sk sk-card"></span>
+            </div>
+            <span class="sk sk-chart"></span>
+          </main>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

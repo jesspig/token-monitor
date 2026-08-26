@@ -102,6 +102,8 @@ export interface SyncCursorRow {
   line_offset: number
   /** 文件 mtime；文件被 truncate/替换时据此重置游标 */
   file_mtime: number
+  /** 压缩字节偏移游标（v6 起）；NULL=未知（非压缩源或尚未建立） */
+  byte_offset?: number | null
   updated_at: number
 }
 

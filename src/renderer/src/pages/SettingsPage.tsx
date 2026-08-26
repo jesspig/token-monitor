@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
@@ -38,8 +38,11 @@ export default function SettingsPage(): ReactElement {
   const [monthlyBudget, setMonthlyBudget] = useState('')
   const [budgetError, setBudgetError] = useState('')
 
+  // 仅首载回填一次：后续轮询/失效返回的新 data 引用不得覆盖用户正在编辑的输入
+  const hydratedRef = useRef(false)
   useEffect(() => {
-    if (!data) return
+    if (!data || hydratedRef.current) return
+    hydratedRef.current = true
     setSyncMin(String(data.syncIntervalMs / 60_000))
     setStatsRefreshSec(String((data.statsRefreshIntervalMs ?? 30_000) / 1000))
     setRetentionDays(String(data.retentionDays))

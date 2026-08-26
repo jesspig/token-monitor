@@ -19,6 +19,12 @@ import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../s
 /** db 源标识：parseFile 按 path 末尾分派；db 行 source.filePath 恒为该常量（去重键稳定） */
 export const DB_SOURCE_SUFFIX = 'opencode.db'
 
+/**
+ * 外部库只读连接的 busy 超时(ms)：better-sqlite3 撞锁时在主线程同步忙等，
+ * 默认 5000ms 会冻结整个应用，故压到 250ms——撞锁即放弃本轮，由下轮同步重试。
+ */
+export const EXTERNAL_DB_BUSY_TIMEOUT_MS = 250
+
 /** 数据根：$OPENCODE_HOME 覆盖，默认 ~/.local/share/opencode（调用时读取，便于测试注入） */
 export function dataRoot(): string {
   const home = process.env.OPENCODE_HOME
@@ -210,13 +216,13 @@ function toUsageRecordFromData(
  * 增量游标：fromLine 语义为「上次已同步的最大 time_created(ms) 水位」——
  * 只处理 time_created > fromLine 的行，nextLine 返回本次最大 time_created（无新增则原样返回）。
  * source.line 采用 time_created（与水位同源）并保证单调递增，跨轮去重唯一。
- * db 打开失败 / message 表不存在 → 空结果；连接在 finally 关闭。
+ * db 打开失败 / message 表不存在 / 撞锁超时（EXTERNAL_DB_BUSY_TIMEOUT_MS）→ 空结果；连接在 finally 关闭。
  */
 export function parseDbFile(dbPath: string, fromLine: number): ParsedResult {
   const base = typeof fromLine === 'number' && Number.isFinite(fromLine) && fromLine > 0 ? fromLine : 0
   let db: Database.Database | null = null
   try {
-    db = new Database(dbPath, { readonly: true })
+    db = new Database(dbPath, { readonly: true, timeout: EXTERNAL_DB_BUSY_TIMEOUT_MS })
     const rows = db
       .prepare(
         `SELECT m.id, m.session_id, m.time_created, m.data, s.directory AS project_dir

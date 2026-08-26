@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { ReactElement, ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import clsx from 'clsx'
@@ -9,6 +9,7 @@ import { api } from '../api'
 import { EmptyState } from '../components/EmptyState'
 import { PageHeader } from '../components/PageHeader'
 import { RangeSelector } from '../components/RangeSelector'
+import { useDebouncedValue } from '../hooks/useDebouncedValue'
 import { useRequestLogs } from '../hooks/useRequestLogs'
 import {
   APP_META,
@@ -33,6 +34,11 @@ const INPUT_SEMANTICS_LABEL: Record<number, string> = {
 const TH = 'px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-neutral-500'
 const TD = 'px-3 py-2 text-sm text-neutral-300'
 
+const MODEL_FILTER_RENDER_LIMIT = 200
+
+/** 关键字搜索防抖：keyword 翻译成 4 列前置通配 LIKE（无索引全表扫描），逐键即时查询会打满主进程 */
+const KEYWORD_DEBOUNCE_MS = 300
+
 /** 请求日志页：筛选栏 + 分页表格 + 行详情抽屉 */
 export default function RequestLogsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('30d')
@@ -44,6 +50,12 @@ export default function RequestLogsPage(): ReactElement {
   const [keyword, setKeyword] = useState('')
   const [page, setPage] = useState(1)
   const [expandedId, setExpandedId] = useState<string | null>(null)
+
+  // 查询用关键字防抖发布；发布后回到第 1 页（挂载时 setPage(1) 对相同值 bail out）
+  const debouncedKeyword = useDebouncedValue(keyword, KEYWORD_DEBOUNCE_MS)
+  useEffect(() => {
+    setPage(1)
+  }, [debouncedKeyword])
 
   // 筛选候选随数据同步缓慢变化，长 staleTime 避免每次进入页面都重复查询
   const { data: filterOptions } = useQuery({
@@ -63,12 +75,12 @@ export default function RequestLogsPage(): ReactElement {
       appTypes: appTypes.length > 0 ? appTypes : undefined,
       models: models.length > 0 ? models : undefined,
       status: status === 'all' ? undefined : status,
-      keyword: keyword.trim() ? keyword.trim() : undefined,
+      keyword: debouncedKeyword.trim() ? debouncedKeyword.trim() : undefined,
       project: knownProject,
       page,
       pageSize: 15
     }),
-    [range, customRange, appTypes, models, status, keyword, knownProject, page]
+    [range, customRange, appTypes, models, status, debouncedKeyword, knownProject, page]
   )
 
   const { data, isLoading } = useRequestLogs(filters)
@@ -167,10 +179,7 @@ export default function RequestLogsPage(): ReactElement {
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-neutral-600" />
           <input
             value={keyword}
-            onChange={(e) => {
-              setKeyword(e.target.value)
-              setPage(1)
-            }}
+            onChange={(e) => setKeyword(e.target.value)}
             placeholder="搜索模型 / 会话 / 项目…"
             className="w-56 rounded-lg border border-neutral-800 bg-neutral-900 py-1.5 pl-8 pr-3 text-xs text-neutral-200 placeholder:text-neutral-600 focus:border-neutral-600 focus:outline-none"
           />
@@ -316,13 +325,21 @@ function ModelFilter({
   onClear: () => void
 }): ReactElement {
   const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const keyword = query.trim().toLowerCase()
+  const filtered = keyword === '' ? options : options.filter((m) => m.toLowerCase().includes(keyword))
+  const visible = filtered.slice(0, MODEL_FILTER_RENDER_LIMIT)
+  const hiddenCount = filtered.length - visible.length
 
   return (
     <div className="relative">
       <button
         type="button"
         aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          setOpen((v) => !v)
+          setQuery('')
+        }}
         className={clsx(
           'inline-flex items-center gap-1 rounded-lg border px-3 py-1.5 text-xs transition-colors',
           selected.length > 0
@@ -351,29 +368,46 @@ function ModelFilter({
                 清空
               </button>
             </header>
+            <div className="border-b border-neutral-800 p-2">
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="输入过滤模型…"
+                className="w-full rounded-md border border-neutral-800 bg-neutral-900 px-2 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 focus:border-neutral-600 focus:outline-none"
+              />
+            </div>
             <div className="max-h-64 overflow-y-auto p-1">
               {options.length === 0 ? (
                 <p className="px-2 py-3 text-xs text-neutral-600">暂无模型数据</p>
+              ) : filtered.length === 0 ? (
+                <p className="px-2 py-3 text-xs text-neutral-600">无匹配模型</p>
               ) : (
-                options.map((m) => {
-                  const active = selected.includes(m)
-                  return (
-                    <label
-                      key={m}
-                      className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-xs text-neutral-300 hover:bg-neutral-800/60"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={active}
-                        onChange={() => onToggle(m)}
-                        className="h-3 w-3 accent-emerald-500"
-                      />
-                      <span className="truncate font-mono" title={m}>
-                        {m}
-                      </span>
-                    </label>
-                  )
-                })
+                <>
+                  {visible.map((m) => {
+                    const active = selected.includes(m)
+                    return (
+                      <label
+                        key={m}
+                        className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-xs text-neutral-300 hover:bg-neutral-800/60"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={active}
+                          onChange={() => onToggle(m)}
+                          className="h-3 w-3 accent-emerald-500"
+                        />
+                        <span className="truncate font-mono" title={m}>
+                          {m}
+                        </span>
+                      </label>
+                    )
+                  })}
+                  {hiddenCount > 0 && (
+                    <p className="px-2 py-2 text-[11px] text-neutral-500">
+                      其余 {hiddenCount} 项，请输入过滤
+                    </p>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -556,7 +590,7 @@ function DetailRow({ label, children }: { label: string; children: ReactNode }):
 type PageItem = number | 'left-gap' | 'right-gap'
 
 /** 分页页码窗口：围绕当前页最多 7 个，两端截断处用省略号 */
-function pageList(current: number, total: number): PageItem[] {
+export function pageList(current: number, total: number): PageItem[] {
   if (total <= 7) {
     return Array.from({ length: total }, (_, i) => i + 1)
   }

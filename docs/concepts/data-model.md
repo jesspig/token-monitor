@@ -4,13 +4,13 @@ title: 数据模型
 description: SQLite 五张核心表：明细、日聚合、定价、同步游标、去重账本。
 tags: [data-model, sqlite, schema, usage]
 resource: src/main/services/db.ts
-timestamp: 2026-08-25T04:54:00+08:00
+timestamp: 2026-08-26T03:21:00+08:00
 ---
 
 # 数据模型
 
 > [!note] 当前状态
-> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5）。五张表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
+> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5；2026-08-26 升级至 v6/v7）。五张表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；v6 为 `sync_cursors` 增可空列 `byte_offset` 字节游标；v7 为 `usage_records` 新增两个部分索引服务回填/重算候选扫描；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
 
 ## 表清单
 
@@ -19,10 +19,10 @@ timestamp: 2026-08-25T04:54:00+08:00
 | `usage_records` | 用量明细 | `id`（去重 key = `data_source:file_path:line`） |
 | `usage_daily_rollups` | 日聚合镜像（`recordUsage` 实时维护，聚合查询优先读它，见下方「查询语义」） | `(date, app_type, model)` |
 | `model_pricing` | 定价（含 `source` 来源分级：`seed`/`sync`/`user`） | `model_id` |
-| `sync_cursors` | 增量同步游标 | `file_path` |
+| `sync_cursors` | 增量同步游标（v6 起含可空 `byte_offset` 压缩字节游标，dsh zstd 用） | `file_path` |
 | `dedup_ledger` | 去重账本（**已接入写入路径**，2026-08-23；fork/rewrite 语义去重生效） | `(data_source, request_id)` |
 
-索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`。
+索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`；v7 起明细另有两个部分索引（见下方「v7 部分索引迁移」）。
 
 ## 日聚合查询语义
 
@@ -44,6 +44,21 @@ timestamp: 2026-08-25T04:54:00+08:00
 - 成因：dsh 初版适配器模型两级来源在真实数据上全部失效（`data.message.model` 全量缺失、request/header 兜底未命中），解析零产出但采集器照常把游标推进到文件末尾；后续三级来源修复又被 mtime 短路（游标与 mtime 一致即跳过）挡住，历史文件永不重析——清游标是绕过短路的自愈入口（见 [同步与去重](sync-mechanism.md)）。
 - 重放安全性：迁移执行时 `usage_records` 无任何 dsh 行、`dedup_ledger` 为空；重析后 `INSERT OR IGNORE` 主键幂等 + requestId 语义去重收敛，无重复计数风险。实测两轮启动完成全量重析：120/120 个 dsh 会话文件游标回写，6084 条 dsh 记录入库（与上游 assistant/message 总数精确吻合），dedup_ledger 同步 6084 条。
 
+## v6 字节游标列迁移（已实现，幂等）
+
+- `ALTER TABLE sync_cursors ADD COLUMN byte_offset INTEGER`（可空）：为 dsh `.jsonl.zstd` 工件记录「已安全消费到的压缩字节偏移」，续读只解压新增帧（见 [监控插件](monitor-plugins.md)）。
+- 可空语义：NULL = 未知（存量行与非法/脏偏移一律），消费方回退整块解压自愈，靠主键幂等去重兜底不丢数据。
+- schema 级幂等：ALTER 前以 `pragma table_info(sync_cursors)` 做列存在性守卫，列已存在即跳过——ALTER 重放会报 duplicate column，与 v3/v4/v5 的数据级幂等一致，保证 `user_version` 回拨重放历史迁移安全。
+- DAO 配套（storage.ts）：`getCursorMeta` 返回 `byteOffset`；`setCursor(filePath, line, fileMtime?, byteOffset?)` 缺省保留现值、显式传入（含 null）覆盖、truncate 重置时行号与 byte_offset 双清（单语句 upsert，@keep_byte_offset / @reset_cursor 控制位）；truncate 判定收紧——既有 `file_mtime = 0`（占位）不参与变化判定。
+
+## v7 部分索引迁移（已实现，幂等）
+
+- 创建两个部分索引，WHERE 子句与各自候选查询条件完全一致，使候选枚举走 index scan：
+  - `idx_usage_records_zero_cost ON usage_records (cost_usd) WHERE cost_usd IS NULL OR cost_usd = '0'`——零成本回填的候选行；
+  - `idx_usage_records_cached_input ON usage_records (input_semantics) WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok')`——存量缓存口径重算的候选行。
+- 动机（2026-08-26 防阻塞第二轮）：两个候选查询此前无任何可用索引，每次执行都是 `usage_records` 全表过滤扫描，且为周期任务、成本随明细量线性上涨；部分索引把稳态扫描成本降为 O(候选数)——稳态下候选集仅为「永久缺价/全免费定价」的滞留行，体量极小。
+- 幂等：`CREATE INDEX IF NOT EXISTS` 保证 user_version 回拨重放安全。配合分批执行消除长事务，见 [定价与费用](pricing.md)。
+
 ## 明细表要点
 
 - `app_type` 直接区分监控对象（插件 id）：`claude / codex / opencode / gemini / grok`（第一阶段，无 provider 维度）。
@@ -63,7 +78,7 @@ timestamp: 2026-08-25T04:54:00+08:00
 ## 保留策略（已接线）
 
 - 默认 **90 天**（`retentionDays=90`，可在设置中修改），清理只删 `usage_records` 明细，**rollups 永不清理**；`retentionDays <= 0` 视为不清理。
-- 清理调度已由宿主 `host.ts` 接线：启动延迟 30s 执行一次，并经 scheduler 以 `syncIntervalMs` 同间隔周期执行；设置变更联动重启调度，dispose 可逆。
+- 清理调度已由宿主 `host.ts` 接线：启动延迟 45s 执行一次（`RETENTION_SWEEP_DELAY_MS`，2026-08-26 由 30s 上调以错开 30s 处触发的存量费用重算），并经 scheduler 以 `syncIntervalMs` 同间隔周期执行——`SchedulerService.schedule` 第三参 `initialDelayMs` 错相半个周期点火（首触到点立即执行一次再进周期）；设置变更联动重启调度，dispose 可逆。
 - 到期明细删除后，历史趋势因 rollups 镜像完整保留，聚合查询不受清理影响。
 
 ## 与监控插件的扩展关系

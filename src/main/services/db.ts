@@ -256,6 +256,37 @@ const MIGRATIONS: Migration[] = [
       // LIKE 模式按 Windows 路径分隔符精确匹配 ~/.dsh/sessions 子树。
       db.prepare('DELETE FROM sync_cursors WHERE file_path LIKE ?').run('%\\.dsh\\sessions%')
     }
+  },
+  {
+    version: 6,
+    up(db) {
+      // dsh zstd 尾部增量解压的字节游标：记录上次已安全消费到的压缩字节偏移，
+      // 续读时从该偏移起仅解压新增帧；可空（NULL=未知），存量行与非法/脏偏移
+      // 一律回退整块解压，靠主键幂等去重兜底，不丢数据。
+      // 列已存在即跳过（schema 级幂等）：ALTER 重放会报 duplicate column，
+      // 与 v3/v4/v5 的数据级幂等一致，保证 user_version 回拨重放历史迁移安全。
+      const columns = db.pragma('table_info(sync_cursors)') as { name: string }[]
+      if (columns.some((c) => c.name === 'byte_offset')) return
+      db.exec('ALTER TABLE sync_cursors ADD COLUMN byte_offset INTEGER')
+    }
+  },
+  {
+    version: 7,
+    up(db) {
+      // 防阻塞优化：零成本回填与缓存口径存量重算的候选查询此前无任何可用索引，
+      // 每次执行都是 usage_records 全表过滤扫描（周期任务，成本随明细量线性上涨）。
+      // 部分索引的 WHERE 与各自查询条件完全一致，使候选枚举走 index scan，
+      // 成本降为 O(候选数)——稳态下候选集仅为「永久缺价/全免费定价」的滞留行，
+      // 体量极小；CREATE INDEX IF NOT EXISTS 保证 user_version 回拨重放安全。
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_usage_records_zero_cost
+          ON usage_records (cost_usd)
+          WHERE cost_usd IS NULL OR cost_usd = '0';
+        CREATE INDEX IF NOT EXISTS idx_usage_records_cached_input
+          ON usage_records (input_semantics)
+          WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok');
+      `)
+    }
   }
 ]
 

@@ -2,6 +2,11 @@
 
 > 仅保留最近 7 天。详细按小时记录见 [changelog/](changelog/)。
 
+## 2026-08-26
+
+- **「每步操作未响应」根治第二轮**：外部 SQLite 只读连接 busy 短超时（opencode/zcode `EXTERNAL_DB_BUSY_TIMEOUT_MS=250`，撞锁弃轮下轮重试，替代默认 5000ms 主线程冻结）；零成本回填/存量重算分批执行（rowid 游标 500 行/批、事务外计算单事务提交、批间 setImmediate 让出）并命中 v7 部分索引（idx_usage_records_zero_cost / idx_usage_records_cached_input，稳态扫描 O(全表) → O(候选数)）；dsh 解压下沉 worker_threads 单例（10s 超时销毁重建 + 异常环境恒主线程回退，构建产物 out/main/zstd-worker.js）+ 坏帧切割尝试上限 MAX_CUT_ATTEMPTS=8；collector.getPluginStatus 5s TTL 缓存（plugins:set-enabled 后主动失效）；pi/dsh detect 存在性短路递归；grok 映射 summary.json path:mtime 签名缓存；调度 schedule 支持 initialDelayMs 错相首触（retention sweep 半周期点火、启动延迟 30s→45s 错开 30s 处的存量费用重算）；渲染端移除全局 refetchInterval、仅用量类查询 8 处显式轮询（「统计自动刷新间隔」收窄为仅控制用量图表），usage-updated 失效 1000ms 节流 → 1500ms 防抖，日志搜索 300ms 防抖 + keepPreviousData 不闪空，设置页仅首载回填。typecheck 双段通过 / 29 文件 394 用例 / build 通过。
+- **第六轮迭代（秒开秒切与低端机流畅度优化）**：主进程启动拆两阶段——`bootstrapHost` 快速段（建库/迁移/seed 定价/settings/ctx）后即 createWindow（backgroundColor 消白闪 + showErrorBox 兜底），8 插件 `Promise.all` 并行装载与错峰定时器注册移入异步 `startServices()`，`Host.ready` + IPC handler 统一门控，首轮采集窗口 show 且就绪后延迟 1500ms 触发；渲染端内联骨架屏、七页 React.lazy + manualChunks 分包（首屏 entry JS 1574.8KB → 20.66KB）、mock 生产剔除、TrendChart memo、失效冷却节流 1000ms、gcTime 30 分钟、定价表分页 50/页、模型筛选渲染上限 200；主进程吞吐——usageQuery 语句预编译缓存、dsh zstd 尾部帧级增量解压（scanZstdFrames + v6 字节游标 sync_cursors.byte_offset，truncate 判定收紧 mtime=0 占位不参与）、定价索引排序数组 + 二分（O(n·L) → O(L·log n)）、批量计费 calcCostBatch。typecheck 双段通过 / 28 文件 387 用例 / build 全部通过（经 Electron 内置 Node 运行）。
+
 ## 2026-08-25
 
 - **dsh 脏游标死锁修复收尾（数据库 v5 迁移）**：初版 dsh 两级模型来源在真实数据上全部失效（`data.message.model` 全量缺失、request/header 兜底未命中），零记录产出但游标推满；commit 3203648 三级来源修复又被 a4bfa4c 的 mtime 短路挡住、历史文件永不重析——v5 迁移执行 `DELETE FROM sync_cursors WHERE file_path LIKE '%\.dsh\sessions%'` 清除脏游标触发全量重析自愈，重放安全由主键幂等 + dedup_ledger 收敛保证。实测两轮启动 120/120 文件游标回写、6084 条 dsh 记录入库（与上游 assistant/message 总数精确吻合）、dedup_ledger 同步 6084 条、deepseek-v4-flash 定价全命中带费用；claude/codex/opencode/zcode 数据完好。typecheck / 27 文件 363 用例全部通过（经 Electron 内置 Node 运行）。
@@ -31,8 +36,3 @@
 ## 2026-08-20
 
 - **第一阶段开发完成**：插件化监控宿主 + 5 个内置监控插件（claude/codex/opencode/gemini/grok）端到端实现；typecheck / 156 项单测 / 构建 / electron-builder 打包全部通过。概念页状态更新为「已实现」，AGENTS.md 同步。
-
-## 2026-08-19
-
-- 建立项目知识库，确立**插件化监控架构**（一切皆插件）为设计方向；概念页定稿 10 页（总览/架构/插件体系/监控插件/数据流/数据模型/同步去重/定价/UI/里程碑），并建立 index、changelog 维护结构。
-- **T13 渲染层基座**：落地 7 个页面 + 共享组件 + TanStack Query hooks + `api.ts`（RendererApi 门面，Mock 自动回退），`ui-pages.md` 状态更新为已实现。

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+﻿import { describe, it, expect } from 'vitest'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -47,7 +47,7 @@ describe('数据库迁移', () => {
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(5)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
@@ -301,7 +301,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     expect(db.pragma('user_version', { simple: true })).toBe(2)
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(5)
+    expect(db.pragma('user_version', { simple: true })).toBe(7)
 
     const zeroCount = db.prepare(`SELECT COUNT(*) AS c FROM usage_records WHERE ${ZERO_COND}`).get() as { c: number }
     expect(zeroCount.c).toBe(0)
@@ -376,7 +376,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     db.pragma('user_version = 2')
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(5)
+    expect(db.pragma('user_version', { simple: true })).toBe(7)
     expect(snapshot()).toEqual(before)
   })
 })
@@ -458,7 +458,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(5)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       const rows = db
         .prepare('SELECT id, input_semantics FROM usage_records ORDER BY id')
         .all() as { id: string; input_semantics: number }[]
@@ -478,7 +478,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(5)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
     } finally {
       db.close()
     }
@@ -500,7 +500,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       db.pragma('user_version = 3')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(5)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       expect(snapshot()).toEqual(before)
     } finally {
       db.close()
@@ -535,7 +535,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(5)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       const dsh = db
         .prepare('SELECT COUNT(*) AS c FROM sync_cursors WHERE file_path LIKE ?')
         .get('%\\.dsh\\sessions%') as { c: number }
@@ -562,7 +562,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       db.pragma('user_version = 4')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(5)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       expect(snapshot()).toEqual(before)
     } finally {
       db.close()
@@ -756,6 +756,71 @@ describe('sync_cursors 游标', () => {
     await storage.setCursor('/b.jsonl', 3, 500)
     expect(await storage.getCursor('/b.jsonl')).toBe(3)
     expect(await storage.getCursor('/a.jsonl')).toBe(15)
+  })
+})
+
+describe('sync_cursors byte_offset 游标（v6）', () => {
+  it('setCursor/getCursorMeta 往返 byteOffset；缺省参数保留现值', async () => {
+    const { storage } = makeStorage()
+    await storage.setCursor('/a.jsonl.zstd', 10, 1000, 2048)
+    expect(await storage.getCursorMeta('/a.jsonl.zstd')).toEqual({
+      lineOffset: 10,
+      fileMtime: 1000,
+      byteOffset: 2048
+    })
+    await storage.setCursor('/a.jsonl.zstd', 20, 1000)
+    expect((await storage.getCursorMeta('/a.jsonl.zstd'))?.byteOffset).toBe(2048)
+    expect(await storage.getCursorMeta('/missing.jsonl.zstd')).toBeNull()
+  })
+
+  it('显式 null 清空 byteOffset；truncate（mtime 变化）重置行号并清空 byteOffset，他文件不受影响', async () => {
+    const { storage } = makeStorage()
+    await storage.setCursor('/a.jsonl.zstd', 10, 1000, 2048)
+    await storage.setCursor('/a.jsonl.zstd', 15, 1000, null)
+    let meta = await storage.getCursorMeta('/a.jsonl.zstd')
+    expect(meta).toMatchObject({ lineOffset: 15, byteOffset: null })
+
+    await storage.setCursor('/a.jsonl.zstd', 30, 1000, 4096)
+    await storage.setCursor('/b.jsonl.zstd', 5, 500, 128)
+    // 文件被 truncate/替换：mtime 变化 → 行号归零且字节游标一并清空
+    await storage.setCursor('/b.jsonl.zstd', 8, 900, 512)
+    meta = await storage.getCursorMeta('/b.jsonl.zstd')
+    expect(meta).toMatchObject({ lineOffset: 0, byteOffset: null })
+    expect((await storage.getCursorMeta('/a.jsonl.zstd'))?.byteOffset).toBe(4096)
+  })
+
+  it('mtime 占位 0 不参与 truncate 判定（插件先写游标占位、采集器随后推进的场景）', async () => {
+    const { storage } = makeStorage()
+    await storage.setCursor('/a.jsonl.zstd', 3, undefined, 96)
+    expect(await storage.getCursorMeta('/a.jsonl.zstd')).toMatchObject({
+      lineOffset: 3,
+      fileMtime: 0,
+      byteOffset: 96
+    })
+    await storage.setCursor('/a.jsonl.zstd', 4, 1111)
+    expect(await storage.getCursorMeta('/a.jsonl.zstd')).toMatchObject({
+      lineOffset: 4,
+      fileMtime: 1111,
+      byteOffset: 96
+    })
+  })
+
+  it('v5 时代旧行（byte_offset 列 NULL）读到 null 语义；缺省写入保留 NULL，显式写入覆盖', async () => {
+    const { storage, db } = makeStorage()
+    db.prepare(
+      `INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, updated_at)
+       VALUES ('/old.jsonl.zstd', 'dsh', 9, 77, 1)`
+    ).run()
+
+    expect(await storage.getCursorMeta('/old.jsonl.zstd')).toEqual({
+      lineOffset: 9,
+      fileMtime: 77,
+      byteOffset: null
+    })
+    await storage.setCursor('/old.jsonl.zstd', 12)
+    expect((await storage.getCursorMeta('/old.jsonl.zstd'))?.byteOffset).toBeNull()
+    await storage.setCursor('/old.jsonl.zstd', 13, 77, 256)
+    expect((await storage.getCursorMeta('/old.jsonl.zstd'))?.byteOffset).toBe(256)
   })
 })
 

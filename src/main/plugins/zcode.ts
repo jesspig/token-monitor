@@ -31,6 +31,12 @@ export function dbPathOf(root: string): string {
   return path.join(root, 'cli', 'db', 'db.sqlite')
 }
 
+/**
+ * 外部库只读连接的 busy 超时(ms)：better-sqlite3 撞锁时在主线程同步忙等，
+ * 默认 5000ms 会冻结整个应用，故压到 250ms——撞锁即放弃本轮，由下轮同步重试。
+ */
+export const EXTERNAL_DB_BUSY_TIMEOUT_MS = 250
+
 /** stat 文件 mtime（epoch ms；stat 失败按 0 兜底） */
 export function statMtimeMs(p: string): number {
   try {
@@ -144,13 +150,13 @@ function toUsageRecord(row: ModelUsageRow, opts: { filePath: string; line: numbe
  * nextLine 返回本次最大 rowid（无新行则原样返回）。
  * source.line 采用 rowid：TEXT PK 表仍是 rowid 表，rowid 按 INSERT 单调递增且不回退，
  * 以此为去重键跨轮唯一（同轮多请求各占一行）。
- * db 打开失败 / model_usage 表不存在 → 空结果；连接在 finally 关闭。
+ * db 打开失败 / model_usage 表不存在 / 撞锁超时（EXTERNAL_DB_BUSY_TIMEOUT_MS）→ 空结果；连接在 finally 关闭。
  */
 export function parseDbFile(dbPath: string, fromLine: number): ParsedResult {
   const base = typeof fromLine === 'number' && Number.isFinite(fromLine) && fromLine > 0 ? fromLine : 0
   let db: Database.Database | null = null
   try {
-    db = new Database(dbPath, { readonly: true })
+    db = new Database(dbPath, { readonly: true, timeout: EXTERNAL_DB_BUSY_TIMEOUT_MS })
     const rows = db
       .prepare(
         `SELECT m.rowid AS rid, m.*, s.directory AS project_dir

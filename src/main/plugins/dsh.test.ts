@@ -1,12 +1,39 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
 import { dshPlugin, dataRootOf, detectFromRoot, listFilesFromRoot } from './dsh'
 import type { PluginContext } from '../../../shared/context'
 
-/** parseFile 不使用 ctx 上的服务，测试时给个空壳即可 */
-const ctx = {} as PluginContext
+/** 游标元信息桩（getCursorMeta 返回值） */
+type CursorMetaStub = { lineOffset: number; fileMtime: number; byteOffset?: number | null } | null
+
+/** 带 fake storage 的 ctx：捕获 setCursor 写入，getCursorMeta 返回注入的桩值 */
+function makeCtxWithStorage(meta: CursorMetaStub = null): {
+  ctx: PluginContext
+  cursorWrites: { filePath: string; line: number; mtime: number | undefined; byteOffset: number | null | undefined }[]
+} {
+  const cursorWrites: {
+    filePath: string
+    line: number
+    mtime: number | undefined
+    byteOffset: number | null | undefined
+  }[] = []
+  const ctx = {
+    storage: {
+      getCursorMeta: vi.fn(async () => meta),
+      setCursor: vi.fn(
+        async (filePath: string, line: number, mtime?: number, byteOffset?: number | null) => {
+          cursorWrites.push({ filePath, line, mtime, byteOffset })
+        }
+      )
+    }
+  } as unknown as PluginContext
+  return { ctx, cursorWrites }
+}
+
+/** parseFile 对 raw JSONL 与解析失败的 zstd 工件不触碰游标，既有用例共用空壳即可 */
+const ctx = makeCtxWithStorage().ctx
 
 const DSH_TS = 1770000000000
 const SESSION_ID = 'sess-dsh-1'
@@ -526,5 +553,305 @@ describe('parseFile zstd 工件容错', () => {
 
     const res = await dshPlugin.parseFile(ctx, file, 0)
     expect(res).toEqual({ records: [], nextLine: 0, eof: true })
+  })
+})
+
+/**
+ * 手工构造最小合法 zstd 帧（fzstd 0.1.1 仅提供 decompress 无 compress）：
+ * Magic(28 B5 2F FD) + Frame_Header_Description（Single_Segment、无校验/字典）+
+ * Frame_Content_Size + Raw Block 头（last=1 type=00，24-bit LE）+ 明文。
+ * FCS 编码随载荷大小选择：单字节（flag=00，<256）/ 双字节偏移 256（flag=01，<65280）。
+ */
+const ZSTD_FRAME_MAGIC = 0xfd2fb528
+
+function makeZstdFrame(payload: Buffer): Buffer {
+  if (payload.length >= 65_280) throw new Error('测试帧明文超出双字节 FCS 编码上限')
+  const wideFcs = payload.length >= 256
+  const fcsBytes = wideFcs ? 2 : 1
+  const blockHeaderOffset = 5 + fcsBytes
+  const frame = Buffer.alloc(blockHeaderOffset + 3 + payload.length)
+  frame.writeUInt32LE(ZSTD_FRAME_MAGIC, 0)
+  frame[4] = wideFcs ? 0x60 : 0x20
+  if (wideFcs) frame.writeUIntLE(payload.length - 256, 5, 2)
+  else frame[5] = payload.length
+  frame.writeUIntLE((payload.length << 3) | 1, blockHeaderOffset, 3)
+  payload.copy(frame, blockHeaderOffset + 3)
+  return frame
+}
+
+function makeZstdChunks(groups: string[][]): Buffer[] {
+  return groups.map((lines) => makeZstdFrame(Buffer.from(lines.join('\n') + '\n', 'utf8')))
+}
+
+describe('parseFile zstd 帧级增量解压', () => {
+  it('多帧首读：整流逐帧解压全部完整帧，游标写回安全消费的压缩字节偏移', async () => {
+    const file = path.join(tmpDir, 'session-first-read.jsonl.zstd')
+    const [chunkA, chunkB] = makeZstdChunks([
+      [headerLine(), requestHeaderLine({ seq: 1 }), assistantMessageLine({ seq: 2 })],
+      [assistantMessageLine({ seq: 3 })]
+    ])
+    fs.writeFileSync(file, Buffer.concat([chunkA, chunkB]))
+
+    const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage()
+    const res = await dshPlugin.parseFile(ctxWithStorage, file, 0)
+
+    expect(res.records.map((r) => r.source.requestId)).toEqual([`${SESSION_ID}:2`, `${SESSION_ID}:3`])
+    expect(res.records.map((r) => r.source.line)).toEqual([3, 4])
+    expect(res.nextLine).toBe(6)
+    expect(res.eof).toBe(true)
+    expect(cursorWrites).toEqual([
+      { filePath: file, line: 6, mtime: undefined, byteOffset: chunkA.length + chunkB.length }
+    ])
+  })
+
+  it('多帧追加：二次解析仅从游标偏移消费尾部新帧，最终记录集与整块解压一致', async () => {
+    const file = path.join(tmpDir, 'session-append-frames.jsonl.zstd')
+    const [chunkA] = makeZstdChunks([
+      [headerLine(), requestHeaderLine({ seq: 1 }), assistantMessageLine({ seq: 2 })]
+    ])
+    fs.writeFileSync(file, chunkA)
+
+    const first = await dshPlugin.parseFile(ctx, file, 0)
+    expect(first.records.map((r) => r.source.requestId)).toEqual([`${SESSION_ID}:2`])
+    expect(first.nextLine).toBe(5)
+
+    const [chunkB] = makeZstdChunks([[assistantMessageLine({ seq: 3 })]])
+    fs.appendFileSync(file, chunkB)
+
+    const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage({
+      lineOffset: first.nextLine,
+      fileMtime: 12345,
+      byteOffset: chunkA.length
+    })
+    const second = await dshPlugin.parseFile(ctxWithStorage, file, first.nextLine)
+
+    // 仅尾部新帧的记录；sessionId/project/currentModel 由会话头缓存衔接恢复
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      source: { filePath: file, line: 5, requestId: `${SESSION_ID}:3` },
+      model: 'deepseek-v4-flash',
+      sessionId: SESSION_ID,
+      project: CWD,
+      inputSemantics: 2
+    })
+    expect(second.nextLine).toBe(7)
+    expect(cursorWrites).toEqual([
+      { filePath: file, line: 7, mtime: undefined, byteOffset: chunkA.length + chunkB.length }
+    ])
+
+    // 最终记录集 == 整块解压（fromLine=0 全量重析参照）
+    const whole = await dshPlugin.parseFile(ctx, file, 0)
+    expect(whole.records.map((r) => r.source.requestId).sort()).toEqual(
+      [...first.records, ...second.records].map((r) => r.source.requestId).sort()
+    )
+  })
+
+  it('byte_offset 为 NULL 的旧行：回退整块解压按行游标跳过已消费部分并回填偏移', async () => {
+    const file = path.join(tmpDir, 'session-legacy-null-offset.jsonl.zstd')
+    const [chunkA, chunkB] = makeZstdChunks([
+      [headerLine(), requestHeaderLine({ seq: 1 }), assistantMessageLine({ seq: 2 })],
+      [assistantMessageLine({ seq: 3, sourceModel: 'glm-5' })]
+    ])
+    fs.writeFileSync(file, Buffer.concat([chunkA, chunkB]))
+    const totalLength = chunkA.length + chunkB.length
+
+    const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage({
+      lineOffset: 4,
+      fileMtime: 1,
+      byteOffset: null
+    })
+    const res = await dshPlugin.parseFile(ctxWithStorage, file, 4)
+
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].source.line).toBe(4)
+    expect(res.records[0].model).toBe('glm-5')
+    expect(res.nextLine).toBe(6)
+    expect(cursorWrites).toEqual([{ filePath: file, line: 6, mtime: undefined, byteOffset: totalLength }])
+  })
+
+  it('非法偏移（非帧边界）：回退整块解压自愈并回填正确偏移', async () => {
+    const file = path.join(tmpDir, 'session-dirty-offset.jsonl.zstd')
+    const [chunkA, chunkB] = makeZstdChunks([
+      [headerLine(), requestHeaderLine({ seq: 1 }), assistantMessageLine({ seq: 2 })],
+      [assistantMessageLine({ seq: 3, sourceModel: 'glm-5' })]
+    ])
+    fs.writeFileSync(file, Buffer.concat([chunkA, chunkB]))
+
+    for (const dirtyOffset of [2, chunkA.length - 3, chunkA.length + chunkB.length + 999]) {
+      const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage({
+        lineOffset: 4,
+        fileMtime: 1,
+        byteOffset: dirtyOffset
+      })
+      const res = await dshPlugin.parseFile(ctxWithStorage, file, 4)
+      expect(res.records.map((r) => r.source.line)).toEqual([4])
+      expect(cursorWrites[0]?.byteOffset).toBe(chunkA.length + chunkB.length)
+    }
+  })
+
+  it('EOF 半帧容错：byteOffset 只推进到最后完整帧末尾，补全后续读产出剩余记录', async () => {
+    const file = path.join(tmpDir, 'session-half-frame.jsonl.zstd')
+    const [chunkA] = makeZstdChunks([
+      [headerLine(), requestHeaderLine({ seq: 1 }), assistantMessageLine({ seq: 2 })]
+    ])
+    const [fullChunkB] = makeZstdChunks([[assistantMessageLine({ seq: 3, sourceModel: 'glm-5' })]])
+    const truncatedChunkB = fullChunkB.subarray(0, fullChunkB.length - 4)
+    fs.writeFileSync(file, Buffer.concat([chunkA, truncatedChunkB]))
+
+    const first = await dshPlugin.parseFile(ctx, file, 0)
+    expect(first.records.map((r) => r.source.requestId)).toEqual([`${SESSION_ID}:2`])
+    expect(first.nextLine).toBe(5)
+    expect(first.eof).toBe(true)
+
+    // 写入器补完半帧后从上轮偏移续读：半帧文本整体成为新片段首段
+    fs.appendFileSync(file, fullChunkB.subarray(truncatedChunkB.length))
+    const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage({
+      lineOffset: first.nextLine,
+      fileMtime: 6789,
+      byteOffset: chunkA.length
+    })
+    const second = await dshPlugin.parseFile(ctxWithStorage, file, first.nextLine)
+
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0].source.line).toBe(5)
+    expect(second.records[0].source.requestId).toBe(`${SESSION_ID}:3`)
+    expect(second.records[0].model).toBe('glm-5')
+    expect(second.nextLine).toBe(7)
+    expect(cursorWrites[0]?.byteOffset).toBe(chunkA.length + fullChunkB.length)
+
+    const whole = await dshPlugin.parseFile(ctx, file, 0)
+    expect(whole.records).toHaveLength(2)
+    expect(whole.records.map((r) => r.model)).toEqual(['deepseek-v4-flash', 'glm-5'])
+  })
+
+  it('帧明文含伪 magic：多帧整流一次解压不被内容中的 zstd magic 干扰，全部记录产出且 byteOffset 写回文件总长', async () => {
+    const file = path.join(tmpDir, 'session-fake-magic.jsonl.zstd')
+    const fakeMagic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+    const chunkA = makeZstdChunks([
+      [headerLine(), requestHeaderLine({ seq: 1 }), assistantMessageLine({ seq: 2 })]
+    ])[0]
+    const chunkB = makeZstdFrame(
+      Buffer.concat([
+        Buffer.from(`${assistantMessageLine({ seq: 3 })}\n`, 'utf8'),
+        fakeMagic,
+        Buffer.from(`\n${assistantMessageLine({ seq: 4 })}`, 'utf8')
+      ])
+    )
+    fs.writeFileSync(file, Buffer.concat([chunkA, chunkB]))
+
+    const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage()
+    const res = await dshPlugin.parseFile(ctxWithStorage, file, 0)
+
+    expect(res.records.map((r) => r.source.requestId)).toEqual([
+      `${SESSION_ID}:2`,
+      `${SESSION_ID}:3`,
+      `${SESSION_ID}:4`
+    ])
+    // 伪 magic 独占的第 5 行 JSON.parse 失败，按中间损坏行宽松跳过
+    expect(res.records.map((r) => r.source.line)).toEqual([3, 4, 6])
+    expect(res.nextLine).toBe(7)
+    expect(res.eof).toBe(true)
+    expect(cursorWrites).toEqual([
+      { filePath: file, line: 7, mtime: undefined, byteOffset: chunkA.length + chunkB.length }
+    ])
+  })
+
+  it('前一帧明文含伪 magic：追加新帧后从帧边界增量续读，记录与游标推进均不受干扰', async () => {
+    const file = path.join(tmpDir, 'session-fake-magic-append.jsonl.zstd')
+    const fakeMagic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+    const chunkA = makeZstdFrame(
+      Buffer.concat([
+        Buffer.from(
+          [headerLine(), requestHeaderLine({ seq: 1 }), assistantMessageLine({ seq: 2 })].join('\n') +
+            '\n',
+          'utf8'
+        ),
+        fakeMagic,
+        Buffer.from(`\n${assistantMessageLine({ seq: 3 })}`, 'utf8')
+      ])
+    )
+    fs.writeFileSync(file, chunkA)
+
+    const first = await dshPlugin.parseFile(ctx, file, 0)
+    expect(first.records.map((r) => r.source.requestId)).toEqual([`${SESSION_ID}:2`, `${SESSION_ID}:3`])
+    expect(first.records.map((r) => r.source.line)).toEqual([3, 5])
+    expect(first.nextLine).toBe(6)
+    expect(first.eof).toBe(true)
+
+    const [chunkB] = makeZstdChunks([[assistantMessageLine({ seq: 4 })]])
+    fs.appendFileSync(file, chunkB)
+
+    const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage({
+      lineOffset: first.nextLine,
+      fileMtime: 4321,
+      byteOffset: chunkA.length
+    })
+    const second = await dshPlugin.parseFile(ctxWithStorage, file, first.nextLine)
+
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      source: { filePath: file, line: 6, requestId: `${SESSION_ID}:4` },
+      model: 'deepseek-v4-flash',
+      sessionId: SESSION_ID,
+      project: CWD,
+      inputSemantics: 2
+    })
+    expect(second.nextLine).toBe(8)
+    expect(second.eof).toBe(true)
+    expect(cursorWrites).toEqual([
+      { filePath: file, line: 8, mtime: undefined, byteOffset: chunkA.length + chunkB.length }
+    ])
+  })
+
+  it('增量空文本：游标偏移处仅有完整空载荷帧+尾部半帧时，byteOffset 推进而行号保持不虚进', async () => {
+    const file = path.join(tmpDir, 'session-empty-frame.jsonl.zstd')
+    const [chunkA] = makeZstdChunks([
+      [headerLine(), requestHeaderLine({ seq: 1 }), assistantMessageLine({ seq: 2 })]
+    ])
+    const emptyFrame = makeZstdFrame(Buffer.alloc(0))
+    const [fullChunkB] = makeZstdChunks([[assistantMessageLine({ seq: 3, sourceModel: 'glm-5' })]])
+    const truncatedChunkB = fullChunkB.subarray(0, fullChunkB.length - 4)
+    fs.writeFileSync(file, Buffer.concat([chunkA, emptyFrame, truncatedChunkB]))
+
+    const first = await dshPlugin.parseFile(ctx, file, 0)
+    expect(first.records.map((r) => r.source.requestId)).toEqual([`${SESSION_ID}:2`])
+    expect(first.nextLine).toBe(5)
+    expect(first.eof).toBe(true)
+
+    const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage({
+      lineOffset: first.nextLine,
+      fileMtime: 99,
+      byteOffset: chunkA.length
+    })
+    const second = await dshPlugin.parseFile(ctxWithStorage, file, first.nextLine)
+
+    expect(second).toEqual({ records: [], nextLine: 5, eof: true })
+    expect(cursorWrites).toEqual([
+      { filePath: file, line: 5, mtime: undefined, byteOffset: chunkA.length + emptyFrame.length }
+    ])
+  })
+
+  it('中途坏帧（其后仍有 magic）：整块回退仍失败时空结果且不写游标', async () => {
+    const file = path.join(tmpDir, 'session-broken-middle.jsonl.zstd')
+    const garbageFrame = Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x68, 0x10, 0x40, 0x24, 0xde, 0xad])
+    const [chunkB] = makeZstdChunks([[assistantMessageLine({ seq: 3, sourceModel: 'glm-5' })]])
+    fs.writeFileSync(file, Buffer.concat([garbageFrame, chunkB]))
+
+    const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage()
+    const res = await dshPlugin.parseFile(ctxWithStorage, file, 0)
+
+    expect(res).toEqual({ records: [], nextLine: 0, eof: true })
+    expect(cursorWrites).toEqual([])
+  })
+
+  it('裸 JSONL 工件无字节游标概念，解析成功也不写字节偏移', async () => {
+    const file = path.join(tmpDir, 'session-no-byte-cursor.jsonl')
+    writeJsonl(file, [headerLine(), assistantMessageLine({ seq: 2, sourceModel: 'deepseek-v4-flash' })])
+
+    const { ctx: ctxWithStorage, cursorWrites } = makeCtxWithStorage()
+    const res = await dshPlugin.parseFile(ctxWithStorage, file, 0)
+
+    expect(res.records).toHaveLength(1)
+    expect(cursorWrites).toEqual([])
   })
 })
