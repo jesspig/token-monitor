@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+﻿import { describe, it, expect } from 'vitest'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -47,7 +47,7 @@ describe('数据库迁移', () => {
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(6)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
@@ -301,7 +301,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     expect(db.pragma('user_version', { simple: true })).toBe(2)
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(6)
+    expect(db.pragma('user_version', { simple: true })).toBe(7)
 
     const zeroCount = db.prepare(`SELECT COUNT(*) AS c FROM usage_records WHERE ${ZERO_COND}`).get() as { c: number }
     expect(zeroCount.c).toBe(0)
@@ -376,7 +376,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     db.pragma('user_version = 2')
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(6)
+    expect(db.pragma('user_version', { simple: true })).toBe(7)
     expect(snapshot()).toEqual(before)
   })
 })
@@ -458,7 +458,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(6)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       const rows = db
         .prepare('SELECT id, input_semantics FROM usage_records ORDER BY id')
         .all() as { id: string; input_semantics: number }[]
@@ -478,7 +478,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(6)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
     } finally {
       db.close()
     }
@@ -500,7 +500,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       db.pragma('user_version = 3')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(6)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       expect(snapshot()).toEqual(before)
     } finally {
       db.close()
@@ -535,7 +535,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(6)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       const dsh = db
         .prepare('SELECT COUNT(*) AS c FROM sync_cursors WHERE file_path LIKE ?')
         .get('%\\.dsh\\sessions%') as { c: number }
@@ -562,7 +562,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       db.pragma('user_version = 4')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(6)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       expect(snapshot()).toEqual(before)
     } finally {
       db.close()

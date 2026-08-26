@@ -5,31 +5,54 @@ function columnsOf(db: SqliteDatabase, table: string): string[] {
   return (db.pragma(`table_info(${table})`) as { name: string }[]).map((c) => c.name)
 }
 
-describe('v6 迁移：sync_cursors.byte_offset', () => {
-  it('全新库迁移至 v6，sync_cursors 含 byte_offset 列，重复迁移幂等', () => {
+/** v5 存量库的最小表结构：sync_cursors（无 byte_offset 列）+ usage_records（后续索引类迁移依赖） */
+const LEGACY_V5_SCHEMA = `
+  CREATE TABLE sync_cursors (
+    file_path   TEXT    NOT NULL PRIMARY KEY,
+    data_source TEXT    NOT NULL DEFAULT '',
+    line_offset INTEGER NOT NULL DEFAULT 0,
+    file_mtime  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL
+  );
+  CREATE TABLE usage_records (
+    id                    TEXT    NOT NULL PRIMARY KEY,
+    data_source           TEXT    NOT NULL,
+    app_type              TEXT    NOT NULL,
+    model                 TEXT    NOT NULL,
+    input_tokens          INTEGER NOT NULL DEFAULT 0,
+    output_tokens         INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    input_semantics       INTEGER NOT NULL DEFAULT 0,
+    cost_usd              TEXT,
+    file_path             TEXT    NOT NULL,
+    line                  INTEGER NOT NULL,
+    created_at            INTEGER NOT NULL
+  )
+`
+
+describe('schema 迁移', () => {
+  it('全新库迁移至最新版（v7），含部分索引；重复迁移幂等', () => {
     const db = createDatabase(':memory:')
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(6)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       expect(columnsOf(db, 'sync_cursors')).toContain('byte_offset')
+      const indexes = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_usage_records_%'")
+        .all() as { name: string }[]
+      expect(indexes.map((r) => r.name)).toContain('idx_usage_records_zero_cost')
+      expect(indexes.map((r) => r.name)).toContain('idx_usage_records_cached_input')
     } finally {
       db.close()
     }
   })
 
-  it('v5 存量库升级：ALTER 增列后存量行 byte_offset 为 NULL（未知语义）', () => {
+  it('v5 存量库升级：ALTER 增列后存量行 byte_offset 为 NULL（未知语义），并补齐 v7 部分索引', () => {
     const db = createDatabase(':memory:')
     try {
-      db.exec(`
-        CREATE TABLE sync_cursors (
-          file_path   TEXT    NOT NULL PRIMARY KEY,
-          data_source TEXT    NOT NULL DEFAULT '',
-          line_offset INTEGER NOT NULL DEFAULT 0,
-          file_mtime  INTEGER NOT NULL DEFAULT 0,
-          updated_at  INTEGER NOT NULL
-        )
-      `)
+      db.exec(LEGACY_V5_SCHEMA)
       db.prepare(
         `INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, updated_at)
          VALUES ('/legacy/session.jsonl.zstd', 'dsh', 7, 42, 1)`
@@ -38,7 +61,7 @@ describe('v6 迁移：sync_cursors.byte_offset', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(6)
+      expect(db.pragma('user_version', { simple: true })).toBe(7)
       const row = db.prepare('SELECT * FROM sync_cursors').get() as {
         file_path: string
         line_offset: number
@@ -46,6 +69,12 @@ describe('v6 迁移：sync_cursors.byte_offset', () => {
       }
       expect(row).toMatchObject({ file_path: '/legacy/session.jsonl.zstd', line_offset: 7 })
       expect(row.byte_offset).toBeNull()
+      const indexNames = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_records'")
+        .all()
+        .map((r) => (r as { name: string }).name)
+      expect(indexNames).toContain('idx_usage_records_zero_cost')
+      expect(indexNames).toContain('idx_usage_records_cached_input')
     } finally {
       db.close()
     }
