@@ -23,7 +23,6 @@ import {
 } from '../lib/range'
 import { getStatsRefreshInterval } from '../lib/settings-cache'
 
-/** HourlyStats.hour（0–23）→ 'HH:00' 横轴标签，与原 formatHour 视觉一致 */
 function hourLabel(hour: number): string {
   return `${String(hour).padStart(2, '0')}:00`
 }
@@ -42,13 +41,8 @@ const EMPTY_SUMMARY: UsageSummary = {
   successRate: 0
 }
 
-/** 预算横幅状态：danger（已超限）/ warning（占比 ≥ 80%）/ 无（未设置预算或占比低） */
 type BudgetBanner = { level: 'danger' | 'warning'; text: string } | null
 
-/**
- * 预算横幅派生：monthlyExceeded 或 dailyExceeded → danger「费用已超预算:$X / 上限 $Y」；
- * 未超但任一占比 ≥ 80% → warning 显示占比百分比；未设置预算或占比 < 80% → 不渲染。
- */
 function deriveBudgetBanner(b: BudgetStatus | undefined): BudgetBanner {
   if (!b) return null
   const parts: string[] = []
@@ -75,11 +69,9 @@ function deriveBudgetBanner(b: BudgetStatus | undefined): BudgetBanner {
   return null
 }
 
-/** Dashboard：Hero 汇总卡 + 时间范围筛选 + 请求/Token 迷你趋势 */
 export default function DashboardPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('today')
   const [customRange, setCustomRange] = useState<CustomRange | null>(null)
-  // custom 且区间合法时按自定义毫秒区间查询，否则回退既有五档（custom 无区间时 rangeToFilters 内部回退 7 天）
   const filters = useMemo(() => {
     if (range === 'custom' && customRange) {
       return rangeToFilters('custom', customRangeToMs(customRange) ?? {})
@@ -89,15 +81,12 @@ export default function DashboardPage(): ReactElement {
 
   const summaryQuery = useUsageSummary(filters)
   const dailyQuery = useDailyTrends(filters)
-  // 今日 / 24 小时迷你趋势改由后端按小时分桶（不再取明细在前端分桶，避免大流量日截断）；
-  // queryKey 复用 daily-trends 一级前缀，纳入既有 usage-updated 失效清单
   const hourlyQuery = useQuery({
     queryKey: ['daily-trends', 'hourly', filters],
     queryFn: () => api.getHourlyTrends(filters),
     enabled: range === 'today' || range === '24h',
     refetchInterval: getStatsRefreshInterval
   })
-  // 预算限额状态（全局维度）；用量类查询按设置间隔轮询兜底
   const budgetQuery = useQuery({
     queryKey: ['budget-status'],
     queryFn: () => api.getBudgetStatus(),

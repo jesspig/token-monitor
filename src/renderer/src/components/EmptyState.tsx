@@ -6,7 +6,6 @@ export interface EmptyStateProps {
   description?: string
 }
 
-/** 空态 / Mock 等待提示（Mock 模式下展示「等待真实数据」） */
 export function EmptyState({
   title = '等待真实数据',
   description

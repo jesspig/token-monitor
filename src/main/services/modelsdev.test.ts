@@ -6,10 +6,6 @@ import { createDatabase, migrate } from './db'
 import { SqliteStorage } from './storage'
 import { MODELSDEV_FETCH_TIMEOUT_MS, fetchCatalog, parseCatalog, syncPricing } from './modelsdev'
 
-/**
- * 小样本 fixture：模拟 models.dev api.json 顶层 provider 映射。
- * anthropic 含 3 条合法条目；broken 含 4 条非法条目（cost 缺失/空/半缺/input 负值）。
- */
 const FIXTURE = {
   anthropic: {
     id: 'anthropic',
@@ -35,10 +31,8 @@ const FIXTURE = {
   }
 }
 
-/** 合法候选条目的 model_id 清单（供多处断言复用） */
 const EXPECTED_IDS = ['claude-opus-4-1', 'claude-haiku', 'key-only-model']
 
-/** stub global.fetch 返回 fixture JSON（默认 200，可指定状态码） */
 function stubFetch(payload: unknown, status = 200): void {
   vi.stubGlobal(
     'fetch',
@@ -46,14 +40,12 @@ function stubFetch(payload: unknown, status = 200): void {
   )
 }
 
-/** 内存库 + 迁移 + 存储实例，返回可直查的 db 句柄 */
 function makeStorage(): { storage: SqliteStorage; db: SqliteDatabase } {
   const db = createDatabase(':memory:')
   migrate(db)
   return { storage: new SqliteStorage(db), db }
 }
 
-/** 构造一条可复用的 user 预置定价行 */
 function userRow(modelId: string): ModelPricingRow {
   return {
     model_id: modelId,
@@ -68,7 +60,6 @@ function userRow(modelId: string): ModelPricingRow {
   }
 }
 
-/** 包装真实存储：updateModelPricingBatch 整体抛错，其余透传 */
 function withBatchWriteFailure(inner: SqliteStorage): StorageService {
   return {
     recordUsage: (records) => inner.recordUsage(records),
@@ -92,10 +83,8 @@ afterEach(() => {
 
 describe('parseCatalog 展平映射', () => {
   it('完整条目正确映射 provider/id/name 与四档价格，计数自洽', () => {
-    // Arrange & Act
     const result = parseCatalog(FIXTURE)
 
-    // Assert：3 合法 + 4 非法 = total 7
     expect(result.total).toBe(7)
     expect(result.skipped).toBe(4)
     expect(result.entries.map((e) => e.modelId).sort()).toEqual([...EXPECTED_IDS].sort())
@@ -113,10 +102,8 @@ describe('parseCatalog 展平映射', () => {
   })
 
   it('cache 档缺失补 0，entry.id 缺失退回对象 key，name 缺失为 null', () => {
-    // Arrange & Act
     const result = parseCatalog(FIXTURE)
 
-    // Assert
     const haiku = result.entries.find((e) => e.modelId === 'claude-haiku')
     expect(haiku).toMatchObject({
       provider: 'anthropic',
@@ -132,10 +119,8 @@ describe('parseCatalog 展平映射', () => {
   })
 
   it('cost 缺失或 input/output 非法的条目被丢弃且计入 skipped', () => {
-    // Arrange & Act
     const result = parseCatalog(FIXTURE)
 
-    // Assert
     const ids = result.entries.map((e) => e.modelId)
     for (const bad of ['m-no-cost', 'm-empty-cost', 'm-partial-cost', 'm-negative-input']) {
       expect(ids).not.toContain(bad)
@@ -144,15 +129,12 @@ describe('parseCatalog 展平映射', () => {
   })
 
   it('provider key 为空串时回退 name；顶层非对象返回空结果不抛错', () => {
-    // Arrange
     const fallbackPayload = {
       '': { name: 'Fallback Name', models: { m: { id: 'm-1', cost: { input: 1, output: 2 } } } }
     }
 
-    // Act
     const fallback = parseCatalog(fallbackPayload)
 
-    // Assert
     expect(fallback.entries[0]?.provider).toBe('Fallback Name')
 
     for (const bad of [null, undefined, [], 'str', 42]) {
@@ -163,14 +145,11 @@ describe('parseCatalog 展平映射', () => {
 
 describe('fetchCatalog 网络层', () => {
   it('mock global.fetch 返回 fixture 时完成拉取与展平', async () => {
-    // Arrange
     const fetchMock = vi.fn(async () => new Response(JSON.stringify(FIXTURE), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
 
-    // Act
     const result = await fetchCatalog()
 
-    // Assert
     expect(result.entries.map((e) => e.modelId).sort()).toEqual([...EXPECTED_IDS].sort())
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(fetchMock).toHaveBeenCalledWith(
@@ -180,15 +159,12 @@ describe('fetchCatalog 网络层', () => {
   })
 
   it('HTTP 非 2xx 直接抛错', async () => {
-    // Arrange
     stubFetch({ error: 'boom' }, 503)
 
-    // Act & Assert
     await expect(fetchCatalog()).rejects.toThrow('HTTP 503')
   })
 
   it('fetch 拒绝（网络失败/超时中止形态）向上抛出', async () => {
-    // Arrange：以 TimeoutError 形态模拟超时中止；真实计时依赖 AbortSignal.timeout 运行时行为，不在单测内等待
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => {
@@ -196,7 +172,6 @@ describe('fetchCatalog 网络层', () => {
       })
     )
 
-    // Act & Assert
     await expect(fetchCatalog()).rejects.toThrow('The operation was aborted due to timeout')
   })
 
@@ -207,15 +182,12 @@ describe('fetchCatalog 网络层', () => {
 
 describe('syncPricing 经真实 SqliteStorage（:memory:）', () => {
   it('全量导入：source=sync、四档价格入库、计数自洽', async () => {
-    // Arrange
     const { storage, db } = makeStorage()
     try {
       stubFetch(FIXTURE)
 
-      // Act
       const result = await syncPricing(storage)
 
-      // Assert
       expect(result).toEqual({ fetched: 7, imported: 3, skipped: 4 })
       const rows = await storage.getModelPricing()
       expect(rows).toHaveLength(3)
@@ -237,16 +209,13 @@ describe('syncPricing 经真实 SqliteStorage（:memory:）', () => {
   })
 
   it('预置 user 行不被 sync 覆盖（分级保护由存储层静默裁决，不产生 skipped）', async () => {
-    // Arrange
     const { storage, db } = makeStorage()
     try {
       await storage.updateModelPricing(userRow('claude-opus-4-1'), 'user')
       stubFetch(FIXTURE)
 
-      // Act
       const result = await syncPricing(storage)
 
-      // Assert：user 行的 upsert 执行成功故仍计入 imported
       expect(result).toEqual({ fetched: 7, imported: 3, skipped: 4 })
       const rows = await storage.getModelPricing()
       expect(rows.find((r) => r.model_id === 'claude-opus-4-1')).toMatchObject({
@@ -266,13 +235,11 @@ describe('syncPricing 经真实 SqliteStorage（:memory:）', () => {
   })
 
   it('批量写入异常向上抛出且不落库', async () => {
-    // Arrange
     const { storage, db } = makeStorage()
     try {
       const flaky = withBatchWriteFailure(storage)
       stubFetch(FIXTURE)
 
-      // Act & Assert：批量失败 = 全失败，与「网络失败直接抛」同级
       await expect(syncPricing(flaky)).rejects.toThrow('simulated batch write failure')
       expect(await flaky.getModelPricing()).toHaveLength(0)
     } finally {
@@ -281,7 +248,6 @@ describe('syncPricing 经真实 SqliteStorage（:memory:）', () => {
   })
 
   it('fetch 失败直接抛出且不落库', async () => {
-    // Arrange
     const { storage, db } = makeStorage()
     try {
       vi.stubGlobal(
@@ -291,7 +257,6 @@ describe('syncPricing 经真实 SqliteStorage（:memory:）', () => {
         })
       )
 
-      // Act & Assert
       await expect(syncPricing(storage)).rejects.toThrow('fetch failed')
       expect(await storage.getModelPricing()).toHaveLength(0)
     } finally {

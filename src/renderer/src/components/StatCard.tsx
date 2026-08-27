@@ -9,7 +9,6 @@ export interface StatCardProps {
   className?: string
 }
 
-/** 指标卡：次级指标展示 */
 export function StatCard({ label, value, sub, icon, className }: StatCardProps): ReactElement {
   return (
     <div className={clsx('rounded-xl border border-neutral-800 bg-neutral-900/60 p-4', className)}>

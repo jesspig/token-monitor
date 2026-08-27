@@ -5,7 +5,6 @@ function columnsOf(db: SqliteDatabase, table: string): string[] {
   return (db.pragma(`table_info(${table})`) as { name: string }[]).map((c) => c.name)
 }
 
-/** v5 存量库的最小表结构：sync_cursors（无 byte_offset 列）+ usage_records（后续索引类迁移依赖） */
 const LEGACY_V5_SCHEMA = `
   CREATE TABLE sync_cursors (
     file_path   TEXT    NOT NULL PRIMARY KEY,
@@ -68,8 +67,6 @@ describe('schema 迁移', () => {
       migrate(db)
 
       expect(db.pragma('user_version', { simple: true })).toBe(10)
-      // v6 原语义为存量行 byte_offset 为 NULL，但 v9 存量回溯全量 DELETE FROM sync_cursors，
-      // migrate() 到 9 后该行已被清除，故期望为 undefined；索引断言仍需保留
       const row = db.prepare('SELECT * FROM sync_cursors').get() as
         | {
             file_path: string
@@ -84,7 +81,6 @@ describe('schema 迁移', () => {
         .map((r) => (r as { name: string }).name)
       expect(indexNames).toContain('idx_usage_records_zero_cost')
       expect(indexNames).toContain('idx_usage_records_cached_input')
-      // v10 新增：小时桶物化 + 筛选维度索引
       expect(indexNames).toContain('idx_usage_records_status')
       expect(indexNames).toContain('idx_usage_records_project')
       expect(indexNames).toContain('idx_usage_records_session_id')

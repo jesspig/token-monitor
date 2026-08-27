@@ -1,13 +1,5 @@
 import type { RendererApi } from '../../../shared/ipc'
 
-/**
- * 渲染层唯一的数据访问入口（docs/concepts/architecture.md）：
- * 渲染进程只能经 window.api（preload contextBridge 白名单）与主进程通信。
- *
- * 后端（src/main + preload）尚未实现完整 RendererApi 时，
- * 自动回退到内置 Mock 实现（src/renderer/src/mock.ts），保证 dev 阶段可渲染；
- * Mock 数据模块仅在开发模式下按需动态加载，生产构建整体剔除。
- */
 function detectBridge(): RendererApi | null {
   const w = typeof window !== 'undefined' ? window : undefined
   if (!w || !w.api) return null
@@ -18,7 +10,6 @@ function detectBridge(): RendererApi | null {
 
 const bridge = detectBridge()
 
-/** 当前是否处于 Mock 模式（界面可据此提示「等待真实数据」） */
 export const isMock: boolean = bridge === null
 
 let mockPromise: Promise<RendererApi> | null = null
@@ -34,7 +25,6 @@ function loadMock(): Promise<RendererApi> {
   return mockPromise
 }
 
-/** 统一调用的 API 门面（真实 IPC 或 Mock，由运行时自动选择） */
 export const api: RendererApi = bridge ?? {
   ping: () => loadMock().then((m) => m.ping()),
   getUsageSummary: (filters) => loadMock().then((m) => m.getUsageSummary(filters)),

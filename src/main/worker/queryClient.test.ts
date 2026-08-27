@@ -5,7 +5,6 @@ import { SqliteStorage } from '../services/storage'
 import { createUsageQuery } from '../services/usageQuery'
 import { createQueryClient } from './queryClient'
 
-/** 构造一条经 recordUsage 写入的测试用量记录 */
 function makeRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
   return {
     appType: 'claude',
@@ -56,7 +55,6 @@ describe('createQueryClient :memory: 进程内直查分支', () => {
     ])
 
     const dbQ = createUsageQuery(db)
-    // dataDir=':memory:' 强制走进程内直查分支（不构造 Worker）
     const client = createQueryClient(':memory:', db)
 
     expect(client.terminate).toBeTypeOf('function')
@@ -75,7 +73,6 @@ describe('createQueryClient :memory: 进程内直查分支', () => {
     const hourlyFromDb = await dbQ.getHourlyTrends({})
     expect(hourlyFromClient).toEqual(hourlyFromDb)
 
-    // 空操作 terminate 不抛错
     expect(() => client.terminate()).not.toThrow()
   })
 })

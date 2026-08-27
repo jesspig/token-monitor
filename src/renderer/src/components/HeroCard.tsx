@@ -9,7 +9,6 @@ export interface HeroCardProps {
   className?: string
 }
 
-/** Hero 汇总卡：主指标大字号展示（Dashboard 顶部） */
 export function HeroCard({ label, value, hint, icon, className }: HeroCardProps): ReactElement {
   return (
     <div

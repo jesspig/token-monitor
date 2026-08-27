@@ -20,7 +20,6 @@ let query: UsageQueryService | null = null
 function ensureQuery(): UsageQueryService {
   if (query) return query
   const dbPath = join(dataDir, DB_FILENAME)
-  // 只读连接：WAL 下可读已提交快照且不阻塞主线程写者（见 db.ts 启用 WAL）
   const db = new Database(dbPath, { readonly: true, fileMustExist: true })
   query = createUsageQuery(db)
   return query

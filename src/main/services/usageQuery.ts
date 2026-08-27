@@ -14,23 +14,13 @@ import type {
 import type { UsageRecordRow } from '../../../shared/tables'
 import type { SqliteDatabase } from './db'
 
-/**
- * 用量查询服务：只读聚合/明细查询（better-sqlite3，仅主进程，同步 API 内部实现 + Promise 签名）。
- * 聚合类查询优先走 usage_daily_rollups（recordUsage 实时维护的日聚合镜像，明细过期清理后历史趋势不丢）；
- * 筛选含 rollup 不支持的维度（status/httpStatus/project/sessionId/keyword）时回退 usage_records 明细表。
- * 费用统一转整数微美元聚合后格式化，与 storage.ts 的金额处理一致。
- * 渲染进程经 IPC 调用，DTO 契约见 shared/query.ts。
- */
 
-/** 微美元：费用以字符串存储避免浮点误差，聚合时统一转成整数微美元累加 */
 const MICRO_PER_USD = 1_000_000
 
-/** 微美元 → 字符串（去掉尾随 0 与小数点，0 返回 '0'） */
 function fromMicroUsd(micro: number): string {
   return (micro / MICRO_PER_USD).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0'
 }
 
-/** epoch ms → YYYY-MM-DD（本地时区）；与 storage.ts 的 toDateKey 同口径（日聚合按本地日归桶） */
 function toDateKey(ms: number): string {
   const d = new Date(ms)
   const y = d.getFullYear()
@@ -39,17 +29,11 @@ function toDateKey(ms: number): string {
   return `${y}-${m}-${day}`
 }
 
-/** 本地时区今日 00:00（epoch ms）：小时级趋势的默认范围起点 */
 function startOfTodayMs(): number {
   const n = new Date()
   return new Date(n.getFullYear(), n.getMonth(), n.getDate()).getTime()
 }
 
-/**
- * 聚合查询能否下推到 usage_daily_rollups：rollup 只保留 (date, app_type, model) 维度，
- * status / project / sessionId / keyword / httpStatus 任一启用时必须回退明细表。
- * httpStatus/statusCode 为失败明细维度，rollup 无该列，下推会丢筛选条件故一律回退。
- */
 function canUseRollups(filters: LogFilters): boolean {
   const httpStatus = filters.httpStatus ?? filters.statusCode
   return (
@@ -61,16 +45,12 @@ function canUseRollups(filters: LogFilters): boolean {
   )
 }
 
-/** SQL 片段：cost_usd(TEXT) → 整数微美元求和（无匹配行时 SUM 为 NULL，调用处需 COALESCE；两表列名一致可复用） */
 const SUM_COST_MICRO = "SUM(CAST(ROUND(COALESCE(cost_usd, '0') * 1000000) AS INTEGER))"
-/** SQL 片段：success / error 计数（仅明细表有 status 列） */
 const SUM_SUCCESS = "COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0)"
 const SUM_ERROR = "COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0)"
-/** SQL 片段：rollup 表自带 success/error 计数列，直接求和 */
 const SUM_ROLLUP_REQUESTS = 'COALESCE(SUM(request_count), 0)'
 const SUM_ROLLUP_SUCCESS = 'COALESCE(SUM(success_count), 0)'
 const SUM_ROLLUP_ERROR = 'COALESCE(SUM(error_count), 0)'
-/** SQL 片段：各类 token 求和（无匹配行时 SUM 为 NULL，用 COALESCE 归零；两表列名一致可复用） */
 const SUM_TOKENS = {
   input: 'COALESCE(SUM(input_tokens), 0)',
   output: 'COALESCE(SUM(output_tokens), 0)',
@@ -78,7 +58,6 @@ const SUM_TOKENS = {
   cacheCreation: 'COALESCE(SUM(cache_creation_tokens), 0)'
 } as const
 
-/** 聚合查询的公共行列接口 */
 interface SummaryRow {
   total_requests: number
   success_count: number
@@ -123,9 +102,7 @@ interface AppRow extends GroupRow {
 }
 
 interface HourlyRow {
-  /** strftime('%H') 输出的两位字符串（'00'–'23'） */
   hour: string
-  /** strftime('%Y-%m-%d') 输出的本地日期，跨天窗口区分同钟点 */
   day_key: string
   request_count: number
   success_count: number
@@ -137,14 +114,6 @@ interface HourlyRow {
   cost_micro_usd: number
 }
 
-/**
- * 把 LogFilters 翻译成明细表 WHERE 子句与参数（page/pageSize 不参与，由分页方法单独处理）。
- * 失败筛选：status 与 httpStatus/statusCode 联合生效（statusCode 为 httpStatus 别名，优先 httpStatus）；
- * status='error' + httpStatus 有值时可按 4xx/5xx 精确过滤（如 httpStatus=429），范围过滤可在调用层扩展为 BETWEEN。
- * 索引说明：复用已有 idx_usage_records_created_at / idx_usage_records_app_created，时间范围为主过滤维度；
- * status / http_status 选择性低且与时间范围组合查询时走已有索引的范围扫描即可，无需为 http_status 单建索引
- * （失败记录占比低，全表扫描成本与现有聚合查询同级；如后续失败查询成为高频独立维度再评估部分索引）。
- */
 function buildWhere(filters: LogFilters): { sql: string; params: unknown[] } {
   const clauses: string[] = []
   const params: unknown[] = []
@@ -169,7 +138,6 @@ function buildWhere(filters: LogFilters): { sql: string; params: unknown[] } {
     clauses.push('status = ?')
     params.push(filters.status)
   }
-  // httpStatus 与 statusCode 同义，优先 httpStatus；仅失败记录该列非空，成功/中断为 NULL
   const httpStatus = filters.httpStatus ?? filters.statusCode
   if (httpStatus != null) {
     clauses.push('http_status = ?')
@@ -207,12 +175,6 @@ function prepareCached(db: SqliteDatabase, sql: string): Database.Statement {
   return stmt
 }
 
-/**
- * rollup 下推路径的 WHERE：appTypes/models 直接对应列；
- * 时间范围映射为本地日期区间（date >= start 所在日、date <= end 所在日），边界整天计入。
- * 性能：rollup 主键为 (date, app_type, model)，下推查询天然走主键范围扫描，无额外索引；
- *       失败筛选（status/httpStatus）强制回退明细表，不走 rollup，避免下推丢条件。
- */
 function buildRollupWhere(filters: LogFilters): { sql: string; params: unknown[] } {
   const clauses: string[] = []
   const params: unknown[] = []
@@ -237,7 +199,6 @@ function buildRollupWhere(filters: LogFilters): { sql: string; params: unknown[]
   return { sql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '', params }
 }
 
-/** Hero 汇总行：可下推走 rollups，否则回退明细表（行列结构一致） */
 function querySummaryRow(db: SqliteDatabase, filters: LogFilters): SummaryRow {
   if (canUseRollups(filters)) {
     const { sql, params } = buildRollupWhere(filters)
@@ -273,7 +234,6 @@ function querySummaryRow(db: SqliteDatabase, filters: LogFilters): SummaryRow {
     .get(...params) as SummaryRow
 }
 
-/** 按天趋势行：可下推时 rollup 已按本地日归桶，直接对桶求和再按 date 分组 */
 function queryDailyRows(db: SqliteDatabase, filters: LogFilters): DailyRow[] {
   if (canUseRollups(filters)) {
     const { sql, params } = buildRollupWhere(filters)
@@ -315,10 +275,6 @@ function queryDailyRows(db: SqliteDatabase, filters: LogFilters): DailyRow[] {
     .all(...params) as DailyRow[]
 }
 
-/**
- * 按模型统计行：可下推时平均延迟 = Σlatency_ms_total / Σrequest_count（rollup 不存单条耗时，
- * NULL 计 0，与明细 AVG(latency_ms) 忽略 NULL 口径略有差异）；防除零返回 NULL。
- */
 function queryModelRows(db: SqliteDatabase, filters: LogFilters): ModelRow[] {
   if (canUseRollups(filters)) {
     const { sql, params } = buildRollupWhere(filters)
@@ -364,7 +320,6 @@ function queryModelRows(db: SqliteDatabase, filters: LogFilters): ModelRow[] {
     .all(...params) as ModelRow[]
 }
 
-/** 按应用统计行：可下推走 rollups 按 app_type 分组 */
 function queryAppRows(db: SqliteDatabase, filters: LogFilters): AppRow[] {
   if (canUseRollups(filters)) {
     const { sql, params } = buildRollupWhere(filters)
@@ -404,14 +359,12 @@ function queryAppRows(db: SqliteDatabase, filters: LogFilters): AppRow[] {
     .all(...params) as AppRow[]
 }
 
-/** 按小时趋势行：无筛选维度走已物化 usage_hourly_rollups 小表，带 status/project/sessionId/keyword 时回退明细表全扫 */
 function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
   const startTime = filters.startTime ?? startOfTodayMs()
   const endTime = filters.endTime ?? Date.now()
   const startDay = toDateKey(startTime)
   const endDay = toDateKey(endTime)
 
-  // 带 status/project/sessionId/keyword 时 rollup 无这些维度，回退明细表全扫（保留原行为）
   if (!canUseRollups(filters)) {
     const { sql, params } = buildWhere(filters)
     return prepareCached(
@@ -434,7 +387,6 @@ function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
       .all(...params) as HourlyRow[]
   }
 
-  // 无筛选维度：读已物化的小时桶，按 day_key/hour 聚合后做精确时间窗裁剪（与原全扫结果一致）
   const extra: string[] = []
   const params: unknown[] = [startDay, endDay]
   if (filters.appTypes && filters.appTypes.length > 0) {
@@ -464,8 +416,6 @@ function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
      ORDER BY day_key ASC, hour ASC`
   ).all(...params) as HourlyRow[]
 
-  // 重叠裁剪：桶时间窗 [bucketMs, bucketEnd] 与查询窗 [startTime, endTime] 有交集即保留，
-  // 与原 usage_records 全扫（按记录 created_at 在 [start,end] 归桶）语义一致；避免边界小时桶被误删
   return rows.filter((r) => {
     const bucketMs = new Date(`${r.day_key}T${r.hour}:00`).getTime()
     const bucketEnd = bucketMs + 3_600_000 - 1
@@ -473,12 +423,6 @@ function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
   })
 }
 
-/**
- * usage_records 行 → RequestLogDetail（snake_case → camelCase，含失败扩展字段 http_status/error_message）
- * 性能：两列为简单字段直取，无计算/正则；分页查询 `ORDER BY created_at DESC LIMIT/OFFSET`
- *       复用已有 idx_usage_records_created_at（或 idx_usage_records_app_created 当带 appTypes 过滤），
- *       失败筛选回退明细表时亦走同一时间索引前缀，无全表扫描放大。
- */
 function toDetail(row: UsageRecordRow): RequestLogDetail {
   return {
     id: row.id,
@@ -504,30 +448,19 @@ function toDetail(row: UsageRecordRow): RequestLogDetail {
   }
 }
 
-/** 用量查询服务契约（只读） */
 export interface UsageQueryService {
-  /** Hero 汇总：请求数/成功失败/费用/各 token/实际总 token/缓存命中率/成功率 */
   getUsageSummary(filters: LogFilters): Promise<UsageSummary>
-  /** 按天（本地时区 YYYY-MM-DD）趋势序列 */
   getDailyTrends(filters: LogFilters): Promise<DailyStats[]>
-  /** 按小时（本地时区 0–23）趋势序列：默认限定今天，filters 显式给 startTime/endTime 时尊重之；桶含日期维度（dayKey），跨天窗口不合并同钟点 */
   getHourlyTrends(filters: LogFilters): Promise<HourlyStats[]>
-  /** 按归一化模型分组统计 */
   getModelStats(filters: LogFilters): Promise<ModelStats[]>
-  /** 按应用（监控对象 app_type）分组统计 */
   getAppStats(filters: LogFilters): Promise<AppStats[]>
-  /** 分页明细（created_at 倒序），支持 keyword 模糊匹配 */
   getRequestLogs(filters: LogFilters): Promise<PaginatedLogs>
-  /** 单条明细（无则 null） */
   getRequestLogDetail(id: string): Promise<RequestLogDetail | null>
-  /** 筛选候选：模型/项目 distinct 非空值（升序，各截断至 FILTER_OPTIONS_LIMIT） */
   getFilterOptions(): Promise<FilterOptions>
 }
 
-/** 筛选候选各维度返回上限：极端日志量下防止候选列表无限膨胀，拖垮 IPC 序列化与下拉渲染 */
 export const FILTER_OPTIONS_LIMIT = 500
 
-/** usage_records 单列 distinct 非空值升序（column 仅接受白名单字面量，无注入面） */
 function queryDistinctColumn(db: SqliteDatabase, column: 'model' | 'project'): string[] {
   const rows = prepareCached(
     db,
@@ -541,10 +474,6 @@ function queryDistinctColumn(db: SqliteDatabase, column: 'model' | 'project'): s
   return rows.map((r) => r.value)
 }
 
-/**
- * 建工厂：直接接收已打开的数据库实例（:memory: 或文件模式均可，须已迁移建表）。
- * 所有方法只读，不修改任何数据。
- */
 export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
   return {
     getUsageSummary(filters): Promise<UsageSummary> {
@@ -587,7 +516,6 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
     },
 
     getHourlyTrends(filters): Promise<HourlyStats[]> {
-      // 默认限定「今天」（本地时区 00:00 起），只补缺失的一侧；显式给了时间范围则完全尊重调用方
       const effective =
         filters.startTime != null && filters.endTime != null
           ? filters
@@ -651,10 +579,6 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
     },
 
     getRequestLogs(filters): Promise<PaginatedLogs> {
-      // 性能：COUNT(*) 与分页 SELECT 均复用 buildWhere 的时间范围谓词，走
-      // idx_usage_records_created_at / idx_usage_records_app_created 的范围扫描；
-      // ORDER BY created_at DESC 由同一索引的有序性支撑，避免全表排序；
-      // httpStatus/statusCode 等失败筛选仅增加等值谓词，不建新索引（见 buildWhere 索引说明）。
       const { sql, params } = buildWhere(filters)
       const page = Math.max(1, filters.page ?? 1)
       const pageSize = Math.max(1, filters.pageSize ?? 50)

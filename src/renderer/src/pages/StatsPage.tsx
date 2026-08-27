@@ -13,7 +13,6 @@ type TabKey = 'model' | 'app'
 const TH = 'px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-neutral-500'
 const TD = 'px-3 py-2 text-sm text-neutral-300'
 
-/** 统计页：按模型 / 按应用聚合表 */
 export default function StatsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('30d')
   const [tab, setTab] = useState<TabKey>('model')

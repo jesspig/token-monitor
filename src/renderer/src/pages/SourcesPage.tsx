@@ -8,7 +8,6 @@ import { PageHeader } from '../components/PageHeader'
 import { usePlugins } from '../hooks/usePlugins'
 import { APP_META, formatDateTime } from '../lib/format'
 
-/** 监控源页：各 CLI 适配器状态（已检测/未安装/最近同步时间/错误数）+ 启停 */
 export default function SourcesPage(): ReactElement {
   const { data, isLoading } = usePlugins()
   const qc = useQueryClient()

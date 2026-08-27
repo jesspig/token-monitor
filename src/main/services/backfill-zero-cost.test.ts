@@ -5,7 +5,6 @@ import { createDatabase, migrate, type SqliteDatabase } from './db'
 import { SqliteStorage } from './storage'
 import { backfillZeroCost, createPricingService } from './pricing'
 
-/** 构造一条可复用的测试用量记录（默认零成本，source 须逐条唯一以避开去重） */
 function makeRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
   return {
     appType: 'claude',
@@ -22,14 +21,12 @@ function makeRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
   }
 }
 
-/** 内存库 + 迁移 + 存储实例，返回可直查的 db 句柄 */
 function makeDb(): { storage: SqliteStorage; db: SqliteDatabase } {
   const db = createDatabase(':memory:')
   migrate(db)
   return { storage: new SqliteStorage(db), db }
 }
 
-/** 测试定价项（默认 test-model-x：in 3 / out 15 USD 每百万 → 上记 token 合计 0.033 USD） */
 function pricingEntry(overrides: Partial<ModelPricingRow> = {}): ModelPricingRow {
   return {
     model_id: 'test-model-x',
@@ -45,7 +42,6 @@ function pricingEntry(overrides: Partial<ModelPricingRow> = {}): ModelPricingRow
   }
 }
 
-/** epoch ms → YYYY-MM-DD（本地时区，与 storage 归桶规则一致；使断言与运行时区无关） */
 function localDateKey(ms: number): string {
   const d = new Date(ms)
   const m = String(d.getMonth() + 1).padStart(2, '0')
@@ -53,7 +49,6 @@ function localDateKey(ms: number): string {
   return `${d.getFullYear()}-${m}-${day}`
 }
 
-/** 指定 (date, app_type, model) 组内当日明细费用之和（微美元累加后按仓库规则转 USD 字符串），用于不变量断言 */
 function detailSumCost(db: SqliteDatabase, date: string, appType: string, model: string): string {
   const rows = db
     .prepare('SELECT created_at, cost_usd FROM usage_records WHERE app_type = ? AND model = ?')
@@ -82,10 +77,8 @@ describe('backfillZeroCost', () => {
     await storage.updateModelPricing(pricingEntry())
     const svc = createPricingService(storage)
 
-    // Act
     const result = await backfillZeroCost(db, svc)
 
-    // Assert：1000×3 + 2000×15 = 33000 微美元/条 = '0.033'
     expect(result).toEqual({ scanned: 2, updated: 2 })
     const details = db
       .prepare('SELECT cost_usd FROM usage_records ORDER BY line')
@@ -95,7 +88,6 @@ describe('backfillZeroCost', () => {
     const rollups = getRollups(db)
     expect(rollups).toHaveLength(1)
     expect(rollups[0].cost_usd).toBe('0.066')
-    // 不变量：rollup.cost ≡ 组内当日明细之和
     expect(rollups[0].cost_usd).toBe(detailSumCost(db, rollups[0].date, 'claude', 'test-model-x'))
   })
 
@@ -104,7 +96,6 @@ describe('backfillZeroCost', () => {
     const day1 = new Date('2026-08-19T10:00:00').getTime()
     const day2 = new Date('2026-08-20T10:00:00').getTime()
     await storage.recordUsage([
-      // 已有价行不参与回填，验证 rollup 是增量累加而非覆盖
       makeRecord({ costUsd: '0.01', createdAt: day1, source: { filePath: '/tmp/bf.jsonl', line: 1 } }),
       makeRecord({ costUsd: '0', createdAt: day1, source: { filePath: '/tmp/bf.jsonl', line: 2 } }),
       makeRecord({ costUsd: '0', createdAt: day2, source: { filePath: '/tmp/bf.jsonl', line: 3 } })
@@ -112,17 +103,14 @@ describe('backfillZeroCost', () => {
     await storage.updateModelPricing(pricingEntry())
     const svc = createPricingService(storage)
 
-    // Act
     const result = await backfillZeroCost(db, svc)
 
-    // Assert
     expect(result).toEqual({ scanned: 2, updated: 2 })
     const rollups = getRollups(db)
     expect(rollups).toHaveLength(2)
     const byDate = new Map(rollups.map((r) => [r.date, r]))
     const d1 = byDate.get(localDateKey(day1))
     const d2 = byDate.get(localDateKey(day2))
-    // day1：原 0.01 + 回填 0.033；day2：仅回填 0.033
     expect(d1?.cost_usd).toBe('0.043')
     expect(d2?.cost_usd).toBe('0.033')
     for (const r of rollups) {
@@ -135,10 +123,8 @@ describe('backfillZeroCost', () => {
     await storage.recordUsage([makeRecord()])
     const svc = createPricingService(storage)
 
-    // Act
     const result = await backfillZeroCost(db, svc)
 
-    // Assert
     expect(result).toEqual({ scanned: 1, updated: 0 })
     const detail = db.prepare('SELECT cost_usd FROM usage_records').get() as { cost_usd: string | null }
     expect(detail.cost_usd).toBe('0')
@@ -161,10 +147,8 @@ describe('backfillZeroCost', () => {
     )
     const svc = createPricingService(storage)
 
-    // Act
     const result = await backfillZeroCost(db, svc)
 
-    // Assert
     expect(result).toEqual({ scanned: 1, updated: 0 })
     const detail = db.prepare('SELECT cost_usd FROM usage_records').get() as { cost_usd: string | null }
     expect(detail.cost_usd).toBe('0')
@@ -182,10 +166,8 @@ describe('backfillZeroCost', () => {
     const first = await backfillZeroCost(db, svc)
     expect(first).toEqual({ scanned: 2, updated: 2 })
 
-    // Act
     const second = await backfillZeroCost(db, svc)
 
-    // Assert
     expect(second).toEqual({ scanned: 0, updated: 0 })
     expect(getRollups(db)[0].cost_usd).toBe('0.066')
   })
@@ -197,10 +179,8 @@ describe('backfillZeroCost', () => {
     db.prepare('DELETE FROM usage_daily_rollups').run()
     const svc = createPricingService(storage)
 
-    // Act
     const result = await backfillZeroCost(db, svc)
 
-    // Assert
     expect(result).toEqual({ scanned: 1, updated: 1 })
     const detail = db.prepare('SELECT cost_usd FROM usage_records').get() as { cost_usd: string | null }
     expect(detail.cost_usd).toBe('0.033')

@@ -4,16 +4,9 @@ import type { SqliteDatabase } from '../services/db'
 import { createUsageQuery, type UsageQueryService } from '../services/usageQuery'
 
 export interface QueryClientService extends UsageQueryService {
-  /** 退出时终止 worker 线程（主进程直查回退时为空操作） */
   terminate(): void
 }
 
-/**
- * 统计查询客户端：文件库模式下把查询 offload 到只读 worker 线程，主线程不再被 better-sqlite3 阻塞；
- * :memory: 或 worker 启动失败时回退为主进程直查（仍走同一 createUsageQuery，仅失去线程隔离）。
- * workerData 传入 dataDir 供 worker 拼出 DB 文件路径；相同 (method+args) 的并发请求做 in-flight 去重，
- * 收敛 usage-updated 事件触发的批量失效重取风暴。
- */
 export function createQueryClient(dataDir: string, fallbackDb?: SqliteDatabase): QueryClientService {
   if (dataDir === ':memory:' || fallbackDb == null) {
     const inProc = createUsageQuery(fallbackDb as SqliteDatabase)

@@ -19,7 +19,6 @@ function toErrMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
-/** 定价页：模型价格列表（只读，数据由 models.dev 自动同步维护）+ 手动全量同步 */
 export default function PricingPage(): ReactElement {
   const { data, isLoading } = useModelPricing()
   const qc = useQueryClient()

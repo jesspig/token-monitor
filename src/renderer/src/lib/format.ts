@@ -1,6 +1,5 @@
 import type { AppType } from '../../../../shared/app'
 
-/** 应用徽标样式（完整类名，确保 Tailwind JIT 可收集） */
 export const APP_META: Record<AppType, { label: string; badge: string }> = {
   claude: { label: 'Claude', badge: 'bg-orange-500/15 text-orange-300 border-orange-500/30' },
   codex: { label: 'Codex', badge: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' },
@@ -12,10 +11,6 @@ export const APP_META: Record<AppType, { label: string; badge: string }> = {
   dsh: { label: 'DSH', badge: 'bg-teal-500/15 text-teal-300 border-teal-500/30' }
 }
 
-/**
- * 完整数字展示（千分位，不缩写）：用量统计一律显示原始数值，
- * 不折叠为万/亿/k/M，避免阅读者换算；zh 用 zh-CN 千分位、其余用 en-US。
- */
 export function formatNumber(n: number, locale?: string): string {
   const lang = locale ?? (typeof navigator !== 'undefined' ? navigator.language : 'en')
   return n.toLocaleString(lang.startsWith('zh') ? 'zh-CN' : 'en-US')
@@ -25,7 +20,6 @@ export function formatTokens(n: number, locale?: string): string {
   return formatNumber(n, locale)
 }
 
-/** 金额：字符串（避免浮点误差，见 docs/concepts/pricing.md）或数字 → $ 展示 */
 export function formatUsd(cost: string | number | null | undefined): string {
   if (cost == null || cost === '') return '—'
   const num = typeof cost === 'string' ? Number.parseFloat(cost) : cost
@@ -47,7 +41,6 @@ export function formatDateTime(ms: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-/** 小时标签（趋势横轴用）：HH:00 */
 export function formatHour(ms: number): string {
   const d = new Date(ms)
   return `${String(d.getHours()).padStart(2, '0')}:00`

@@ -6,38 +6,19 @@ import type { MonitorPlugin } from '../../../shared/plugin'
 import type { PluginContext } from '../../../shared/context'
 import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../shared/dto'
 
-/**
- * zcode 监控插件（docs/concepts/monitor-plugins.md）。
- * 单数据源：SQLite 库 <数据根>/cli/db/db.sqlite；数据根可用 $ZCODE_STORAGE_DIR 重定位整个根，
- * 默认 ~/.zcode。schema 核实自 CLI db v0.14.8（社区工具 codeburn 实测）：
- *  - model_usage.id 每请求唯一 → 直接作为稳定语义请求 ID（requestId）；
- *  - input_tokens 已包含缓存读写 token（上游未扣减，直接计费约 8 倍高估）
- *    → inputSemantics=1，由 pricing 计费前本地扣减缓存；
- *  - reasoning_tokens 为独立列、不折入 output（codeburn 同口径）→ outputTokens 原样不加；
- *  - started_at / completed_at 均为 epoch 毫秒，createdAt = completed_at ?? started_at。
- * WAL 感知：条目 mtime 取主库与 -wal 较大值，避免 watcher 因主库 mtime 长期不变而漏检
- * （实时性退化为兜底扫描）。
- */
 
-/** 数据根：$ZCODE_STORAGE_DIR 覆盖整个根，默认 ~/.zcode（调用时读取，便于测试注入） */
 export function dataRootOf(): string {
   const dir = process.env.ZCODE_STORAGE_DIR
   if (dir && dir.trim() !== '') return dir.trim()
   return path.join(os.homedir(), '.zcode')
 }
 
-/** db 文件绝对路径：<root>/cli/db/db.sqlite */
 export function dbPathOf(root: string): string {
   return path.join(root, 'cli', 'db', 'db.sqlite')
 }
 
-/**
- * 外部库只读连接的 busy 超时(ms)：better-sqlite3 撞锁时在主线程同步忙等，
- * 默认 5000ms 会冻结整个应用，故压到 250ms——撞锁即放弃本轮，由下轮同步重试。
- */
 export const EXTERNAL_DB_BUSY_TIMEOUT_MS = 250
 
-/** stat 文件 mtime（epoch ms；stat 失败按 0 兜底） */
 export function statMtimeMs(p: string): number {
   try {
     return Math.round(fs.statSync(p).mtimeMs)
@@ -46,22 +27,16 @@ export function statMtimeMs(p: string): number {
   }
 }
 
-/** 多路径 mtime 最大值（WAL 感知用）；全失败 → 0 */
 export function maxMtime(paths: string[]): number {
   return paths.reduce((m, p) => Math.max(m, statMtimeMs(p)), 0)
 }
 
-/**
- * 列出待解析文件（root 可注入，便于测试）：
- * db 存在 → 单条目（WAL 感知 mtime，path 保持真实 db 绝对路径）；不存在 → 空数组。
- */
 export function listFilesFromRoot(root: string): FileEntry[] {
   const dbPath = dbPathOf(root)
   if (!fs.existsSync(dbPath)) return []
   return [{ path: dbPath, mtime: maxMtime([dbPath, dbPath + '-wal']) }]
 }
 
-/** 探测逻辑（root 可注入，便于测试）：数据根存在且 db 存在即可用 */
 export function detectFromRoot(root: string): Detection {
   let rootOk = false
   try {
@@ -86,7 +61,6 @@ export function detectFromRoot(root: string): Detection {
   }
 }
 
-/** model_usage 行（LEFT JOIN session 后的扁平形态；宽松取列均按 unknown 兜底） */
 interface ModelUsageRow {
   rid: number
   id: string | null
@@ -99,52 +73,28 @@ interface ModelUsageRow {
   started_at: number | null
   completed_at: number | null
   project_dir: string | null
-  /** 失败语义新增列（兼容旧库缺列：缺失时为 undefined，宽松视为 success） */
   status?: string | null
   error_type?: string | null
   error_code?: string | number | null
   error_message?: string | null
 }
 
-/** 宽松取数字：缺失/非有限数 → 0 */
 const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 
-/** 错误文案最大长度（与 shared/failure.ts ERROR_MESSAGE_MAX_LENGTH 同值 500，本地常量避免循环依赖） */
 const ERROR_MESSAGE_MAX_LENGTH = 500
 
-/** 截断错误文案至 500 */
 function truncateMessage(text: string): string {
   return text.length > ERROR_MESSAGE_MAX_LENGTH ? text.slice(0, ERROR_MESSAGE_MAX_LENGTH) : text
 }
 
-/**
- * model_usage 行 → UsageRecord。字段映射：
- * model=model_id（trim 非空）/ input=input_tokens / output=output_tokens /
- * cacheRead=cache_read_input_tokens / cacheCreation=cache_creation_input_tokens；
- * inputSemantics=1：上游 input_tokens 已含缓存读写（实测依据见文件头），计费前需扣减；
- * outputTokens 不加 reasoning_tokens（独立列不计入速率，codeburn 同口径）；
- * 全零四桶行照常产出，由 collector 的 isAllZeroUsage 统一拦截。
- * 宽松解析：model_id 缺失/空白 → null（跳过该条，不阻塞整体）。
- *
- * 失败语义（T01 矩阵 zcode 分支，shared/dto.ts / shared/failure.ts）：
- * - 当 status != 'completed' && error_type != null && error_type !== 'cancelled' 时判 error，
- *   否则 success；cancelled 视为用户中断忽略（仍 success，不产 errorMessage/httpStatus）。
- * - 失败时 httpStatus 取 error_code 转数字（仅有限数保留），errorMessage 取 error_message 截断 500；
- *   兼容旧库缺列：行对象缺字段时宽松读取，默认 success。
- * 性能：失败判定为追加的 if 分支（status/error_type 字符串比较），无正则/全表扫描；
- *       SQLite 行已在 `WHERE rowid > ? ORDER BY rowid` 有序扫描中，失败分支仅单行 O(1) 判定，不影响批量速度。
- */
 function toUsageRecord(row: ModelUsageRow, opts: { filePath: string; line: number }): UsageRecord | null {
   const model = typeof row.model_id === 'string' ? row.model_id.trim() : ''
   if (!model) return null
 
-  // createdAt = completed_at ?? started_at（codeburn 口径）；均无效时 Date.now() 兜底
   let createdAt = toNum(row.completed_at)
   if (createdAt <= 0) createdAt = toNum(row.started_at)
   if (createdAt <= 0) createdAt = Date.now()
 
-  // 失败判定：status != 'completed' && error_type != null && error_type !== 'cancelled'
-  // 兼容旧库缺列：缺字段时为 undefined，宽松视为 success
   const statusRaw = (row as unknown as Record<string, unknown>).status
   const statusVal = typeof statusRaw === 'string' ? statusRaw.trim() : (statusRaw as unknown as string | null | undefined)
   const errorTypeRaw = (row as unknown as Record<string, unknown>).error_type
@@ -195,27 +145,16 @@ function toUsageRecord(row: ModelUsageRow, opts: { filePath: string; line: numbe
     source: {
       filePath: opts.filePath,
       line: opts.line,
-      // 稳定语义请求 ID = model_usage.id（每请求唯一）；空串/缺失退回 (file,line) 主键去重
       requestId: row.id && row.id.trim() !== '' ? row.id : undefined
     }
   }
 }
 
-/**
- * 解析 db 源（better-sqlite3 只读）。
- * 增量游标：fromLine 语义为「上次已处理的最大 rowid 水位」——只处理 rowid > fromLine 的行，
- * nextLine 返回本次最大 rowid（无新行则原样返回）。
- * source.line 采用 rowid：TEXT PK 表仍是 rowid 表，rowid 按 INSERT 单调递增且不回退，
- * 以此为去重键跨轮唯一（同轮多请求各占一行）。
- * db 打开失败 / model_usage 表不存在 / 撞锁超时（EXTERNAL_DB_BUSY_TIMEOUT_MS）→ 空结果；连接在 finally 关闭。
- */
 export function parseDbFile(dbPath: string, fromLine: number): ParsedResult {
   const base = typeof fromLine === 'number' && Number.isFinite(fromLine) && fromLine > 0 ? fromLine : 0
   let db: Database.Database | null = null
   try {
     db = new Database(dbPath, { readonly: true, timeout: EXTERNAL_DB_BUSY_TIMEOUT_MS })
-    // 兼容旧库缺列：SELECT m.* 已含所有列（status/error_type/error_code/error_message），
-    // 旧表缺字段时行对象对应属性为 undefined，toUsageRecord 中宽松读取并默认 success
     const rows = db
       .prepare(
         `SELECT m.rowid AS rid, m.*, s.directory AS project_dir
@@ -229,36 +168,30 @@ export function parseDbFile(dbPath: string, fromLine: number): ParsedResult {
     const records: UsageRecord[] = []
     let watermark = base
     for (const row of rows) {
-      // 水位覆盖本次扫描的所有新行（无论是否产出记录），避免反复重扫
       watermark = Math.max(watermark, row.rid)
       const record = toUsageRecord(row, { filePath: dbPath, line: row.rid })
       if (record) records.push(record)
     }
     return { records, nextLine: watermark, eof: true }
   } catch {
-    // db 打开失败 / model_usage 表不存在 / 读取异常：宽松返回空，不阻塞整体同步
     return { records: [], nextLine: base, eof: true }
   } finally {
     if (db) db.close()
   }
 }
 
-/** 探测：数据根 + db */
 async function detect(): Promise<Detection> {
   return detectFromRoot(dataRootOf())
 }
 
-/** 列出待解析文件 */
 async function listFiles(): Promise<FileEntry[]> {
   return listFilesFromRoot(dataRootOf())
 }
 
-/** 增量解析：单数据源直接按 rowid 水位续读（path 即 db 绝对路径，无需分派） */
 async function parseFile(_ctx: PluginContext, filePath: string, fromLine: number): Promise<ParsedResult> {
   return parseDbFile(filePath, fromLine)
 }
 
-/** zcode 监控插件（docs/concepts/monitor-plugins.md） */
 export const zcodePlugin: MonitorPlugin = {
   id: 'zcode',
   name: 'ZCode',

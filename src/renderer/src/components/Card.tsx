@@ -8,7 +8,6 @@ export interface CardProps {
   className?: string
 }
 
-/** 通用面板容器（带可选标题栏） */
 export function Card({ title, action, children, className }: CardProps): ReactElement {
   return (
     <section className={clsx('rounded-xl border border-neutral-800 bg-neutral-900/60', className)}>

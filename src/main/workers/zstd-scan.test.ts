@@ -1,12 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { MAX_CUT_ATTEMPTS, hasZstdMagicAt, scanZstdFrames } from './zstd-scan'
 
-/**
- * 手工构造最小合法 zstd 帧（fzstd 0.1.1 只提供 decompress 无 compress）：
- * Magic(28 B5 2F FD) + Frame_Header_Description（Single_Segment，无校验/无字典）+
- * Frame_Content_Size + Raw Block 头（last=1 type=00，24-bit LE）+ 载荷。
- * FCS 按载荷大小选择：单字节（flag=00，<256）/ 双字节偏移 256（flag=01，<65280）。
- */
 const ZSTD_FRAME_MAGIC = 0xfd2fb528
 
 function makeZstdFrame(payload: Buffer): Buffer {
@@ -40,7 +34,7 @@ describe('scanZstdFrames', () => {
 
   it('EOF 尾部半帧：consumedEnd 收敛到最后完整帧边界，半帧文本不产出', () => {
     const complete = makeZstdFrame(Buffer.from('a\n'))
-    const half = makeZstdFrame(Buffer.from('b\n')).subarray(0, 6) // 截断的半帧
+    const half = makeZstdFrame(Buffer.from('b\n')).subarray(0, 6)
     const buf = Buffer.concat([complete, half])
     const res = scanZstdFrames(buf, 0)
     expect(res.ok).toBe(true)
@@ -51,7 +45,6 @@ describe('scanZstdFrames', () => {
   })
 
   it(`伪 magic 数量超过上限(${MAX_CUT_ATTEMPTS})时放弃：返回 ok:false 防止 O(n) 次 decompress`, () => {
-    // magic 后紧跟非法帧头 → 每个切割点前缀解压必失败；数量超过 MAX_CUT_ATTEMPTS 即终止
     const junk = Buffer.concat(
       Array.from({ length: MAX_CUT_ATTEMPTS + 4 }, () => Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0xff, 0xff]))
     )

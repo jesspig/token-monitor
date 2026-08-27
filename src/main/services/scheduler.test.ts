@@ -79,7 +79,6 @@ describe('SchedulerServiceImpl', () => {
     await vi.advanceTimersByTimeAsync(500)
     expect(calls).toHaveLength(1)
 
-    // 首触后周期仍为 intervalMs：t=1500 第二次
     await vi.advanceTimersByTimeAsync(1000)
     expect(calls).toHaveLength(2)
 

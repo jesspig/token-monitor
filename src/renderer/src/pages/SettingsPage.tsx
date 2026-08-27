@@ -12,10 +12,6 @@ const INPUT_CLS =
   'w-full rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-neutral-600 focus:outline-none'
 const LABEL_CLS = 'mb-1 block text-xs font-medium text-neutral-400'
 
-/**
- * 预算输入解析：空串 → null（不启用）；非法（非数值/负数）返回错误信息；合法返回数值。
- * 0 视为合法值，语义与 null 一致（不启用告警）。
- */
 function parseBudgetInput(raw: string): { value: number | null; error: string | null } {
   const text = raw.trim()
   if (text === '') return { value: null, error: null }
@@ -24,7 +20,6 @@ function parseBudgetInput(raw: string): { value: number | null; error: string | 
   return { value: n, error: null }
 }
 
-/** 设置页：同步间隔 / 数据保留策略 / 数据目录 / 预算上限 */
 export default function SettingsPage(): ReactElement {
   const { data, isLoading } = useSettings()
   const qc = useQueryClient()
@@ -39,7 +34,6 @@ export default function SettingsPage(): ReactElement {
   const [budgetError, setBudgetError] = useState('')
   const [closeToTray, setCloseToTray] = useState(false)
 
-  // 仅首载回填一次：后续轮询/失效返回的新 data 引用不得覆盖用户正在编辑的输入
   const hydratedRef = useRef(false)
   useEffect(() => {
     if (!data || hydratedRef.current) return

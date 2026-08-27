@@ -1,15 +1,7 @@
 import { watch, type FSWatcher } from 'chokidar'
 import type { WatcherService } from '../../../shared/context'
 
-/**
- * 基于 chokidar 的文件监听服务（docs/concepts/sync-mechanism.md「增量」）。
- *
- * 监听目标（文件或目录，忽略初始扫描）的增/改/删事件并触发 onChange；
- * options.debounceMs 用于合并高频变更（窗口内重置定时器，仅最后一次到期后触发）。
- * registerWatcher 返回 disposer，卸载时关闭 watcher 并清理，保证生命周期可逆。
- */
 export class WatcherServiceImpl implements WatcherService {
-  /** 记录活跃 watcher，便于 dispose 时统一清理 */
   private readonly watchers = new Set<FSWatcher>()
 
   registerWatcher(
@@ -23,7 +15,6 @@ export class WatcherServiceImpl implements WatcherService {
 
     const fire = (): void => {
       if (closed) return
-      // onChange 可能同步抛错或返回 rejected promise，均兜底为日志
       void Promise.resolve()
         .then(() => onChange())
         .catch((err) => {
@@ -64,5 +55,4 @@ export class WatcherServiceImpl implements WatcherService {
   }
 }
 
-/** 单例：宿主作为 ctx.watcher 注入插件 */
 export const watcherService: WatcherService = new WatcherServiceImpl()
