@@ -3,6 +3,9 @@ import type { AppType, RequestStatus } from './app'
 /**
  * 日志/统计查询筛选（时间范围 + 应用/模型 + 状态 + 分页）。
  * 与 ui-pages.md 各页面的筛选交互对应。
+ *
+ * 失败语义（T01）：status==='error' 判据见 shared/dto.ts 顶部矩阵与 shared/failure.ts；
+ * cancelled / interrupted 属中断忽略，不计 error；筛选 status='error' 仅返回失败记录。
  */
 export interface LogFilters {
   appTypes?: AppType[]
@@ -11,7 +14,18 @@ export interface LogFilters {
   startTime?: number
   /** 结束时间（epoch ms） */
   endTime?: number
+  /**
+   * 请求状态筛选：'success' | 'error'（中断 cancelled/interrupted 不计 error，忽略不返回）。
+   * 失败判定矩阵见 shared/dto.ts / shared/failure.ts。
+   */
   status?: RequestStatus
+  /**
+   * HTTP 状态码筛选，仅对 status='error' 记录有效；与 httpStatus 同义，传其一即可。
+   * 用于按 4xx/5xx 等失败码过滤。
+   */
+  statusCode?: number
+  /** HTTP 状态码筛选（同 statusCode，优先使用本字段） */
+  httpStatus?: number
   project?: string
   sessionId?: string
   /** 关键字（模糊匹配模型/会话/项目等） */
@@ -98,7 +112,7 @@ export interface AppStats {
   successRate: number
 }
 
-/** 请求日志页：行详情（覆盖时间/模型/各类 token/费用/状态/耗时） */
+/** 请求日志页：行详情（覆盖时间/模型/各类 token/费用/状态/耗时/错误信息） */
 export interface RequestLogDetail {
   id: string
   appType: AppType
@@ -118,6 +132,10 @@ export interface RequestLogDetail {
   project: string | null
   sessionId: string | null
   status: RequestStatus
+  /** HTTP 状态码，仅失败时有效；成功/中断为 null */
+  httpStatus: number | null
+  /** 截断后的错误文案（最长 500 字符，存储层截断）；仅失败时有效 */
+  errorMessage: string | null
   /** 发生时间（epoch ms） */
   createdAt: number
   /** 来源文件 */

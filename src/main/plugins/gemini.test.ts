@@ -51,6 +51,16 @@ const geminiMsg = (
   }
 })
 
+/** error 消息（type==='error'，content 文本，宽松兼容 id / 不同 timestamp 命名） */
+const errorMsg = (
+  o: { timestamp?: string; content?: string; id?: string; text?: string; type?: string } = {}
+): Record<string, unknown> => ({
+  ...(o.id === undefined ? {} : { id: o.id }),
+  type: o.type ?? 'error',
+  timestamp: o.timestamp ?? GEMINI_TS,
+  content: o.content ?? 'upstream error: 429 rate limited'
+})
+
 let tmpDir = ''
 
 beforeEach(() => {
@@ -311,6 +321,15 @@ const jsonlGeminiLine = (
     tokens: o.tokens ?? { input: 100, output: 50, cached: 10 }
   })
 
+/** JSONL error 消息行（type==='error'，content 文本） */
+const jsonlErrorLine = (o: { id?: string; timestamp?: string; content?: string } = {}): string =>
+  JSON.stringify({
+    ...(o.id === undefined ? {} : { id: o.id }),
+    type: 'error',
+    timestamp: o.timestamp ?? GEMINI_TS,
+    content: o.content ?? 'upstream error: 429 rate limited'
+  })
+
 /** 多行拼成 JSONL 文件内容（无尾随换行，行号即数组下标 +1） */
 const writeJsonl = (file: string, lines: string[]): void =>
   fs.writeFileSync(file, lines.join('\n'), 'utf8')
@@ -431,5 +450,267 @@ describe('JSONL 会话格式（新版）', () => {
 
     const res = await geminiPlugin.parseFile(ctx, file, 0)
     expect(res.records.map((r) => r.sessionId)).toEqual(['sess-jsonl', 'sess-jsonl-2'])
+  })
+})
+
+/* ---------- 失败可观测：gemini type==='error' => error（T01 矩阵，双格式） ---------- */
+
+describe('失败可观测：type===error => error 记录（双格式兼容）', () => {
+  it('legacy：孤立 error 行产出 error 记录，model 回退 unknown，tokens 全 0，httpStatus undefined', async () => {
+    const file = path.join(tmpDir, 'session-error-alone.json')
+    fs.writeFileSync(file, buildSession([errorMsg({ content: 'quota exceeded' })]), 'utf8')
+
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    const r = res.records[0]
+    expect(r).toMatchObject({
+      appType: 'gemini',
+      model: 'unknown',
+      rawModel: 'unknown',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      inputSemantics: 1,
+      status: 'error',
+      sessionId: 'sess-g-1'
+    })
+    expect(r.httpStatus).toBeUndefined()
+    expect(r.errorMessage).toBe('quota exceeded')
+    expect(r.createdAt).toBe(Date.parse(GEMINI_TS))
+    expect(r.source).toEqual({ filePath: file, line: 1 })
+    expect(res.nextLine).toBe(1)
+  })
+
+  it('legacy：gemini 后紧跟 error，error 的 model 取前一条 gemini 的 model', async () => {
+    const file = path.join(tmpDir, 'session-error-fallback.json')
+    fs.writeFileSync(
+      file,
+      buildSession([geminiMsg({ model: 'gemini-2.5-pro' }), errorMsg({ content: 'rate limited' })]),
+      'utf8'
+    )
+
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(2)
+    expect(res.records[0]).toMatchObject({ status: 'success', model: 'gemini-2.5-pro' })
+    expect(res.records[1]).toMatchObject({
+      status: 'error',
+      model: 'gemini-2.5-pro',
+      rawModel: 'gemini-2.5-pro',
+      inputTokens: 0,
+      outputTokens: 0,
+      errorMessage: 'rate limited'
+    })
+    expect(res.records[1].httpStatus).toBeUndefined()
+    expect(res.records[1].createdAt).toBe(Date.parse(GEMINI_TS))
+    expect(res.records[1].source.line).toBe(2)
+  })
+
+  it('legacy：error 混合成功/失败与 user 行，游标与模型回退正确', async () => {
+    const file = path.join(tmpDir, 'session-mixed.json')
+    fs.writeFileSync(
+      file,
+      buildSession([
+        userMsg(),
+        errorMsg({ content: 'first error' }),
+        geminiMsg({ model: 'gemini-2.5-flash', tokens: { input: 10, output: 5, cached: 1 } }),
+        errorMsg({ content: 'second error' }),
+        userMsg({ timestamp: LAST_TS }),
+        errorMsg({ content: 'third error', timestamp: LAST_TS })
+      ]),
+      'utf8'
+    )
+
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    // user 跳过，剩余：error(2)->unknown, gemini(3), error(4)->flash, error(6)->flash
+    expect(res.records).toHaveLength(4)
+    expect(res.records[0]).toMatchObject({ status: 'error', model: 'unknown', source: { line: 2 } })
+    expect(res.records[1]).toMatchObject({ status: 'success', model: 'gemini-2.5-flash' })
+    expect(res.records[2]).toMatchObject({ status: 'error', model: 'gemini-2.5-flash', source: { line: 4 } })
+    expect(res.records[3]).toMatchObject({ status: 'error', model: 'gemini-2.5-flash', source: { line: 6 } })
+    expect(res.nextLine).toBe(6)
+  })
+
+  it('legacy：error content 超 500 截断，httpStatus 保持 undefined', async () => {
+    const file = path.join(tmpDir, 'session-truncate.json')
+    const long = 'a'.repeat(600)
+    fs.writeFileSync(file, buildSession([errorMsg({ content: long })]), 'utf8')
+
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].errorMessage!.length).toBe(500)
+    expect(res.records[0].errorMessage).toBe('a'.repeat(500))
+    expect(res.records[0].httpStatus).toBeUndefined()
+    expect(res.records[0].status).toBe('error')
+  })
+
+  it('legacy：error 带 id 时透传 requestId，缺 id 时不设', async () => {
+    const withId = path.join(tmpDir, 'session-error-id.json')
+    fs.writeFileSync(withId, buildSession([errorMsg({ content: 'boom', id: 'err-1' })]), 'utf8')
+    const r1 = await geminiPlugin.parseFile(ctx, withId, 0)
+    expect(r1.records[0].source).toEqual({ filePath: withId, line: 1, requestId: 'err-1' })
+
+    const noId = path.join(tmpDir, 'session-error-noid.json')
+    fs.writeFileSync(noId, buildSession([errorMsg({ content: 'boom' })]), 'utf8')
+    const r2 = await geminiPlugin.parseFile(ctx, noId, 0)
+    expect(r2.records[0].source.requestId).toBeUndefined()
+  })
+
+  it('legacy：游标增量跨批，error 仍能回退到上一批的 gemini 模型', async () => {
+    const file = path.join(tmpDir, 'session-incremental-error.json')
+    fs.writeFileSync(file, buildSession([geminiMsg({ model: 'gemini-2.5-pro' })]), 'utf8')
+    const first = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(first.records).toHaveLength(1)
+    expect(first.nextLine).toBe(1)
+
+    // 追加 error（跨批续读）
+    fs.writeFileSync(
+      file,
+      buildSession([geminiMsg({ model: 'gemini-2.5-pro' }), errorMsg({ content: 'after', timestamp: LAST_TS })]),
+      'utf8'
+    )
+    const second = await geminiPlugin.parseFile(ctx, file, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      status: 'error',
+      model: 'gemini-2.5-pro',
+      errorMessage: 'after'
+    })
+    expect(second.records[0].source.line).toBe(2)
+    expect(second.nextLine).toBe(2)
+  })
+
+  it('legacy：error 与 gemini 成功消息类型区分（tokens 互不干扰）', async () => {
+    const file = path.join(tmpDir, 'session-distinct.json')
+    fs.writeFileSync(file, buildSession([geminiMsg(), errorMsg({ content: 'fail' }), geminiMsg({ id: 'm2' })]), 'utf8')
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(3)
+    expect(res.records[0]).toMatchObject({ status: 'success', inputTokens: 100 })
+    expect(res.records[1]).toMatchObject({ status: 'error', inputTokens: 0, outputTokens: 0 })
+    expect(res.records[2]).toMatchObject({ status: 'success', inputTokens: 100 })
+  })
+
+  it('JSONL：孤立 error 行产出 unknown，tokens 0，sessionId 取 metadata', async () => {
+    const file = path.join(tmpDir, 'session-error-jsonl-alone.jsonl')
+    writeJsonl(file, [META_LINE, jsonlErrorLine({ content: 'quota exceeded' })])
+
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    const r = res.records[0]
+    expect(r).toMatchObject({
+      appType: 'gemini',
+      model: 'unknown',
+      rawModel: 'unknown',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      inputSemantics: 1,
+      status: 'error',
+      sessionId: 'sess-jsonl',
+      errorMessage: 'quota exceeded'
+    })
+    expect(r.httpStatus).toBeUndefined()
+    expect(r.createdAt).toBe(Date.parse(GEMINI_TS))
+    expect(r.source).toEqual({ filePath: file, line: 2 })
+    expect(res.nextLine).toBe(3)
+  })
+
+  it('JSONL：gemini 后紧跟 error，model 回退前一条 gemini 模型', async () => {
+    const file = path.join(tmpDir, 'session-jsonl-fallback.jsonl')
+    writeJsonl(file, [META_LINE, jsonlGeminiLine({ id: 'g1' }), jsonlErrorLine({ content: 'rate limited' })])
+
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(2)
+    expect(res.records[0]).toMatchObject({ status: 'success', model: 'gemini-2.5-pro' })
+    expect(res.records[1]).toMatchObject({
+      status: 'error',
+      model: 'gemini-2.5-pro',
+      errorMessage: 'rate limited'
+    })
+    expect(res.records[1].httpStatus).toBeUndefined()
+  })
+
+  it('JSONL：error content 超 500 截断', async () => {
+    const file = path.join(tmpDir, 'session-jsonl-truncate.jsonl')
+    writeJsonl(file, [META_LINE, jsonlErrorLine({ content: 'b'.repeat(700) })])
+
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(res.records[0].errorMessage!.length).toBe(500)
+    expect(res.records[0].errorMessage).toBe('b'.repeat(500))
+  })
+
+  it('JSONL：游标增量跨批，error 回退到上一批 gemini 模型（全量扫描维护 lastModel）', async () => {
+    const file = path.join(tmpDir, 'session-jsonl-incremental-error.jsonl')
+    writeJsonl(file, [META_LINE, jsonlGeminiLine({ id: 'g1', timestamp: GEMINI_TS })])
+    const first = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(first.records).toHaveLength(1)
+    expect(first.nextLine).toBe(3)
+
+    fs.appendFileSync(file, '\n' + jsonlErrorLine({ content: 'after error', timestamp: LAST_TS }), 'utf8')
+    const second = await geminiPlugin.parseFile(ctx, file, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      status: 'error',
+      model: 'gemini-2.5-pro',
+      errorMessage: 'after error'
+    })
+    expect(second.records[0].source.line).toBe(3)
+    expect(second.records[0].sessionId).toBe('sess-jsonl')
+  })
+
+  it('JSONL：中间损坏行不影响后续 error 产出，尾部半行重试', async () => {
+    const file = path.join(tmpDir, 'session-jsonl-error-corrupt.jsonl')
+    writeJsonl(file, [META_LINE, '{broken', jsonlGeminiLine({ id: 'g1' }), jsonlErrorLine({ id: 'e1' })])
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(res.records.map((r) => r.status)).toEqual(['success', 'error'])
+    expect(res.records[1].source.line).toBe(4)
+  })
+
+  it('JSONL：error 与 success 区分，混合序列正确产出各自记录', async () => {
+    const userLine = JSON.stringify({ type: 'user', timestamp: USER_TS, content: 'hi' })
+    const file = path.join(tmpDir, 'session-jsonl-mixed.jsonl')
+    writeJsonl(file, [
+      META_LINE,
+      userLine,
+      jsonlErrorLine({ content: 'first' }),
+      jsonlGeminiLine({ id: 'g1' }),
+      jsonlErrorLine({ content: 'second' }),
+      userLine,
+      jsonlErrorLine({ content: 'third', timestamp: LAST_TS })
+    ])
+
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    // user(2) 跳过，剩余：error(3)->unknown, gemini(4), error(5)->pro, error(7)->pro
+    expect(res.records).toHaveLength(4)
+    expect(res.records[0]).toMatchObject({ status: 'error', model: 'unknown', source: { line: 3 } })
+    expect(res.records[1]).toMatchObject({ status: 'success', model: 'gemini-2.5-pro' })
+    expect(res.records[2]).toMatchObject({ status: 'error', model: 'gemini-2.5-pro', source: { line: 5 } })
+    expect(res.records[3]).toMatchObject({ status: 'error', model: 'gemini-2.5-pro', source: { line: 7 } })
+  })
+
+  it('JSONL：error 带 id 时 requestId 透传', async () => {
+    const file = path.join(tmpDir, 'session-jsonl-error-id.jsonl')
+    writeJsonl(file, [META_LINE, jsonlErrorLine({ id: 'err-9', content: 'boom' })])
+    const res = await geminiPlugin.parseFile(ctx, file, 0)
+    expect(res.records[0].source).toEqual({ filePath: file, line: 2, requestId: 'err-9' })
+  })
+
+  it('双格式兼容：error 行与 gemini 成功行解析逻辑不互相覆盖（tokens 全 0 vs 有值）', async () => {
+    // legacy
+    const legacy = path.join(tmpDir, 'session-dual-legacy.json')
+    fs.writeFileSync(legacy, buildSession([geminiMsg(), errorMsg({ content: 'legacy-fail' })]), 'utf8')
+    const r1 = await geminiPlugin.parseFile(ctx, legacy, 0)
+    expect(r1.records[0].inputTokens).toBe(100)
+    expect(r1.records[1].inputTokens).toBe(0)
+    expect(r1.records[1].status).toBe('error')
+
+    // jsonl
+    const jsonl = path.join(tmpDir, 'session-dual-jsonl.jsonl')
+    writeJsonl(jsonl, [META_LINE, jsonlGeminiLine(), jsonlErrorLine({ content: 'jsonl-fail' })])
+    const r2 = await geminiPlugin.parseFile(ctx, jsonl, 0)
+    expect(r2.records[0].inputTokens).toBe(100)
+    expect(r2.records[1].inputTokens).toBe(0)
+    expect(r2.records[1].status).toBe('error')
   })
 })

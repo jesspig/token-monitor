@@ -81,6 +81,32 @@ const tokenCountNoLast = (): string =>
     payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10, output_tokens: 5 } } }
   })
 
+/** stream_error 事件行：产出 error 记录；httpStatus 传 null 可省略 codex_error_info */
+const streamErrorLine = (o: {
+  message?: string | null
+  httpStatus?: number | null
+  timestamp?: string | null
+} = {}): string =>
+  JSON.stringify({
+    type: 'event_msg',
+    ...(o.timestamp === null ? {} : { timestamp: o.timestamp ?? '2026-08-19T09:00:03+08:00' }),
+    payload: {
+      type: 'stream_error',
+      ...(o.message === null ? {} : { message: o.message ?? 'stream disconnected' }),
+      ...(o.httpStatus === null || o.httpStatus === undefined
+        ? {}
+        : { codex_error_info: { http_status_code: o.httpStatus } })
+    }
+  })
+
+/** turn_aborted 事件行（interrupted 属用户中断，忽略不计 error） */
+const turnAbortedLine = (o: { reason?: string; timestamp?: string } = {}): string =>
+  JSON.stringify({
+    type: 'event_msg',
+    timestamp: o.timestamp ?? '2026-08-19T09:00:04+08:00',
+    payload: { type: 'turn_aborted', reason: o.reason ?? 'interrupted' }
+  })
+
 let tmpDir = ''
 
 beforeEach(() => {
@@ -378,6 +404,125 @@ describe('parseFile 增量解析', () => {
     expect(res2.records[0]).toMatchObject({ inputTokens: 7, outputTokens: 3, cacheReadTokens: 1 })
     expect(res2.nextLine).toBe(6)
     expect(res2.eof).toBe(true)
+  })
+})
+
+describe('parseFile stream_error 失败可观测（T01 矩阵 codex 分支）', () => {
+  it('stream_error 产出 error 记录：tokens 全 0、status error、httpStatus/errorMessage/createdAt/model 正确', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [sessionMetaLine(), turnContextLine({ model: 'gpt-5' }), streamErrorLine({ message: 'upstream 429', httpStatus: 429 })].join(
+        '\n'
+      ),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    const r = res.records[0]
+    expect(r).toMatchObject({
+      appType: 'codex',
+      model: 'gpt-5',
+      rawModel: 'gpt-5',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      inputSemantics: 1,
+      status: 'error',
+      httpStatus: 429,
+      errorMessage: 'upstream 429',
+      project: '/Users/a/b',
+      sessionId: 'sess-1'
+    })
+    expect(r.createdAt).toBe(Date.parse('2026-08-19T09:00:03+08:00'))
+    expect(r.source).toEqual({ filePath: file, line: 3 })
+  })
+
+  it('stream_error 无 http_status_code 时 httpStatus 省略；无 message 时 errorMessage 省略', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [sessionMetaLine(), turnContextLine(), streamErrorLine({ message: null, httpStatus: null })].join('\n'),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].httpStatus).toBeUndefined()
+    expect(res.records[0].errorMessage).toBeUndefined()
+    expect('httpStatus' in res.records[0]).toBe(false)
+    expect('errorMessage' in res.records[0]).toBe(false)
+  })
+
+  it('stream_error 无当前模型时 model 回落为 unknown（不跳过）', async () => {
+    const file = path.join(tmpDir, 'rollout-noModel.jsonl')
+    // 无 turn_context，仅 session_meta（其 model 不作为当前模型）
+    fs.writeFileSync(file, [sessionMetaLine(), streamErrorLine()].join('\n'), 'utf8')
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].model).toBe('unknown')
+    expect(res.records[0].rawModel).toBe('unknown')
+    expect(res.records[0].status).toBe('error')
+  })
+
+  it('turn_aborted(interrupted) 不判 error：忽略不产出记录', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [sessionMetaLine(), turnContextLine(), turnAbortedLine({ reason: 'interrupted' })].join('\n'),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(0)
+    expect(res.nextLine).toBe(4)
+    expect(res.eof).toBe(true)
+
+    // turn_aborted 即使携带不同大小写 interrupted 仍忽略
+    const file2 = path.join(tmpDir, 'rollout-abc124.jsonl')
+    fs.writeFileSync(file2, [sessionMetaLine(), turnContextLine(), turnAbortedLine({ reason: 'Interrupted' })].join('\n'), 'utf8')
+    const res2 = await codexPlugin.parseFile(ctx, file2, 0)
+    expect(res2.records).toHaveLength(0)
+  })
+
+  it('stream_error 与 token_count 共存：分别产出 success/error，token_count 逻辑不变', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [
+        sessionMetaLine(),
+        turnContextLine({ model: 'gpt-5' }),
+        tokenCountLine(),
+        streamErrorLine({ message: 'rate limited', httpStatus: 500, timestamp: '2026-08-19T09:00:10+08:00' }),
+        tokenCountLine({ timestamp: '2026-08-19T09:00:11+08:00' })
+      ].join('\n'),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(3)
+    expect(res.records[0]).toMatchObject({ status: 'success', source: { line: 3 } })
+    expect(res.records[1]).toMatchObject({
+      status: 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      httpStatus: 500,
+      errorMessage: 'rate limited',
+      source: { line: 4 }
+    })
+    expect(res.records[2]).toMatchObject({ status: 'success', source: { line: 5 } })
+    expect(res.nextLine).toBe(6)
+  })
+
+  it('stream_error createdAt 取 timestamp；非法 timestamp 兜底不为 NaN', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [sessionMetaLine(), turnContextLine(), streamErrorLine({ timestamp: 'not-a-date' })].join('\n'),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(Number.isNaN(res.records[0].createdAt)).toBe(false)
+    expect(Math.abs(res.records[0].createdAt - Date.now())).toBeLessThan(60_000)
   })
 })
 

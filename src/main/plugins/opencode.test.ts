@@ -511,3 +511,151 @@ describe('parseFile 双源分派', () => {
     expect(r2.records[0].source.filePath).toBe(jsonPath)
   })
 })
+
+describe('失败分支（T01 宽松 error 探测）', () => {
+  it('assistant 消息含 error 字段的 JSON 文件产出 error 记录，tokens 保留，errorMessage/httpStatus 正确', () => {
+    const file = path.join(tmpDir, 'err.json')
+    const data = {
+      ...(asstMsg({ time: 1_000 }).data as Record<string, unknown>),
+      id: 'm-err',
+      error: 'upstream timeout',
+      httpStatus: 504
+    }
+    fs.writeFileSync(file, JSON.stringify(data), 'utf8')
+    const res = parseJsonFile(file, 0)
+    expect(res.records).toHaveLength(1)
+    const r = res.records[0]
+    expect(r.status).toBe('error')
+    expect(r.errorMessage).toBe('upstream timeout')
+    expect(r.httpStatus).toBe(504)
+    expect(r.inputTokens).toBe(123)
+    expect(r.outputTokens).toBe(45)
+    expect(r.source.requestId).toBe('m-err')
+  })
+
+  it('status 异常的 assistant 消息产出 error，errorMessage 取 status 文案兜底', () => {
+    const file = path.join(tmpDir, 'status-err.json')
+    const data = {
+      ...(asstMsg({ time: 2_000 }).data as Record<string, unknown>),
+      status: 'failed',
+      id: 'm-status'
+    }
+    // 移除 tokens 以验证失败路径即使无 tokens 仍可产出（tokens 全 0）
+    // 但为保留 tokens 场景，这里保留原 tokens；另起一个用例测全 0
+    fs.writeFileSync(file, JSON.stringify(data), 'utf8')
+    const res = parseJsonFile(file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].errorMessage).toBe('failed')
+  })
+
+  it('error 为对象时宽松提取 message，httpStatus 从嵌套取', () => {
+    const file = path.join(tmpDir, 'obj-err.json')
+    const data = {
+      ...(asstMsg({ time: 3_000 }).data as Record<string, unknown>),
+      error: { message: 'model overloaded', httpStatus: 503 }
+    }
+    fs.writeFileSync(file, JSON.stringify(data), 'utf8')
+    const res = parseJsonFile(file, 0)
+    expect(res.records[0].errorMessage).toBe('model overloaded')
+    expect(res.records[0].httpStatus).toBe(503)
+    expect(res.records[0].status).toBe('error')
+  })
+
+  it('失败时无 tokens 仍产出，tokens 全 0', () => {
+    const file = path.join(tmpDir, 'no-tokens-err.json')
+    const data = {
+      role: 'assistant',
+      time: { created: 4_000 },
+      modelID: 'glm-5.1',
+      id: 'm-no-tokens',
+      error: 'no tokens but failed'
+    }
+    fs.writeFileSync(file, JSON.stringify(data), 'utf8')
+    const res = parseJsonFile(file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].inputTokens).toBe(0)
+    expect(res.records[0].outputTokens).toBe(0)
+  })
+
+  it('errorMessage 超 500 截断', () => {
+    const file = path.join(tmpDir, 'long-err.json')
+    const longMsg = 'e'.repeat(600)
+    const data = {
+      ...(asstMsg({ time: 5_000 }).data as Record<string, unknown>),
+      error: longMsg
+    }
+    fs.writeFileSync(file, JSON.stringify(data), 'utf8')
+    const res = parseJsonFile(file, 0)
+    expect(res.records[0].errorMessage!.length).toBe(500)
+  })
+
+  it('中断 cancelled/interrupted 忽略不产记录', () => {
+    const file1 = path.join(tmpDir, 'cancelled.json')
+    const file2 = path.join(tmpDir, 'interrupted.json')
+    const d1 = { ...(asstMsg({ time: 6_000 }).data as Record<string, unknown>), error: 'cancelled', id: 'm-cancel' }
+    const d2 = { ...(asstMsg({ time: 6_001 }).data as Record<string, unknown>), status: 'interrupted', id: 'm-inter' }
+    fs.writeFileSync(file1, JSON.stringify(d1), 'utf8')
+    fs.writeFileSync(file2, JSON.stringify(d2), 'utf8')
+    expect(parseJsonFile(file1, 0).records).toHaveLength(0)
+    expect(parseJsonFile(file2, 0).records).toHaveLength(0)
+  })
+
+  it('db 源 SQLite 附加 error 列亦产出 error（宽松兼容）', () => {
+    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
+    // 建表时显式包含 error 列
+    const db = new Database(dbPath)
+    db.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT, error TEXT);
+    `)
+    const data = asstMsg({ id: 'm-db-err', time: 7_000 }).data as Record<string, unknown>
+    // data 内无 error，但行级 error 列有值
+    db.prepare('INSERT INTO session (id, directory) VALUES (?, ?)').run('sess-1', '/p')
+    db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data, error) VALUES (?, ?, ?, ?, ?, ?)').run(
+      'm-db-err',
+      'sess-1',
+      7_000,
+      7_000,
+      JSON.stringify(data),
+      'db column error'
+    )
+    db.close()
+    const res = parseDbFile(dbPath, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].errorMessage).toBe('db column error')
+  })
+
+  it('db 源 data 内 error 与 db 列同时存在时以 data 优先', () => {
+    const dbPath2 = path.join(tmpDir, 'opencode2.db')
+    const db = new Database(dbPath2)
+    db.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT, error TEXT);
+    `)
+    const dataWithErr = {
+      ...(asstMsg({ id: 'm-both', time: 8_000 }).data as Record<string, unknown>),
+      error: 'data error'
+    }
+    db.prepare('INSERT INTO session (id, directory) VALUES (?, ?)').run('sess-1', '/p')
+    db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data, error) VALUES (?, ?, ?, ?, ?, ?)').run(
+      'm-both',
+      'sess-1',
+      8_000,
+      8_000,
+      JSON.stringify(dataWithErr),
+      'column error'
+    )
+    db.close()
+    const res = parseDbFile(dbPath2, 0)
+    expect(res.records[0].errorMessage).toBe('data error')
+  })
+
+  it('非 assistant 角色即使含 error 也不产出', () => {
+    const file = path.join(tmpDir, 'user-err.json')
+    fs.writeFileSync(file, JSON.stringify({ role: 'user', error: 'should ignore' }), 'utf8')
+    expect(parseJsonFile(file, 0).records).toHaveLength(0)
+  })
+})

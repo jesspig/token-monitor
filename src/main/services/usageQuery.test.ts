@@ -144,20 +144,22 @@ function insert(db: SqliteDatabase, overrides: Partial<UsageRecordRow> = {}): st
     file_path: '/sessions/claude/a.jsonl',
     line: 1,
     created_at: new Date('2026-08-18T10:00:00+08:00').getTime(),
-    ...overrides
+    ...overrides,
+    http_status: overrides.http_status ?? null,
+    error_message: overrides.error_message ?? null
   }
   db.prepare(
     `INSERT INTO usage_records (
-       id, data_source, app_type, model, raw_model,
-       input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-       input_semantics, cost_usd, currency, latency_ms, project, session_id,
-       status, file_path, line, created_at
-     ) VALUES (
-       @id, @data_source, @app_type, @model, @raw_model,
-       @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens,
-       @input_semantics, @cost_usd, @currency, @latency_ms, @project, @session_id,
-       @status, @file_path, @line, @created_at
-     )`
+        id, data_source, app_type, model, raw_model,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+        input_semantics, cost_usd, currency, latency_ms, project, session_id,
+        status, http_status, error_message, file_path, line, created_at
+      ) VALUES (
+        @id, @data_source, @app_type, @model, @raw_model,
+        @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens,
+        @input_semantics, @cost_usd, @currency, @latency_ms, @project, @session_id,
+        @status, @http_status, @error_message, @file_path, @line, @created_at
+      )`
   ).run(row)
   return row.id
 }

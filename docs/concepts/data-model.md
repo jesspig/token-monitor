@@ -1,16 +1,16 @@
 ---
 type: data-model
 title: 数据模型
-description: SQLite 五张核心表：明细、日聚合、定价、同步游标、去重账本。
-tags: [data-model, sqlite, schema, usage]
+description: SQLite 五张核心表：明细、日聚合、定价、同步游标、去重账本；失败可观测性扩展（http_status/error_message，v8/v9）。
+tags: [data-model, sqlite, schema, usage, failure-observability]
 resource: src/main/services/db.ts
-timestamp: 2026-08-26T03:21:00+08:00
+timestamp: 2026-08-27T02:12:00+08:00
 ---
 
 # 数据模型
 
 > [!note] 当前状态
-> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5；2026-08-26 升级至 v6/v7）。五张表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；v6 为 `sync_cursors` 增可空列 `byte_offset` 字节游标；v7 为 `usage_records` 新增两个部分索引服务回填/重算候选扫描；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
+> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5；2026-08-26 升级至 v6/v7；**2026-08-27 升级至 v8/v9——失败可观测性**）。五张表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；v6 为 `sync_cursors` 增可空列 `byte_offset` 字节游标；v7 为 `usage_records` 新增两个部分索引服务回填/重算候选扫描；**v8 为 `usage_records` 新增 `http_status` / `error_message` 失败可观测列（INTEGER/TEXT，仅失败有效，存量 NULL，见下方 v8）；v9 清空 `sync_cursors` 触发失败记录存量回溯全量重析（见下方 v9）**；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
 
 ## 表清单
 
@@ -22,13 +22,13 @@ timestamp: 2026-08-26T03:21:00+08:00
 | `sync_cursors` | 增量同步游标（v6 起含可空 `byte_offset` 压缩字节游标，dsh zstd 用） | `file_path` |
 | `dedup_ledger` | 去重账本（**已接入写入路径**，2026-08-23；fork/rewrite 语义去重生效） | `(data_source, request_id)` |
 
-索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`；v7 起明细另有两个部分索引（见下方「v7 部分索引迁移」）。
+索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`；v7 起明细另有两个部分索引（见下方「v7 部分索引迁移」）；**v8 新增的 `http_status` / `error_message` 不建独立索引**——失败记录占比极低（<1%），查询复用已有 `created_at` / `(app_type, created_at)` 的时间范围扫描即可，单列/部分索引增写入开销而收益可忽略（见 [同步与去重](sync-mechanism.md) 索引说明与 `usageQuery.ts:buildWhere` 注释）。
 
 ## 日聚合查询语义
 
-- `usage_daily_rollups` 由 `storage.recordUsage` 在入库同事务实时维护，是明细的**镜像**而非独立主数据。
-- `usageQuery.ts` 全部聚合类查询（汇总 / 日趋势 / 按模型 / 按应用）**优先读本表**；筛选条件包含 `status` / `project` / `sessionId` / `keyword` 时回退明细表（rollup 桶不携带这些维度）。
-- 明细分页与详情查询始终走明细表，不经 rollups。
+- `usage_daily_rollups` 由 `storage.recordUsage` 在入库同事务实时维护，是明细的**镜像**而非独立主数据；桶字段含 `request_count / success_count / error_count`（`status='error'` 时 `error_count++`，否则 `success_count++`，见 `storage.ts:recordUsage`），费用与 token 的聚合口径与明细一致。
+- `usageQuery.ts` 全部聚合类查询（汇总 / 日趋势 / 按模型 / 按应用）**优先读本表**；筛选条件包含 `status` / `httpStatus`（含别名 `statusCode`）/ `project` / `sessionId` / `keyword` 时回退明细表（rollup 桶不携带 `http_status`/`error_message`/`status` 细筛与文本维度，下推会丢条件，见 `usageQuery.ts:canUseRollups` / `buildWhere` / `buildRollupWhere`）。
+- 明细分页与详情查询始终走明细表，不经 rollups（失败筛选 `status='error'` / `http_status=429` 等在明细表以 `WHERE status=? AND http_status=?` 精确过滤，复用 `created_at` 时间索引范围扫描）。
 
 ## v3 数据修复迁移（已实现，幂等）
 
@@ -59,14 +59,70 @@ timestamp: 2026-08-26T03:21:00+08:00
 - 动机（2026-08-26 防阻塞第二轮）：两个候选查询此前无任何可用索引，每次执行都是 `usage_records` 全表过滤扫描，且为周期任务、成本随明细量线性上涨；部分索引把稳态扫描成本降为 O(候选数)——稳态下候选集仅为「永久缺价/全免费定价」的滞留行，体量极小。
 - 幂等：`CREATE INDEX IF NOT EXISTS` 保证 user_version 回拨重放安全。配合分批执行消除长事务，见 [定价与费用](pricing.md)。
 
+## v8 失败可观测性列迁移（已实现，幂等，2026-08-27）
+
+- `ALTER TABLE usage_records ADD COLUMN http_status INTEGER` / `ADD COLUMN error_message TEXT`（可空）：为失败请求持久化 HTTP 状态码与错误文案。**仅失败有效**——`status='error'` 时写入，成功/中断为 `NULL`；存量行保持 `NULL`（`ADD COLUMN` 默认），旧库重放安全。
+- 类型与约束：`http_status` 为 `INTEGER`（如 400/401/403/429/500/529 等），`error_message` 为 `TEXT` 且由存储层 `toUsageRecordRow` 按 `shared/failure.ts:ERROR_MESSAGE_MAX_LENGTH=500` 截断后写入（DTO 层不限长，入库前收敛，超长 `slice(0,500)`，性能 O(1)）。
+- 幂等：`PRAGMA table_info(usage_records)` 列存在性守卫，列已存在即跳过 `ALTER`——避免 `duplicate column` 报错，与 v6 风格一致，保证 `user_version` 回拨重放历史迁移安全。
+- 索引策略：**不建索引**——失败记录占比极低，查询侧由 `usageQuery.ts:buildWhere` 复用已有 `idx_usage_records_created_at` / `idx_usage_records_app_created` 的时间范围扫描即可；单列或部分索引会增加每次 `INSERT OR IGNORE` 的写入放慢而收益可忽略。`status='error'` + `http_status` 联合筛选回退明细表（rollup 无该列，下推会丢条件，见 `usageQuery.ts:canUseRollups`）。
+- 关联：DTO `UsageRecord.httpStatus? / errorMessage?`（`shared/dto.ts`）→ 行 `http_status / error_message`（`shared/tables.ts:UsageRecordRow`）→ 查询 `RequestLogDetail.httpStatus / errorMessage`（`shared/query.ts`）；校验与截断 SSOT 见 `shared/failure.ts`。
+
+## v9 存量回溯迁移（已实现，幂等，2026-08-27）
+
+- 一次性 `DELETE FROM sync_cursors` 清空全部游标，触发下一轮全量重析以回填**历史失败记录**。
+- 成因：失败接入前（v8 前无 `http_status`/`error_message` 列，且 `collector.isAllZeroUsage` 对四项全 0 记录一律拦截），历史失败请求从未入库，但其会话文件的 `sync_cursors` 游标已推进到文件末尾；`collector` 的 mtime 短路（游标与文件 mtime 一致且均非 0 时跳过解析）又挡住存量重析，导致历史失败永不回填。
+- 作用域选择：全量 `DELETE` 而非按 `data_source IN (...)` 或 `file_path LIKE` 过滤——失败语义横跨全部 8 个内置源（claude/codex/opencode/gemini/grok/pi/zcode/dsh），且早期游标 `data_source` 可能为空字符串（`setCursor` 未显式写入），`IN` 过滤会漏删；`LIKE` 需枚举多套路径模式亦不完备，全量更稳且幂等。
+- 单事务与性能：由 `migrate()` 外层 `db.transaction` 包裹 `m.up + PRAGMA user_version`，仅一次 `fsync`；稳态重析一轮后游标即按 `parsed.nextLine` 重建，后续增量仍走 mtime 短路，开销仅首轮一次全量解析。
+- 幂等与去重：`DELETE` 重复执行无影响（无游标时 deletes 0 行）；重放由双层幂等保证——`usage_records` 主键 `id=data_source:file_path:line` 的 `INSERT OR IGNORE`（`storage.ts:insertRecordStmt`，`info.changes===0` 跳过不累 rollup/事件）+ `dedup_ledger` 主键 `(data_source, request_id)` 的 `INSERT OR IGNORE`（与明细同事务），成功记录因主键冲突跳过、仅新增的失败记录正常入库且增量修正 `usage_daily_rollups.error_count`，无重复计数风险。
+- 与本次迭代的联动：`collector.isAllZeroUsage` 已对 `status='error'` 放行全零（失败零 token 可观测），`storage.toUsageRecordRow` 已对 `errorMessage` 截断 500，v9 清游标是该放行的存量入口。
+
+## 明细表结构（usage_records，已实现，v8 起含失败列）
+
+```sql
+-- 主键/去重 key = id = data_source:file_path:line  （':' 分隔避免拼接歧义）
+CREATE TABLE usage_records (
+  id                    TEXT    NOT NULL PRIMARY KEY,
+  data_source           TEXT    NOT NULL,
+  app_type              TEXT    NOT NULL,  -- 插件 id：claude/codex/opencode/gemini/grok/pi/zcode/dsh
+  model                 TEXT    NOT NULL,  -- 归一化后模型 ID（计费用）
+  raw_model             TEXT,               -- 日志原始模型名
+  input_tokens          INTEGER NOT NULL DEFAULT 0,
+  output_tokens         INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  input_semantics       INTEGER NOT NULL DEFAULT 0, -- 0=未知 / 1=含缓存总量需扣减 / 2=纯新输入
+  cost_usd              TEXT,               -- 字符串避免浮点误差，聚合时转微美元累加
+  currency              TEXT,
+  latency_ms            INTEGER,
+  project               TEXT,               -- 会话归属（可选）
+  session_id            TEXT,               -- 会话归属（可选）
+  status                TEXT    NOT NULL DEFAULT 'success', -- 'success' | 'error'
+  http_status           INTEGER,            -- v8 新增：HTTP 状态码，仅 error 有效，成功/中断为 NULL，存量 NULL
+  error_message         TEXT,               -- v8 新增：截断后错误文案≤500 字符，仅 error 有效，存储层 slice(0,500)
+  file_path             TEXT    NOT NULL,
+  line                  INTEGER NOT NULL,
+  created_at            INTEGER NOT NULL   -- epoch ms
+);
+CREATE INDEX idx_usage_records_created_at ON usage_records (created_at);
+CREATE INDEX idx_usage_records_app_created ON usage_records (app_type, created_at);
+-- v7 部分索引（WHERE 与候选查询一致，见 v7 节）
+-- http_status / error_message 不建独立索引（选择性低、失败占比极低，复用时间索引范围扫描）
+```
+
 ## 明细表要点
 
-- `app_type` 直接区分监控对象（插件 id）：`claude / codex / opencode / gemini / grok`（第一阶段，无 provider 维度）。
+- `app_type` 直接区分监控对象（插件 id）：`claude / codex / opencode / gemini / grok / pi / zcode / dsh`（8 个内置插件阶段，无 provider 维度）。
 - `data_source` 与插件 id 对应，标识数据来源插件。
 - `model` 为归一化后模型 ID（计费用）；`raw_model` 保留日志原始名。
-- `input_semantics`（SSOT 三态）：**0=未知 / 1=input 为含缓存读写的总量（计费前需扣减缓存）/ 2=input 已为纯新输入**。五源实际取值：claude=2、codex=1、opencode=2（上游已自行扣减）、gemini=1、grok=1；费用侧按此扣减，见 [定价与费用](pricing.md)。
+- `input_semantics`（SSOT 三态）：**0=未知 / 1=input 为含缓存读写的总量（计费前需扣减缓存）/ 2=input 已为纯新输入**。八源实际取值：claude=2、codex=1、opencode=2（上游已自行扣减）、gemini=1、grok=1、pi=2、zcode=1、dsh=2；费用侧按此扣减，见 [定价与费用](pricing.md)。
 - 费用精度：`cost_usd` 以字符串存储避免浮点误差，聚合时统一转为整数微美元累加再回写字符串。
-- `project` / `session_id` 记录会话归属（可选）；`status` 默认 `'success'`。
+- `project` / `session_id` 记录会话归属（可选）。
+- `status` 三态语义（v1 起列，v8 起失败可观测）：
+  - `'success'`（默认，缺省即 success）：正常完成，已计费或零成本但成功；
+  - `'error'`：失败（判定矩阵见 `shared/failure.ts` SSOT 与 `shared/dto.ts` 顶部注释，亦见 [监控插件](monitor-plugins.md) 失败判定表）；仅此时 `http_status` / `error_message` 有效；
+  - 中断忽略（`cancelled` / `interrupted`，大小写不敏感，`shared/failure.ts:IGNORED_FAILURE_STATUSES`）：**不计 error**——插件层判定为中断即不产出 error 记录，亦不触发失败告警；`status` 保持缺省 success（不单独建 `'cancelled'` 状态），`http_status`/`error_message` 保持 `NULL`（见 `shared/failure.ts:isIgnoredFailureReason`）。
+- `http_status`（`INTEGER`，可空，仅失败有效）：HTTP 状态码（如 429/500/529 等）；成功/中断/存量为 `NULL`；由各插件按源提取（claude `apiErrorStatus`、zcode `error_code`、其余宽松探测），失败时宽松取首个有限数字（含字符串数字兼容），无精确码则不设（保持 `NULL`）。
+- `error_message`（`TEXT`，可空，仅失败有效）：截断后的错误文案，**最长 500 字符**（`shared/failure.ts:ERROR_MESSAGE_MAX_LENGTH=500`，`storage.ts:toUsageRecordRow` 入库前 `slice(0,500)`，DTO 层不限长）；成功/中断/存量为 `NULL`；由插件按源提取（见失败判定表），表格内预览截断 64 字符、详情抽屉完整展示。
 - `source.requestId`（dto 层可选字段）：稳定语义请求 ID（如上游消息 UUID），入库时写入 `dedup_ledger` 用于跨文件/重写场景去重；不单独建列。
 
 ## 去重账本（dedup_ledger，已接入）

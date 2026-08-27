@@ -17,7 +17,7 @@ import type { SqliteDatabase } from './db'
 /**
  * 用量查询服务：只读聚合/明细查询（better-sqlite3，仅主进程，同步 API 内部实现 + Promise 签名）。
  * 聚合类查询优先走 usage_daily_rollups（recordUsage 实时维护的日聚合镜像，明细过期清理后历史趋势不丢）；
- * 筛选含 rollup 不支持的维度（status/project/sessionId/keyword）时回退 usage_records 明细表。
+ * 筛选含 rollup 不支持的维度（status/httpStatus/project/sessionId/keyword）时回退 usage_records 明细表。
  * 费用统一转整数微美元聚合后格式化，与 storage.ts 的金额处理一致。
  * 渲染进程经 IPC 调用，DTO 契约见 shared/query.ts。
  */
@@ -47,11 +47,14 @@ function startOfTodayMs(): number {
 
 /**
  * 聚合查询能否下推到 usage_daily_rollups：rollup 只保留 (date, app_type, model) 维度，
- * status / project / sessionId / keyword 任一启用时必须回退明细表。
+ * status / project / sessionId / keyword / httpStatus 任一启用时必须回退明细表。
+ * httpStatus/statusCode 为失败明细维度，rollup 无该列，下推会丢筛选条件故一律回退。
  */
 function canUseRollups(filters: LogFilters): boolean {
+  const httpStatus = filters.httpStatus ?? filters.statusCode
   return (
     filters.status == null &&
+    httpStatus == null &&
     (filters.project == null || filters.project === '') &&
     (filters.sessionId == null || filters.sessionId === '') &&
     (filters.keyword == null || filters.keyword === '')
@@ -134,7 +137,14 @@ interface HourlyRow {
   cost_micro_usd: number
 }
 
-/** 把 LogFilters 翻译成明细表 WHERE 子句与参数（page/pageSize 不参与，由分页方法单独处理） */
+/**
+ * 把 LogFilters 翻译成明细表 WHERE 子句与参数（page/pageSize 不参与，由分页方法单独处理）。
+ * 失败筛选：status 与 httpStatus/statusCode 联合生效（statusCode 为 httpStatus 别名，优先 httpStatus）；
+ * status='error' + httpStatus 有值时可按 4xx/5xx 精确过滤（如 httpStatus=429），范围过滤可在调用层扩展为 BETWEEN。
+ * 索引说明：复用已有 idx_usage_records_created_at / idx_usage_records_app_created，时间范围为主过滤维度；
+ * status / http_status 选择性低且与时间范围组合查询时走已有索引的范围扫描即可，无需为 http_status 单建索引
+ * （失败记录占比低，全表扫描成本与现有聚合查询同级；如后续失败查询成为高频独立维度再评估部分索引）。
+ */
 function buildWhere(filters: LogFilters): { sql: string; params: unknown[] } {
   const clauses: string[] = []
   const params: unknown[] = []
@@ -158,6 +168,12 @@ function buildWhere(filters: LogFilters): { sql: string; params: unknown[] } {
   if (filters.status != null) {
     clauses.push('status = ?')
     params.push(filters.status)
+  }
+  // httpStatus 与 statusCode 同义，优先 httpStatus；仅失败记录该列非空，成功/中断为 NULL
+  const httpStatus = filters.httpStatus ?? filters.statusCode
+  if (httpStatus != null) {
+    clauses.push('http_status = ?')
+    params.push(httpStatus)
   }
   if (filters.project != null && filters.project !== '') {
     clauses.push('project = ?')
@@ -194,6 +210,8 @@ function prepareCached(db: SqliteDatabase, sql: string): Database.Statement {
 /**
  * rollup 下推路径的 WHERE：appTypes/models 直接对应列；
  * 时间范围映射为本地日期区间（date >= start 所在日、date <= end 所在日），边界整天计入。
+ * 性能：rollup 主键为 (date, app_type, model)，下推查询天然走主键范围扫描，无额外索引；
+ *       失败筛选（status/httpStatus）强制回退明细表，不走 rollup，避免下推丢条件。
  */
 function buildRollupWhere(filters: LogFilters): { sql: string; params: unknown[] } {
   const clauses: string[] = []
@@ -409,7 +427,12 @@ function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
     .all(...params) as HourlyRow[]
 }
 
-/** usage_records 行 → RequestLogDetail（snake_case → camelCase） */
+/**
+ * usage_records 行 → RequestLogDetail（snake_case → camelCase，含失败扩展字段 http_status/error_message）
+ * 性能：两列为简单字段直取，无计算/正则；分页查询 `ORDER BY created_at DESC LIMIT/OFFSET`
+ *       复用已有 idx_usage_records_created_at（或 idx_usage_records_app_created 当带 appTypes 过滤），
+ *       失败筛选回退明细表时亦走同一时间索引前缀，无全表扫描放大。
+ */
 function toDetail(row: UsageRecordRow): RequestLogDetail {
   return {
     id: row.id,
@@ -427,6 +450,8 @@ function toDetail(row: UsageRecordRow): RequestLogDetail {
     project: row.project,
     sessionId: row.session_id,
     status: row.status as RequestStatus,
+    httpStatus: row.http_status ?? null,
+    errorMessage: row.error_message ?? null,
     createdAt: row.created_at,
     sourceFile: row.file_path,
     sourceLine: row.line
@@ -580,6 +605,10 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
     },
 
     getRequestLogs(filters): Promise<PaginatedLogs> {
+      // 性能：COUNT(*) 与分页 SELECT 均复用 buildWhere 的时间范围谓词，走
+      // idx_usage_records_created_at / idx_usage_records_app_created 的范围扫描；
+      // ORDER BY created_at DESC 由同一索引的有序性支撑，避免全表排序；
+      // httpStatus/statusCode 等失败筛选仅增加等值谓词，不建新索引（见 buildWhere 索引说明）。
       const { sql, params } = buildWhere(filters)
       const page = Math.max(1, filters.page ?? 1)
       const pageSize = Math.max(1, filters.pageSize ?? 50)

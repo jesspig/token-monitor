@@ -1,6 +1,21 @@
 import type { AppType, RequestStatus } from './app'
 
 /**
+ * 失败判定矩阵（T01 契约固化，SSOT）：
+ * - 通用：HTTP 4xx/5xx、isApiErrorMessage、LLM failure、status != completed 判 error；
+ *          cancelled / interrupted 属用户中断，忽略不计 error。
+ * - claude: isApiErrorMessage === true => error，httpStatus = apiErrorStatus，model = <synthetic>（合成失败模型）
+ * - zcode: model_usage.status != 'completed' && error_type != null => error；error_type === 'cancelled' 忽略
+ * - dsh: llm/retry.failure => error（仅尝试级 failure 事件产出 error 记录，会话级中断忽略）
+ * - gemini: type === 'error' => error（双格式 JSONL 均以该标记为准）
+ * - codex: stream_error => error
+ * - grok / opencode / pi: 宽松探测，按各源 error 标记（存在 error 字段/非 completed 状态即判 error，中断标记除外）
+ *
+ * 约束：httpStatus 仅失败时有效；errorMessage 由存储层截断至 500 字符。
+ * 详见 shared/failure.ts 与 docs/concepts/data-model.md。
+ */
+
+/**
  * 插件探测结果：CLI 是否安装、会话目录是否存在
  * （docs/concepts/monitor-plugins.md）。
  */
@@ -48,6 +63,13 @@ export interface UsageRecord {
   sessionId?: string
   /** 请求状态（可选，插件可携带错误信息，供日志状态筛选） */
   status?: RequestStatus
+  /** HTTP 状态码，仅失败（status==='error'）时有效；成功/中断为 undefined */
+  httpStatus?: number
+  /**
+   * 截断后的错误文案，最长 500 字符约束由存储层执行（入库前截断，DTO 层不限长）。
+   * 仅失败时有效；成功/中断为 undefined。
+   */
+  errorMessage?: string
   /** 发生时间（epoch ms） */
   createdAt: number
   /**

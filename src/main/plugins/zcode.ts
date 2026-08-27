@@ -99,10 +99,23 @@ interface ModelUsageRow {
   started_at: number | null
   completed_at: number | null
   project_dir: string | null
+  /** 失败语义新增列（兼容旧库缺列：缺失时为 undefined，宽松视为 success） */
+  status?: string | null
+  error_type?: string | null
+  error_code?: string | number | null
+  error_message?: string | null
 }
 
 /** 宽松取数字：缺失/非有限数 → 0 */
 const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+
+/** 错误文案最大长度（与 shared/failure.ts ERROR_MESSAGE_MAX_LENGTH 同值 500，本地常量避免循环依赖） */
+const ERROR_MESSAGE_MAX_LENGTH = 500
+
+/** 截断错误文案至 500 */
+function truncateMessage(text: string): string {
+  return text.length > ERROR_MESSAGE_MAX_LENGTH ? text.slice(0, ERROR_MESSAGE_MAX_LENGTH) : text
+}
 
 /**
  * model_usage 行 → UsageRecord。字段映射：
@@ -112,6 +125,14 @@ const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(
  * outputTokens 不加 reasoning_tokens（独立列不计入速率，codeburn 同口径）；
  * 全零四桶行照常产出，由 collector 的 isAllZeroUsage 统一拦截。
  * 宽松解析：model_id 缺失/空白 → null（跳过该条，不阻塞整体）。
+ *
+ * 失败语义（T01 矩阵 zcode 分支，shared/dto.ts / shared/failure.ts）：
+ * - 当 status != 'completed' && error_type != null && error_type !== 'cancelled' 时判 error，
+ *   否则 success；cancelled 视为用户中断忽略（仍 success，不产 errorMessage/httpStatus）。
+ * - 失败时 httpStatus 取 error_code 转数字（仅有限数保留），errorMessage 取 error_message 截断 500；
+ *   兼容旧库缺列：行对象缺字段时宽松读取，默认 success。
+ * 性能：失败判定为追加的 if 分支（status/error_type 字符串比较），无正则/全表扫描；
+ *       SQLite 行已在 `WHERE rowid > ? ORDER BY rowid` 有序扫描中，失败分支仅单行 O(1) 判定，不影响批量速度。
  */
 function toUsageRecord(row: ModelUsageRow, opts: { filePath: string; line: number }): UsageRecord | null {
   const model = typeof row.model_id === 'string' ? row.model_id.trim() : ''
@@ -122,6 +143,40 @@ function toUsageRecord(row: ModelUsageRow, opts: { filePath: string; line: numbe
   if (createdAt <= 0) createdAt = toNum(row.started_at)
   if (createdAt <= 0) createdAt = Date.now()
 
+  // 失败判定：status != 'completed' && error_type != null && error_type !== 'cancelled'
+  // 兼容旧库缺列：缺字段时为 undefined，宽松视为 success
+  const statusRaw = (row as unknown as Record<string, unknown>).status
+  const statusVal = typeof statusRaw === 'string' ? statusRaw.trim() : (statusRaw as unknown as string | null | undefined)
+  const errorTypeRaw = (row as unknown as Record<string, unknown>).error_type
+  const errorTypeVal =
+    typeof errorTypeRaw === 'string' ? errorTypeRaw.trim() : (errorTypeRaw as unknown as string | null | undefined)
+  const isError =
+    statusVal !== 'completed' &&
+    errorTypeVal != null &&
+    errorTypeVal !== '' &&
+    errorTypeVal !== 'cancelled'
+
+  let status: 'success' | 'error' = 'success'
+  let httpStatus: number | undefined
+  let errorMessage: string | undefined
+  if (isError) {
+    status = 'error'
+    const rawCode = (row as unknown as Record<string, unknown>).error_code
+    if (typeof rawCode === 'number' && Number.isFinite(rawCode)) {
+      httpStatus = rawCode
+    } else if (typeof rawCode === 'string' && rawCode.trim() !== '') {
+      const n = Number(rawCode.trim())
+      if (Number.isFinite(n)) httpStatus = n
+    } else if (rawCode != null && typeof rawCode !== 'string' && typeof rawCode !== 'number') {
+      const n = Number(String(rawCode).trim())
+      if (Number.isFinite(n)) httpStatus = n
+    }
+    const rawMsg = (row as unknown as Record<string, unknown>).error_message
+    if (typeof rawMsg === 'string' && rawMsg.trim() !== '') {
+      errorMessage = truncateMessage(rawMsg.trim())
+    }
+  }
+
   return {
     appType: 'zcode',
     model,
@@ -131,7 +186,9 @@ function toUsageRecord(row: ModelUsageRow, opts: { filePath: string; line: numbe
     cacheReadTokens: toNum(row.cache_read_input_tokens),
     cacheCreationTokens: toNum(row.cache_creation_input_tokens),
     inputSemantics: 1,
-    status: 'success',
+    status,
+    ...(httpStatus !== undefined ? { httpStatus } : {}),
+    ...(errorMessage !== undefined ? { errorMessage } : {}),
     createdAt,
     project: row.project_dir ?? undefined,
     sessionId: row.session_id ?? undefined,
@@ -157,6 +214,8 @@ export function parseDbFile(dbPath: string, fromLine: number): ParsedResult {
   let db: Database.Database | null = null
   try {
     db = new Database(dbPath, { readonly: true, timeout: EXTERNAL_DB_BUSY_TIMEOUT_MS })
+    // 兼容旧库缺列：SELECT m.* 已含所有列（status/error_type/error_code/error_message），
+    // 旧表缺字段时行对象对应属性为 undefined，toUsageRecord 中宽松读取并默认 success
     const rows = db
       .prepare(
         `SELECT m.rowid AS rid, m.*, s.directory AS project_dir

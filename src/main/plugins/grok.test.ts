@@ -465,3 +465,165 @@ describe('每轮同步重建模型映射（listFiles 入口）', () => {
     expect(res.records[0]).toMatchObject({ sessionId: 'sess-ok', model: 'grok-3-fast' })
   })
 })
+
+describe('parseFile 失败分支（T01 宽松 error 探测）', () => {
+  it('含 error 字段的 inference_done 产出 error 记录，status=error，tokens 保留，errorMessage/httpStatus 正确', async () => {
+    makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const errLine = JSON.stringify({
+      msg: 'shell.turn.inference_done',
+      sessionId: 'sess-1',
+      timestamp: '2026-08-19T10:00:00+08:00',
+      sid: 'sid-1',
+      ctx: { prompt_tokens: 50, completion_tokens: 20, cached_prompt_tokens: 5, loop_index: 1, error: 'rate limited' },
+      error: 'rate limited',
+      httpStatus: 429
+    })
+    fs.writeFileSync(file, errLine, 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    const r = res.records[0]
+    expect(r.status).toBe('error')
+    expect(r.errorMessage).toBe('rate limited')
+    expect(r.httpStatus).toBe(429)
+    // tokens 保留原值（满足“全 0 或保留原 tokens”）
+    expect(r.inputTokens).toBe(50)
+    expect(r.outputTokens).toBe(20)
+    expect(r.cacheReadTokens).toBe(5)
+    expect(r.inputSemantics).toBe(1)
+    expect(r.source.requestId).toBe('sid-1:1')
+  })
+
+  it('status 非 success 时产出 error，errorMessage 取 status 文案兜底', async () => {
+    makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const line = JSON.stringify({
+      msg: 'shell.turn.inference_done',
+      sessionId: 'sess-1',
+      timestamp: '2026-08-19T10:00:00+08:00',
+      ctx: { prompt_tokens: 10, completion_tokens: 5, cached_prompt_tokens: 0 },
+      status: 'failed'
+    })
+    fs.writeFileSync(file, line, 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].errorMessage).toBe('failed')
+    expect(res.records[0].httpStatus).toBeUndefined()
+  })
+
+  it('ctx.error 为对象时宽松提取 message，httpStatus 从嵌套取', async () => {
+    makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const line = JSON.stringify({
+      msg: 'shell.turn.inference_done',
+      sessionId: 'sess-1',
+      timestamp: '2026-08-19T10:00:00+08:00',
+      ctx: { prompt_tokens: 1, completion_tokens: 1, error: { message: 'upstream 500', httpStatus: 500 } }
+    })
+    fs.writeFileSync(file, line, 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].errorMessage).toBe('upstream 500')
+    expect(res.records[0].httpStatus).toBe(500)
+  })
+
+  it('errorMessage 超 500 截断', async () => {
+    makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const longMsg = 'a'.repeat(600)
+    const line = JSON.stringify({
+      msg: 'shell.turn.inference_done',
+      sessionId: 'sess-1',
+      timestamp: '2026-08-19T10:00:00+08:00',
+      ctx: { prompt_tokens: 1, completion_tokens: 1, error: longMsg }
+    })
+    fs.writeFileSync(file, line, 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].errorMessage!.length).toBe(500)
+  })
+
+  it('中断 cancelled/interrupted 忽略不产记录', async () => {
+    makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const cancelled = JSON.stringify({
+      msg: 'shell.turn.inference_done',
+      sessionId: 'sess-1',
+      timestamp: '2026-08-19T10:00:00+08:00',
+      ctx: { prompt_tokens: 10, completion_tokens: 5, error: 'cancelled' },
+      status: 'cancelled'
+    })
+    const interrupted = JSON.stringify({
+      msg: 'shell.turn.inference_done',
+      sessionId: 'sess-1',
+      timestamp: '2026-08-19T10:00:01+08:00',
+      ctx: { prompt_tokens: 10, completion_tokens: 5, error: 'interrupted by user' }
+    })
+    fs.writeFileSync(file, [cancelled, interrupted].join('\n'), 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(0)
+    expect(res.nextLine).toBe(3)
+  })
+
+  it('error 为空串不判失败，仍为 success', async () => {
+    makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const line = JSON.stringify({
+      msg: 'shell.turn.inference_done',
+      sessionId: 'sess-1',
+      timestamp: '2026-08-19T10:00:00+08:00',
+      ctx: { prompt_tokens: 10, completion_tokens: 5, error: '' },
+      error: ''
+    })
+    fs.writeFileSync(file, line, 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].status).toBe('success')
+  })
+
+  it('失败仍需模型映射，无映射跳过', async () => {
+    // 不建 sess-1 映射
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const line = JSON.stringify({
+      msg: 'shell.turn.inference_done',
+      sessionId: 'sess-unknown',
+      timestamp: '2026-08-19T10:00:00+08:00',
+      ctx: { prompt_tokens: 10, completion_tokens: 5, error: 'boom' }
+    })
+    fs.writeFileSync(file, line, 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(0)
+  })
+
+  it('httpStatus 字符串数字亦兼容', async () => {
+    makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
+    await loadModelMap(tmpDir)
+    const file = path.join(tmpDir, 'logs', 'unified.jsonl')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const line = JSON.stringify({
+      msg: 'shell.turn.inference_done',
+      sessionId: 'sess-1',
+      timestamp: '2026-08-19T10:00:00+08:00',
+      ctx: { prompt_tokens: 1, completion_tokens: 1, error: 'err' },
+      statusCode: '502'
+    })
+    fs.writeFileSync(file, line, 'utf8')
+    const res = await grokPlugin.parseFile(ctx, file, 0)
+    expect(res.records[0].httpStatus).toBe(502)
+  })
+})

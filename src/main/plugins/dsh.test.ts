@@ -129,6 +129,43 @@ const assistantMessageLine = (
     }
   })
 
+/** llm/retry 失败行（T01 矩阵 dsh 分支）：type==='llm/retry' 且 data.failure 存在时产出 error 记录 */
+const llmRetryFailureLine = (
+  o: {
+    seq?: number
+    time?: number
+    code?: string | number | null
+    message?: string | null
+    model?: string | null
+    failure?: Record<string, unknown> | null
+    dataModel?: string | null
+  } = {}
+): string =>
+  JSON.stringify({
+    type: 'llm/retry',
+    seq: o.seq ?? 8,
+    time: o.time ?? DSH_TS + 7000,
+    data: {
+      ...(o.dataModel === undefined ? {} : o.dataModel === null ? {} : { model: o.dataModel }),
+      failure:
+        o.failure !== undefined
+          ? o.failure
+          : {
+              ...(o.code === undefined || o.code === null ? {} : { code: o.code }),
+              ...(o.message === undefined || o.message === null ? {} : { message: o.message }),
+              ...(o.model === undefined || o.model === null ? {} : { model: o.model })
+            }
+    }
+  })
+
+/** llm/retry-started 流水行（无 failure，应忽略） */
+const llmRetryStartedLine = (seq = 9, time: number = DSH_TS + 8000): string =>
+  JSON.stringify({ type: 'llm/retry-started', seq, time, data: { attempt: 1 } })
+
+/** llm/retry 无 failure 字段行（应忽略） */
+const llmRetryNoFailureLine = (seq = 10, time: number = DSH_TS + 9000): string =>
+  JSON.stringify({ type: 'llm/retry', seq, time, data: { retryCount: 1 } })
+
 /** 多行拼成 JSONL 文件内容（无尾随换行，行号即数组下标 +1；自动创建父目录） */
 const writeJsonl = (file: string, lines: string[]): void => {
   fs.mkdirSync(path.dirname(file), { recursive: true })
@@ -532,6 +569,168 @@ describe('parseFile 模型三级来源（source.model → message.model → requ
     expect(res.records.map((r) => r.source.line)).toEqual([3, 5, 6])
     expect(res.nextLine).toBe(7)
     expect(res.eof).toBe(true)
+  })
+})
+
+describe('parseFile llm/retry 失败可观测（T01 矩阵 dsh 分支）', () => {
+  it('矩阵 dsh: llm/retry.failure => error：status=error，tokens 全 0，errorMessage 为 [code] message 截断500，无 httpStatus，model 取 failure.model 或缓存', async () => {
+    const file = path.join(tmpDir, 'session-retry-failure.jsonl')
+    writeJsonl(file, [
+      headerLine(), // 1
+      requestHeaderLine({ seq: 1, model: 'deepseek-chat' }), // 2 缓存模型
+      assistantMessageLine({ seq: 2, time: DSH_TS + 2000 }), // 3 success
+      llmRetryFailureLine({ seq: 3, time: DSH_TS + 3000, code: 'RATE_LIMIT', message: 'Too many requests', model: 'deepseek-reasoner' }), // 4 error 用 failure.model
+      llmRetryFailureLine({ seq: 4, time: DSH_TS + 4000, code: 'TIMEOUT', message: 'timeout' }), // 5 error 回落缓存 deepseek-chat
+      llmRetryFailureLine({ seq: 5, time: DSH_TS + 5000, code: 429, message: 'numeric code' }) // 6 数值 code 宽松
+    ])
+
+    const res = await dshPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(4)
+    // 第一条为 success，模型取自缓存 deepseek-chat
+    expect(res.records[0]).toMatchObject({ status: 'success', model: 'deepseek-chat' })
+    expect(res.records[0].source.line).toBe(3)
+    // 后三条为 error
+    const err1 = res.records[1]
+    expect(err1).toMatchObject({
+      appType: 'dsh',
+      model: 'deepseek-reasoner',
+      rawModel: 'deepseek-reasoner',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      inputSemantics: 2,
+      status: 'error',
+      errorMessage: '[RATE_LIMIT] Too many requests',
+      sessionId: SESSION_ID,
+      project: CWD,
+      createdAt: DSH_TS + 3000
+    })
+    expect(err1.httpStatus).toBeUndefined()
+    expect(err1.source).toEqual({ filePath: file, line: 4, requestId: `${SESSION_ID}:3` })
+
+    const err2 = res.records[2]
+    expect(err2.model).toBe('deepseek-chat') // 回落缓存
+    expect(err2.errorMessage).toBe('[TIMEOUT] timeout')
+    expect(err2.source.requestId).toBe(`${SESSION_ID}:4`)
+    expect(err2.httpStatus).toBeUndefined()
+
+    const err3 = res.records[3]
+    expect(err3.errorMessage).toBe('[429] numeric code')
+
+    expect(res.nextLine).toBe(7)
+    expect(res.eof).toBe(true)
+  })
+
+  it('llm/retry-started 与无 failure 的 llm/retry 行应忽略，不产出记录但游标推进', async () => {
+    const file = path.join(tmpDir, 'session-retry-ignore.jsonl')
+    writeJsonl(file, [
+      headerLine(), // 1
+      requestHeaderLine({ seq: 1 }), // 2
+      llmRetryStartedLine(2), // 3
+      llmRetryNoFailureLine(3), // 4
+      assistantMessageLine({ seq: 4 }), // 5 正常产出
+      llmRetryFailureLine({ seq: 5, code: 'ERR', message: 'fail' }) // 6 error
+    ])
+
+    const res = await dshPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(2)
+    expect(res.records[0].status).toBe('success')
+    expect(res.records[0].source.line).toBe(5)
+    expect(res.records[1].status).toBe('error')
+    expect(res.records[1].source.line).toBe(6)
+    expect(res.records[1].errorMessage).toBe('[ERR] fail')
+    expect(res.nextLine).toBe(7)
+  })
+
+  it('errorMessage 截断500：超长 [code] message 仅保留前500字符', async () => {
+    const file = path.join(tmpDir, 'session-retry-truncate.jsonl')
+    const longMsg = 'a'.repeat(600)
+    writeJsonl(file, [
+      headerLine(), // 1
+      requestHeaderLine({ seq: 1 }), // 2
+      llmRetryFailureLine({ seq: 2, code: 'LONG', message: longMsg }) // 3
+    ])
+
+    const res = await dshPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].errorMessage!.length).toBe(500)
+    expect(res.records[0].errorMessage).toBe(`[LONG] ${longMsg}`.slice(0, 500))
+    expect(res.records[0].inputSemantics).toBe(2)
+  })
+
+  it('model 回落链：failure.model 优先于 data.model 与缓存；三者皆无时回落 unknown', async () => {
+    const file = path.join(tmpDir, 'session-retry-model-fallback.jsonl')
+    writeJsonl(file, [
+      headerLine(), // 1 不设 request/header，缓存为空
+      llmRetryFailureLine({ seq: 1, code: 'E1', message: 'm1', model: 'failure-model' }), // 2 取 failure.model
+      llmRetryFailureLine({ seq: 2, code: 'E2', message: 'm2', failure: { code: 'E2', message: 'm2' }, dataModel: 'data-model' }), // 3 取 data.model
+      llmRetryFailureLine({ seq: 3, code: 'E3', message: 'm3' }) // 4 无模型回落 unknown
+    ])
+
+    const res = await dshPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(3)
+    expect(res.records[0].model).toBe('failure-model')
+    expect(res.records[1].model).toBe('data-model')
+    expect(res.records[2].model).toBe('unknown')
+    for (const r of res.records) {
+      expect(r.status).toBe('error')
+      expect(r.inputTokens).toBe(0)
+      expect(r.outputTokens).toBe(0)
+      expect(r.httpStatus).toBeUndefined()
+    }
+  })
+
+  it('仅 code 或仅 message 时 errorMessage 宽松拼接；两者皆无时回落 JSON 兜底', async () => {
+    const file = path.join(tmpDir, 'session-retry-partial.jsonl')
+    writeJsonl(file, [
+      headerLine(), // 1
+      requestHeaderLine({ seq: 1 }), // 2
+      llmRetryFailureLine({ seq: 2, code: 'ONLY_CODE' }), // 3 仅 code
+      llmRetryFailureLine({ seq: 3, message: 'only message' }), // 4 仅 message
+      llmRetryFailureLine({ seq: 4, failure: { reason: 'weird' } }) // 5 两者皆无 JSON 兜底
+    ])
+
+    const res = await dshPlugin.parseFile(ctx, file, 0)
+    expect(res.records.map((r) => r.errorMessage)).toEqual(['[ONLY_CODE]', 'only message', JSON.stringify({ reason: 'weird' }).slice(0, 500)])
+  })
+
+  it('增量续读与 zstd 帧内均能捕获 llm/retry 失败，且保持 assistant/message 成功路径不变', async () => {
+    const file = path.join(tmpDir, 'session-retry-incremental.jsonl')
+    writeJsonl(file, [
+      headerLine(), // 1
+      requestHeaderLine({ seq: 1 }), // 2
+      assistantMessageLine({ seq: 2 }), // 3 success
+      llmRetryFailureLine({ seq: 3, code: 'ERR', message: 'first' }) // 4 error
+    ])
+
+    const first = await dshPlugin.parseFile(ctx, file, 0)
+    expect(first.records).toHaveLength(2)
+    expect(first.records.map((r) => r.status)).toEqual(['success', 'error'])
+    expect(first.nextLine).toBe(5)
+
+    fs.appendFileSync(file, '\n' + llmRetryFailureLine({ seq: 4, code: 'ERR2', message: 'second' }), 'utf8')
+    const second = await dshPlugin.parseFile(ctx, file, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0].status).toBe('error')
+    expect(second.records[0].errorMessage).toBe('[ERR2] second')
+    expect(second.records[0].sessionId).toBe(SESSION_ID)
+    expect(second.records[0].source.line).toBe(5)
+    expect(second.records[0].source.requestId).toBe(`${SESSION_ID}:4`)
+
+    // zstd 帧内同样产出
+    const zfile = path.join(tmpDir, 'session-retry-zstd.jsonl.zstd')
+    const [chunk] = makeZstdChunks([
+      [headerLine(), requestHeaderLine({ seq: 1 }), llmRetryFailureLine({ seq: 2, code: 'ZERR', message: 'zstd fail' })]
+    ])
+    fs.writeFileSync(zfile, chunk)
+    const { ctx: zctx, cursorWrites } = makeCtxWithStorage()
+    const zres = await dshPlugin.parseFile(zctx, zfile, 0)
+    expect(zres.records).toHaveLength(1)
+    expect(zres.records[0].status).toBe('error')
+    expect(zres.records[0].errorMessage).toBe('[ZERR] zstd fail')
+    expect(cursorWrites[0].byteOffset).toBe(chunk.length)
   })
 })
 

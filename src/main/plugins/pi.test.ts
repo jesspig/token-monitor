@@ -324,3 +324,183 @@ describe('parseFile 增量解析', () => {
     expect(Math.abs(res.records[1].createdAt - Date.now())).toBeLessThan(60_000)
   })
 })
+
+describe('parseFile 失败分支（T01 宽松 error 探测）', () => {
+  it('条目含 error 字段的 assistant 消息产出 error，tokens 保留，errorMessage/httpStatus 正确', async () => {
+    const file = path.join(tmpDir, 'session-err.jsonl')
+    const errEntry = JSON.stringify({
+      type: 'message',
+      id: 'm-err',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      error: 'rate limited',
+      httpStatus: 429,
+      message: { role: 'assistant', model: 'claude-opus-4-6', usage: FULL_USAGE }
+    })
+    writeJsonl(file, [HEADER_LINE(), errEntry])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    const r = res.records[0]
+    expect(r.status).toBe('error')
+    expect(r.errorMessage).toBe('rate limited')
+    expect(r.httpStatus).toBe(429)
+    expect(r.inputTokens).toBe(120)
+    expect(r.outputTokens).toBe(60)
+    expect(r.source.requestId).toBe('m-err')
+  })
+
+  it('isError 标记的 assistant 消息产出 error', async () => {
+    const file = path.join(tmpDir, 'session-isError.jsonl')
+    const line = JSON.stringify({
+      type: 'message',
+      id: 'm-isError',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      isError: true,
+      error: 'flagged error',
+      message: { role: 'assistant', model: 'glm-5', usage: FULL_USAGE }
+    })
+    writeJsonl(file, [HEADER_LINE(), line])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].errorMessage).toBe('flagged error')
+  })
+
+  it('message 内 error 字段亦触发 error', async () => {
+    const file = path.join(tmpDir, 'session-msg-err.jsonl')
+    const line = JSON.stringify({
+      type: 'message',
+      id: 'm-msg-err',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      message: { role: 'assistant', model: 'glm-5', error: 'msg level boom', usage: FULL_USAGE }
+    })
+    writeJsonl(file, [HEADER_LINE(), line])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].errorMessage).toBe('msg level boom')
+  })
+
+  it('status 非 success 时产出 error，errorMessage 取 status 兜底', async () => {
+    const file = path.join(tmpDir, 'session-status-err.jsonl')
+    const line = JSON.stringify({
+      type: 'message',
+      id: 'm-status',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      status: 'failed',
+      message: { role: 'assistant', model: 'glm-5', usage: FULL_USAGE }
+    })
+    writeJsonl(file, [HEADER_LINE(), line])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].errorMessage).toBe('failed')
+  })
+
+  it('失败时无 usage 仍产出，tokens 全 0', async () => {
+    const file = path.join(tmpDir, 'session-no-usage-err.jsonl')
+    const line = JSON.stringify({
+      type: 'message',
+      id: 'm-no-usage',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      error: 'no usage but failed',
+      message: { role: 'assistant', model: 'glm-5' }
+    })
+    writeJsonl(file, [HEADER_LINE(), line])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].inputTokens).toBe(0)
+    expect(res.records[0].outputTokens).toBe(0)
+  })
+
+  it('error 对象宽松提取 message/httpStatus', async () => {
+    const file = path.join(tmpDir, 'session-obj-err.jsonl')
+    const line = JSON.stringify({
+      type: 'message',
+      id: 'm-obj',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      error: { message: 'upstream 500', httpStatus: 500 },
+      message: { role: 'assistant', model: 'glm-5', usage: FULL_USAGE }
+    })
+    writeJsonl(file, [HEADER_LINE(), line])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records[0].errorMessage).toBe('upstream 500')
+    expect(res.records[0].httpStatus).toBe(500)
+  })
+
+  it('errorMessage 超 500 截断', async () => {
+    const file = path.join(tmpDir, 'session-long-err.jsonl')
+    const longMsg = 'x'.repeat(600)
+    const line = JSON.stringify({
+      type: 'message',
+      id: 'm-long',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      error: longMsg,
+      message: { role: 'assistant', model: 'glm-5', usage: FULL_USAGE }
+    })
+    writeJsonl(file, [HEADER_LINE(), line])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records[0].errorMessage!.length).toBe(500)
+  })
+
+  it('中断 cancelled/interrupted 忽略不产记录', async () => {
+    const file = path.join(tmpDir, 'session-cancelled.jsonl')
+    const cancelled = JSON.stringify({
+      type: 'message',
+      id: 'm-cancel',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      error: 'cancelled',
+      message: { role: 'assistant', model: 'glm-5', usage: FULL_USAGE }
+    })
+    const interrupted = JSON.stringify({
+      type: 'message',
+      id: 'm-inter',
+      parentId: 'u-1',
+      timestamp: PI_TS + 2000,
+      status: 'interrupted',
+      message: { role: 'assistant', model: 'glm-5', usage: FULL_USAGE }
+    })
+    writeJsonl(file, [HEADER_LINE(), cancelled, interrupted])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(0)
+  })
+
+  it('httpStatus 字符串数字亦兼容', async () => {
+    const file = path.join(tmpDir, 'session-status-code.jsonl')
+    const line = JSON.stringify({
+      type: 'message',
+      id: 'm-code',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      error: 'boom',
+      statusCode: '502',
+      message: { role: 'assistant', model: 'glm-5', usage: FULL_USAGE }
+    })
+    writeJsonl(file, [HEADER_LINE(), line])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records[0].httpStatus).toBe(502)
+  })
+
+  it('失败时无 model 兜底 unknown', async () => {
+    const file = path.join(tmpDir, 'session-no-model-err.jsonl')
+    const line = JSON.stringify({
+      type: 'message',
+      id: 'm-no-model',
+      parentId: 'u-1',
+      timestamp: PI_TS + 1000,
+      error: 'no model but failed',
+      message: { role: 'assistant', usage: FULL_USAGE }
+    })
+    writeJsonl(file, [HEADER_LINE(), line])
+    const res = await piPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].model).toBe('unknown')
+    expect(res.records[0].status).toBe('error')
+  })
+})

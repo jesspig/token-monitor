@@ -148,6 +148,88 @@ export function detectFromRoot(root: string): Detection {
 /** 宽松取数字：缺失/非有限数 → 0 */
 const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 
+/** 错误文案截断至 500（SSOT 为 shared/failure.ts ERROR_MESSAGE_MAX_LENGTH） */
+function truncateErrorMessage(text: string): string {
+  return text.length > 500 ? text.slice(0, 500) : text
+}
+
+/**
+ * llm/retry 失败行 → UsageRecord（T01 矩阵 dsh 分支）。
+ * 触发条件：type==='llm/retry' 且 data.failure 为对象存在时。
+ * 产出：status='error'，errorMessage 为 `[code] message`（code/message 均取 failure 字段，缺失时宽松回落，截断 500），
+ *       httpStatus 不设（无精确码），tokens 四项为 0，inputSemantics=2，
+ *       model 取 failure.model（若为非空字符串）或缓存 currentModel，皆无则回落 'unknown' 以保证可观测，
+ *       createdAt 取 envelope time，requestId 与成功路径一致为 `<sessionId>:<seq>`。
+ * llm/retry-started（无 failure）天然不命中，属忽略。
+ * 性能：追加的 type 严格相等 + failure 对象存在性分支，无正则/全表扫描；
+ *       单次字符串拼接 + slice 截断，单行 O(1)，zstd 解压/帧扫描热点不受影响。
+ */
+function toRetryErrorRecord(
+  row: Record<string, unknown>,
+  filePath: string,
+  line: number,
+  session: { sessionId?: string; project?: string; currentModel?: string }
+): UsageRecord | null {
+  if (row.type !== 'llm/retry') return null
+  const data = row.data
+  if (!data || typeof data !== 'object') return null
+  const d = data as Record<string, unknown>
+  const failure = d.failure
+  if (!failure || typeof failure !== 'object') return null
+  const f = failure as Record<string, unknown>
+
+  const codeRaw = f.code
+  const code =
+    typeof codeRaw === 'string' ? codeRaw.trim() : typeof codeRaw === 'number' && Number.isFinite(codeRaw) ? String(codeRaw) : ''
+  const msgRaw = f.message ?? f.error ?? f.text
+  const message = typeof msgRaw === 'string' ? msgRaw.trim() : ''
+  let errorMessage: string | undefined
+  if (code && message) errorMessage = truncateErrorMessage(`[${code}] ${message}`)
+  else if (code) errorMessage = truncateErrorMessage(`[${code}]`)
+  else if (message) errorMessage = truncateErrorMessage(message)
+  else {
+    try {
+      const fallback = JSON.stringify(failure)
+      if (fallback && fallback !== '{}') errorMessage = truncateErrorMessage(fallback)
+    } catch {
+      errorMessage = undefined
+    }
+  }
+
+  const failureModel = typeof f.model === 'string' ? f.model.trim() : ''
+  const dataModel = typeof d.model === 'string' ? d.model.trim() : ''
+  let model = failureModel || dataModel || session.currentModel || ''
+  if (!model) model = 'unknown'
+
+  const rawSeq =
+    typeof row.seq === 'number' && Number.isFinite(row.seq)
+      ? String(row.seq)
+      : typeof row.seq === 'string' && row.seq.trim() !== ''
+        ? row.seq.trim()
+        : undefined
+  const requestId = session.sessionId && rawSeq ? `${session.sessionId}:${rawSeq}` : undefined
+
+  const t = toNum(row.time)
+  const createdAt = t > 0 ? t : Date.now()
+
+  return {
+    appType: 'dsh',
+    model,
+    rawModel: model,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    inputSemantics: 2,
+    status: 'error',
+    ...(errorMessage !== undefined ? { errorMessage } : {}),
+    createdAt,
+    project: session.project,
+    sessionId: session.sessionId,
+    source: { filePath, line, ...(requestId ? { requestId } : {}) }
+  }
+}
+
 /**
  * 单条 storage record envelope → UsageRecord。
  * 仅 type==='assistant/message'、message.role 无 assistant 异值（宽松：role 缺失放行）
@@ -485,8 +567,13 @@ async function parseFile(ctx: PluginContext, filePath: string, fromLine: number)
         }
       }
     } else {
-      const record = toUsageRecord(row, filePath, lineNumber, { sessionId, project, currentModel })
-      if (record) records.push(record)
+      const errorRecord = toRetryErrorRecord(row, filePath, lineNumber, { sessionId, project, currentModel })
+      if (errorRecord) {
+        records.push(errorRecord)
+      } else {
+        const record = toUsageRecord(row, filePath, lineNumber, { sessionId, project, currentModel })
+        if (record) records.push(record)
+      }
     }
     nextLine = lineNumber + 1
   }
