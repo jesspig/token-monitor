@@ -2,11 +2,45 @@ import { join } from 'path'
 import { app, dialog, shell, BrowserWindow, ipcMain } from 'electron'
 import { bootstrapHost, type Host } from './host'
 import { registerIpcHandlers } from './ipc/register'
+import { createTray, type TrayHandle } from './tray'
 
 const STARTUP_SYNC_DELAY_MS = 1500
 
 let mainWindow: BrowserWindow | null = null
 let host: Host | null = null
+let tray: TrayHandle | null = null
+let willQuit = false
+
+// 单实例锁：第二个实例直接退出，由首实例聚焦窗口
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+}
+
+function resolveTrayIcon(): string {
+  const name =
+    process.platform === 'win32' ? 'icon.ico'
+    : process.platform === 'darwin' ? 'iconTemplate.png'
+    : 'icon.png'
+  return app.isPackaged
+    ? join(process.resourcesPath, 'tray', name)
+    : join(app.getAppPath(), 'resources', 'tray', name)
+}
+
+function showWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+    return
+  }
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function quitApp(): void {
+  willQuit = true
+  tray?.destroy()
+  tray = null
+  app.quit()
+}
 
 function showFatalError(err: unknown): void {
   const message = err instanceof Error ? err.message : String(err)
@@ -27,6 +61,14 @@ function createWindow(): BrowserWindow {
   })
 
   mainWindow = window
+
+  // 关闭窗口时：未显式退出且开启常驻 → 取消关闭并隐藏到托盘
+  window.on('close', (e) => {
+    if (!willQuit && host?.getSettings().closeToTray) {
+      e.preventDefault()
+      window.hide()
+    }
+  })
 
   window.on('ready-to-show', () => {
     window.show()
@@ -58,6 +100,12 @@ async function bootstrapApp(): Promise<void> {
   registerIpcHandlers(ipcMain, host, () => mainWindow)
 
   createWindow()
+
+  // 按设置创建托盘：开启常驻时提供「显示 / 退出」入口
+  if (host.getSettings().closeToTray) {
+    tray = createTray(resolveTrayIcon(), { showWindow, quitApp })
+  }
+
   const windowShown = new Promise<void>((resolve) => {
     mainWindow?.once('show', () => resolve())
   })
@@ -76,7 +124,7 @@ async function bootstrapApp(): Promise<void> {
     .catch(() => {})
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    showWindow()
   })
 }
 
@@ -85,13 +133,21 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+  // 开启常驻（托盘）时不退出；仅非 darwin 且未开启常驻才退出
+  if (process.platform !== 'darwin' && !host?.getSettings().closeToTray) {
     app.quit()
   }
 })
 
+// 第二实例：聚焦已存在的窗口（单实例锁兜底）
+app.on('second-instance', () => {
+  showWindow()
+})
+
 // 退出前清理宿主：停采集 → 卸载全部插件 → 关闭数据库
 app.on('before-quit', () => {
+  tray?.destroy()
+  tray = null
   host?.dispose()
   host = null
 })

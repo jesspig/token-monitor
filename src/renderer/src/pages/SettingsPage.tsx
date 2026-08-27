@@ -37,6 +37,7 @@ export default function SettingsPage(): ReactElement {
   const [dailyBudget, setDailyBudget] = useState('')
   const [monthlyBudget, setMonthlyBudget] = useState('')
   const [budgetError, setBudgetError] = useState('')
+  const [closeToTray, setCloseToTray] = useState(false)
 
   // 仅首载回填一次：后续轮询/失效返回的新 data 引用不得覆盖用户正在编辑的输入
   const hydratedRef = useRef(false)
@@ -50,6 +51,7 @@ export default function SettingsPage(): ReactElement {
     setDataDir(data.dataDir)
     setDailyBudget(data.dailyBudgetUsd != null ? String(data.dailyBudgetUsd) : '')
     setMonthlyBudget(data.monthlyBudgetUsd != null ? String(data.monthlyBudgetUsd) : '')
+    setCloseToTray(data.closeToTray ?? true)
   }, [data])
 
   async function handleSave(): Promise<void> {
@@ -68,7 +70,8 @@ export default function SettingsPage(): ReactElement {
       pricingSyncIntervalMs: Math.max(1, Number(pricingSyncMin) || 5) * 60_000,
       dataDir: dataDir.trim() || data?.dataDir || '',
       dailyBudgetUsd: daily.value,
-      monthlyBudgetUsd: monthly.value
+      monthlyBudgetUsd: monthly.value,
+      closeToTray
     }
     await api.updateSettings(payload)
     setCachedSettings(payload)
@@ -147,6 +150,18 @@ export default function SettingsPage(): ReactElement {
                 placeholder="~/.config/token-monitor"
                 className={INPUT_CLS}
               />
+            </div>
+            <div className="md:col-span-2 flex items-center gap-2">
+              <input
+                id="close-to-tray"
+                type="checkbox"
+                checked={closeToTray}
+                onChange={(e) => setCloseToTray(e.target.checked)}
+                className="h-4 w-4 rounded border-neutral-700 bg-neutral-900"
+              />
+              <label className={LABEL_CLS} htmlFor="close-to-tray">
+                关闭窗口时最小化到系统托盘（后台常驻）
+              </label>
             </div>
             <div>
               <label className={LABEL_CLS} htmlFor="daily-budget">

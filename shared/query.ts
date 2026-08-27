@@ -187,6 +187,8 @@ export interface AppSettings {
   statsRefreshIntervalMs?: number
   /** models.dev 价格自动同步间隔（ms，默认 300000） */
   pricingSyncIntervalMs?: number
+  /** 关闭窗口时最小化到系统托盘（后台常驻）；默认 true（默认值在宿主设置存储中体现，此处仅声明类型） */
+  closeToTray?: boolean
 }
 
 /**
