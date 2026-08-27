@@ -36,6 +36,13 @@ const TD = 'px-3 py-2 text-sm text-neutral-300'
 
 const MODEL_FILTER_RENDER_LIMIT = 200
 
+/** 失败错误文案表格内截断长度（详情抽屉完整展示） */
+const ERROR_PREVIEW_LEN = 64
+
+function truncateError(msg: string, len = ERROR_PREVIEW_LEN): string {
+  return msg.length > len ? `${msg.slice(0, len)}…` : msg
+}
+
 /** 关键字搜索防抖：keyword 翻译成 4 列前置通配 LIKE（无索引全表扫描），逐键即时查询会打满主进程 */
 const KEYWORD_DEBOUNCE_MS = 300
 
@@ -226,7 +233,7 @@ export default function RequestLogsPage(): ReactElement {
         />
       ) : (
         <div className="overflow-x-auto rounded-xl border border-neutral-800 bg-neutral-900/60">
-          <table className="w-full min-w-[960px] border-collapse">
+          <table className="w-full min-w-[1100px] border-collapse">
             <thead>
               <tr className="border-b border-neutral-800 bg-neutral-900">
                 <th className={TH}>时间</th>
@@ -239,6 +246,7 @@ export default function RequestLogsPage(): ReactElement {
                 <th className={TH}>费用</th>
                 <th className={TH}>耗时</th>
                 <th className={TH}>状态</th>
+                <th className={TH}>错误</th>
               </tr>
             </thead>
             <tbody>
@@ -446,7 +454,28 @@ function Row({
       <td className={`${TD} tabular-nums`}>{formatUsd(r.costUsd)}</td>
       <td className={`${TD} tabular-nums`}>{formatDuration(r.latencyMs)}</td>
       <td className={TD}>
-        <StatusBadge status={r.status} />
+        <StatusBadge status={r.status} httpStatus={r.httpStatus} />
+      </td>
+      <td className={TD}>
+        {r.status === 'error' && r.errorMessage ? (
+          <span
+            className="block max-w-[220px] truncate text-[11px] leading-normal text-neutral-400"
+            title={r.errorMessage}
+          >
+            {r.httpStatus != null ? (
+              <span className="mr-1 inline-flex rounded border border-red-500/30 bg-red-500/10 px-1 py-0.5 font-mono text-[10px] leading-none text-red-300">
+                {r.httpStatus}
+              </span>
+            ) : null}
+            {truncateError(r.errorMessage)}
+          </span>
+        ) : r.status === 'error' && r.httpStatus != null ? (
+          <span className="inline-flex rounded border border-red-500/30 bg-red-500/10 px-1.5 py-0.5 font-mono text-[10px] leading-none text-red-300">
+            {r.httpStatus}
+          </span>
+        ) : (
+          <span className="text-neutral-600">—</span>
+        )}
       </td>
     </tr>
   )
@@ -463,18 +492,27 @@ function AppBadge({ app }: { app: AppType }): ReactElement {
   )
 }
 
-/** 状态徽章：成功绿 / 失败红 */
-function StatusBadge({ status }: { status: RequestStatus }): ReactElement {
+/** 状态徽章：成功绿 / 失败红；失败时叠加 httpStatus（如 403/500），复用现有 Badge/Tag 样式 */
+function StatusBadge({
+  status,
+  httpStatus
+}: {
+  status: RequestStatus
+  httpStatus?: number | null
+}): ReactElement {
+  const isError = status === 'error'
+  const label = isError && httpStatus != null ? `失败 · ${httpStatus}` : isError ? '失败' : '成功'
   return (
     <span
       className={clsx(
-        'inline-flex items-center rounded-md border px-1.5 py-0.5 text-[11px] font-medium',
+        'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-medium',
         status === 'success'
           ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300'
           : 'border-red-500/30 bg-red-500/15 text-red-300'
       )}
+      title={isError && httpStatus != null ? `HTTP ${httpStatus}` : undefined}
     >
-      {status === 'success' ? '成功' : '失败'}
+      {label}
     </span>
   )
 }
@@ -512,7 +550,16 @@ function DetailDrawer({ record: r, onClose }: { record: RequestLogDetail; onClos
               <span className="font-mono">{r.rawModel ?? '—'}</span>
             </DetailRow>
             <DetailRow label="状态">
-              <StatusBadge status={r.status} />
+              <StatusBadge status={r.status} httpStatus={r.httpStatus} />
+            </DetailRow>
+            <DetailRow label="HTTP 状态">
+              {r.httpStatus != null ? (
+                <span className="inline-flex rounded border border-red-500/30 bg-red-500/10 px-1.5 py-0.5 font-mono text-[11px] text-red-300">
+                  {r.httpStatus}
+                </span>
+              ) : (
+                <span className="text-neutral-500">—</span>
+              )}
             </DetailRow>
             <DetailRow label="时间">
               <span className="font-mono">{formatDateTime(r.createdAt)}</span>
@@ -526,6 +573,16 @@ function DetailDrawer({ record: r, onClose }: { record: RequestLogDetail; onClos
             <DetailRow label="输入语义">
               {INPUT_SEMANTICS_LABEL[r.inputSemantics] ?? String(r.inputSemantics)}
             </DetailRow>
+          </DetailSection>
+
+          <DetailSection title="错误信息">
+            {r.errorMessage ? (
+              <p className="break-all whitespace-pre-wrap rounded-md border border-red-500/20 bg-red-500/5 p-2 font-mono text-[11px] leading-relaxed text-red-300/90">
+                {r.errorMessage}
+              </p>
+            ) : (
+              <p className="text-xs text-neutral-500">— 暂无错误信息（成功或未记录）</p>
+            )}
           </DetailSection>
 
           <DetailSection title="Token">

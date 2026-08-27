@@ -125,6 +125,21 @@ function buildRecords(): RequestLogDetail[] {
               cacheCreation * def.cacheCreationPerM) /
             1_000_000
           : null
+      // 失败样本：随机 httpStatus 与错误文案，便于前端展示层验证截断/详情
+      const HTTP_ERROR_CODES = [400, 401, 403, 404, 429, 500, 502, 503] as const
+      const ERROR_TEMPLATES = [
+        'API Error 429: rate limit exceeded, retry after 60s',
+        'API Error 500: internal server error, model overloaded',
+        'API Error 403: permission denied, check api key scope',
+        'API Error 400: invalid request, prompt too long exceeding context window limit',
+        'API Error 502: bad gateway, upstream provider unavailable transient failure'
+      ] as const
+      const httpStatus =
+        status === 'error' ? HTTP_ERROR_CODES[Math.floor(rnd() * HTTP_ERROR_CODES.length)] : null
+      const errorMessage =
+        status === 'error'
+          ? ERROR_TEMPLATES[Math.floor(rnd() * ERROR_TEMPLATES.length)]
+          : null
 
       records.push({
         id: `${app}-${dateStr}-${i}-${offset}`,
@@ -143,6 +158,8 @@ function buildRecords(): RequestLogDetail[] {
         project: rnd() < 0.6 ? projects[Math.floor(rnd() * projects.length)] : null,
         sessionId: `sess-${Math.floor(rnd() * 0xffffffff).toString(16)}`,
         status,
+        httpStatus,
+        errorMessage,
         createdAt,
         sourceFile: `.config/${app}/sessions/${dateStr}.jsonl`,
         sourceLine: 2 + Math.floor(rnd() * 800)
@@ -191,17 +208,19 @@ const DAILY = buildDaily()
 
 function filterRecords(filters: LogFilters): RequestLogDetail[] {
   const { startTime, endTime, appTypes, models, status, keyword, project, sessionId } = filters
+  const httpStatus = filters.httpStatus ?? filters.statusCode
   return ALL_RECORDS.filter((r) => {
     if (startTime != null && r.createdAt < startTime) return false
     if (endTime != null && r.createdAt > endTime) return false
     if (appTypes && appTypes.length > 0 && !appTypes.includes(r.appType)) return false
     if (models && models.length > 0 && !models.includes(r.model)) return false
     if (status && r.status !== status) return false
+    if (httpStatus != null && r.httpStatus !== httpStatus) return false
     if (project && r.project !== project) return false
     if (sessionId && r.sessionId !== sessionId) return false
     if (keyword) {
       const kw = keyword.toLowerCase()
-      const hay = `${r.model} ${r.sessionId} ${r.project ?? ''} ${r.appType}`.toLowerCase()
+      const hay = `${r.model} ${r.sessionId} ${r.project ?? ''} ${r.appType} ${r.errorMessage ?? ''} ${r.httpStatus ?? ''}`.toLowerCase()
       if (!hay.includes(kw)) return false
     }
     return true
