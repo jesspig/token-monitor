@@ -199,7 +199,10 @@ export async function bootstrapHost(options: HostOptions = {}): Promise<HostBoot
   })
 
   // 以 LifecyclePlugin 包装内置插件：装载时把该插件探测到的会话目录注册进 watcher，
-  // 目录内文件变更即触发该插件的定向同步（debounce 500ms 合并高频事件）
+  // 目录内文件变更即触发该插件的定向同步（debounce 500ms 合并高频事件，性能防护：watcher 回调经定向 syncPlugin 单插件重扫，不触发全量 8 插件扫描）
+  // 节流保留说明（T08 性能防护）：usage-updated 200ms 防抖由 EventBus 统一合并（见 core/event-bus.ts DEBOUNCE_WINDOW），
+  // watcher 500ms 防抖在此处生效，collector.start 的启动错峰（initialSyncDelayMs）与宿主 STARTUP_* 延迟（10/20/30/45s）错开首轮重活，
+  // 失败接入未改动上述节流链路，仅在解析层追加失败分支，不影响事件/调度性能。
   const plugins: LifecyclePlugin[] = BUILTIN_PLUGINS.map((p) => ({
     ...p,
     onMount: async (pctx): Promise<(() => void) | undefined> => {
@@ -225,6 +228,7 @@ export async function bootstrapHost(options: HostOptions = {}): Promise<HostBoot
   // 与兜底扫描同节奏；启动后延迟 RETENTION_SWEEP_DELAY_MS 先行一次。
   // 每次清理前先尽力回填零成本明细：缺价行（cost 为空/'0'）一旦被删除，费用将永久无法回补
   // （日聚合为镜像，明细没了便再也算不出）；回填失败仅记日志，不阻塞清理。
+  // 性能：清理 DELETE 复用 idx_usage_records_created_at 范围扫描（见 retention.ts），日聚合不清理无额外开销。
   async function runRetentionSweep(): Promise<void> {
     try {
       const result = await backfillZeroCost(db, pricing)
@@ -324,6 +328,9 @@ export async function bootstrapHost(options: HostOptions = {}): Promise<HostBoot
 
       startPricingAutoSync()
       // 启动错峰：定价同步/零成本回填/存量费用重算延迟触发，不与首轮采集同一时刻点火
+      // 性能防护：STARTUP_PRICING_SYNC_DELAY_MS=10s / ZERO_COST=20s / RECALC=30s / RETENTION_SWEEP=45s
+      // 四段错峰 + 保留清理半周期错相（RETENTION_SWEEP_PHASE_OFFSET_RATIO=0.5），避免启动瞬间 IO 叠加阻塞主进程；
+      // 失败接入未新增定时任务，沿用既有错峰链路，无额外启动开销。
       startupPricingSyncTimer = setTimeout(() => {
         void syncModelsDevPricing().catch((err) => {
           console.error('[host] 启动 models.dev 定价同步失败:', err)

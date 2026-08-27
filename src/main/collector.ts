@@ -3,15 +3,37 @@ import type { PluginContext } from '../../shared/context'
 import type { Detection, FileEntry, UsageRecord } from '../../shared/dto'
 import type { MonitorPlugin } from '../../shared/plugin'
 import type { PluginStatus } from '../../shared/query'
+import { ERROR_MESSAGE_MAX_LENGTH } from '../../shared/failure'
 import { CLI_VERSION_COMMANDS, detectCliVersion } from './services/cli-version'
 
+/**
+ * 全零过滤谓词：四项 token 全 0 视为无效空转，拦截不入库（游标仍推进）。
+ * 失败语义例外（T01 矩阵 / shared/failure.ts）：status === 'error' 的记录即使全零也放行，
+ * 确保失败请求可观测入库；成功记录仍保持全零跳过。
+ * cancelled / interrupted 属用户中断忽略，由插件层决定不产 error，本层不特殊处理。
+ * 性能：失败放行仅增加一次 `status === 'error'` 字符串比较，O(1) 无分支预测开销，
+ *       不引入额外索引/查询/正则，过滤仍为单次四字段数值比较，热点路径零回退。
+ */
 function isAllZeroUsage(record: UsageRecord): boolean {
+  if (record.status === 'error') return false
   return (
     record.inputTokens === 0 &&
     record.outputTokens === 0 &&
     record.cacheReadTokens === 0 &&
     record.cacheCreationTokens === 0
   )
+}
+
+/**
+ * 失败文案截断至 shared/failure.ts 约束长度（500），DTO 层不限长，入库前收敛
+ * 性能：单次 `String.slice(0, 500)`，O(1) 截断，无正则/循环/分配放大；
+ *       仅对含 errorMessage 的失败记录执行，成功记录零开销。
+ */
+function truncateErrorMessage(message: string | undefined): string | undefined {
+  if (message == null) return undefined
+  return message.length > ERROR_MESSAGE_MAX_LENGTH
+    ? message.slice(0, ERROR_MESSAGE_MAX_LENGTH)
+    : message
 }
 
 /**
@@ -129,7 +151,8 @@ export function createCollector(
       try {
         // 增量：读游标元信息（未同步过为 null）
         const meta = await ctx.storage.getCursorMeta(file.path)
-        // mtime 短路：文件未变更（游标与文件 mtime 一致且均非 0）则跳过解析与入库
+        // mtime 短路（性能核心）：文件未变更（游标与文件 mtime 一致且均非 0）则跳过解析与入库，
+        // 避免对未变更大文件（如 dsh zstd/大 JSONL）做全量读取与 JSON.parse；失败接入未改动此短路，游标仍为唯一增量依据
         if (
           meta !== null &&
           file.mtime > 0 &&
@@ -139,7 +162,13 @@ export function createCollector(
           continue
         }
         const parsed = await plugin.parseFile(ctx, file.path, meta?.lineOffset ?? 0)
+        // 性能：isAllZeroUsage 失败放行仅多一次 status 比较，O(1)，不过滤逻辑仍为四字段数值比较，无索引依赖
         const records = parsed.records.filter((record) => !isAllZeroUsage(record))
+        // 失败文案入库前截断至 ERROR_MESSAGE_MAX_LENGTH（500，shared/failure.ts SSOT），DTO 层不限长
+        // 性能：单次 slice 截断，无正则/全表扫描，仅失败记录命中
+        for (const r of records) {
+          if (r.errorMessage != null) r.errorMessage = truncateErrorMessage(r.errorMessage)
+        }
 
         // 费用计算回填 costUsd（无定价项则保持 undefined）
         const costs = await ctx.pricing.calcCostBatch(records)

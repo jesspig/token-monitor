@@ -28,6 +28,10 @@ export interface UsageRecordRow {
   project: string | null
   session_id: string | null
   status: RequestStatus
+  /** HTTP 状态码，仅失败时有效；成功/中断为 null */
+  http_status: number | null
+  /** 截断后的错误文案，最长 500 字符（存储层截断）；仅失败时有效 */
+  error_message: string | null
   /** 来源文件（去重 key 组成之一） */
   file_path: string
   /** 来源行号（去重 key 组成之一） */

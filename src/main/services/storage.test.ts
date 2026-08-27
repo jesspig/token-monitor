@@ -47,7 +47,7 @@ describe('数据库迁移', () => {
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(7)
+      expect(db.pragma('user_version', { simple: true })).toBe(9)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
@@ -301,7 +301,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     expect(db.pragma('user_version', { simple: true })).toBe(2)
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(7)
+    expect(db.pragma('user_version', { simple: true })).toBe(9)
 
     const zeroCount = db.prepare(`SELECT COUNT(*) AS c FROM usage_records WHERE ${ZERO_COND}`).get() as { c: number }
     expect(zeroCount.c).toBe(0)
@@ -311,10 +311,12 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
       'claude:/legacy/sessions.jsonl:4',
       'codex:/legacy/sessions.jsonl:1'
     ])
+    // v3 原语义为“游标不受影响”，但 v9 存量回溯全量 DELETE FROM sync_cursors 触发重析，
+    // migrate() 到最新版（9）后 sync_cursors 已被全量清空，故此处期望为 undefined
     const cursor = db.prepare('SELECT * FROM sync_cursors WHERE file_path = ?').get('/legacy/sessions.jsonl') as
       | SyncCursorRow
       | undefined
-    expect(cursor).toMatchObject({ data_source: 'claude', line_offset: 5 })
+    expect(cursor).toBeUndefined()
   })
 
   it('受影响日期的日聚合重建为剩余明细的真实聚合，纯脏桶移除，其他日期不动', () => {
@@ -376,7 +378,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     db.pragma('user_version = 2')
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(7)
+    expect(db.pragma('user_version', { simple: true })).toBe(9)
     expect(snapshot()).toEqual(before)
   })
 })
@@ -458,7 +460,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(7)
+      expect(db.pragma('user_version', { simple: true })).toBe(9)
       const rows = db
         .prepare('SELECT id, input_semantics FROM usage_records ORDER BY id')
         .all() as { id: string; input_semantics: number }[]
@@ -473,12 +475,12 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
     }
   })
 
-  it('全新库直接建至 v5，重复迁移幂等', () => {
+  it('全新库直接建至 v9，重复迁移幂等', () => {
     const db = createDatabase(':memory:')
     try {
       migrate(db)
       migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(7)
+      expect(db.pragma('user_version', { simple: true })).toBe(9)
     } finally {
       db.close()
     }
@@ -500,7 +502,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       db.pragma('user_version = 3')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(7)
+      expect(db.pragma('user_version', { simple: true })).toBe(9)
       expect(snapshot()).toEqual(before)
     } finally {
       db.close()
@@ -535,7 +537,9 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(7)
+      expect(db.pragma('user_version', { simple: true })).toBe(9)
+      // v5 原语义为仅清除 dsh 游标、其他保留；但 v9 存量回溯为全量 DELETE FROM sync_cursors，
+      // migrate() 到 9 后两者均被清除，故此处两者均期望为空/undefined
       const dsh = db
         .prepare('SELECT COUNT(*) AS c FROM sync_cursors WHERE file_path LIKE ?')
         .get('%\\.dsh\\sessions%') as { c: number }
@@ -543,7 +547,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
       const kept = db.prepare('SELECT * FROM sync_cursors WHERE file_path LIKE ?').get('%claude%') as
         | SyncCursorRow
         | undefined
-      expect(kept).toMatchObject({ data_source: 'claude', line_offset: 97 })
+      expect(kept).toBeUndefined()
     } finally {
       db.close()
     }
@@ -562,8 +566,11 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       db.pragma('user_version = 4')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(7)
-      expect(snapshot()).toEqual(before)
+      expect(db.pragma('user_version', { simple: true })).toBe(9)
+      // v5 原语义为幂等重跑后 snapshot 不变，但 v9 存量回溯全量清游标，
+      // 回拨到 4 再 migrate 到 9 会触发 v9 的 DELETE，故重跑后为空而非 before
+      expect(snapshot()).toEqual([])
+      expect(before).toHaveLength(1)
     } finally {
       db.close()
     }

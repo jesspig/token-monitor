@@ -13,5 +13,7 @@ export type ServiceKey = 'storage' | 'pricing' | 'events' | 'scheduler' | 'watch
 
 /**
  * 请求状态（用于请求日志的筛选与行详情展示）。
+ * - success：正常完成（含正常计费记录）
+ * - error：失败（判定矩阵见 shared/dto.ts 顶部与 shared/failure.ts；cancelled/interrupted 不计 error）
  */
 export type RequestStatus = 'success' | 'error'

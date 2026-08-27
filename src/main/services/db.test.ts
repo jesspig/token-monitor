@@ -32,12 +32,12 @@ const LEGACY_V5_SCHEMA = `
 `
 
 describe('schema 迁移', () => {
-  it('全新库迁移至最新版（v7），含部分索引；重复迁移幂等', () => {
+  it('全新库迁移至最新版（v9），含部分索引；重复迁移幂等', () => {
     const db = createDatabase(':memory:')
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(7)
+      expect(db.pragma('user_version', { simple: true })).toBe(9)
       expect(columnsOf(db, 'sync_cursors')).toContain('byte_offset')
       const indexes = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_usage_records_%'")
@@ -61,14 +61,17 @@ describe('schema 迁移', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(7)
-      const row = db.prepare('SELECT * FROM sync_cursors').get() as {
-        file_path: string
-        line_offset: number
-        byte_offset: number | null
-      }
-      expect(row).toMatchObject({ file_path: '/legacy/session.jsonl.zstd', line_offset: 7 })
-      expect(row.byte_offset).toBeNull()
+      expect(db.pragma('user_version', { simple: true })).toBe(9)
+      // v6 原语义为存量行 byte_offset 为 NULL，但 v9 存量回溯全量 DELETE FROM sync_cursors，
+      // migrate() 到 9 后该行已被清除，故期望为 undefined；索引断言仍需保留
+      const row = db.prepare('SELECT * FROM sync_cursors').get() as
+        | {
+            file_path: string
+            line_offset: number
+            byte_offset: number | null
+          }
+        | undefined
+      expect(row).toBeUndefined()
       const indexNames = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_records'")
         .all()

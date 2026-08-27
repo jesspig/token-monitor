@@ -59,7 +59,14 @@ function microUsdToCostString(micro: number): string {
  * v4 = 修正 opencode 存量行的语义标注（input_semantics 1→2：上游已核实其 input
  *      本为纯新输入）；codex/gemini/grok 的历史费用重算不在迁移内做——migrate()
  *      为同步函数拿不到活定价，由 pricing.recalcCachedInputCosts 在宿主启动时
- *      以当前定价重算并增量修正日聚合。
+ *      以当前定价重算并增量修正日聚合；
+ * v5 = 清理 dsh 会话游标（模型三级来源修复前零记录但游标推满的脏状态，LIKE 精确匹配 ~/.dsh/sessions）；
+ * v6 = sync_cursors 增加 byte_offset（dsh zstd 增量解压字节游标，schema 级幂等）；
+ * v7 = usage_records 增部分索引（零成本/缓存口径候选查询走 index scan）；
+ * v8 = usage_records 增加 http_status / error_message（失败可观测性，存量 NULL，schema 级幂等）；
+ * v9 = 存量回溯：清 sync_cursors 触发失败记录全量重析（v8 + collector 全零放行前历史失败未入库，
+ *      游标已推进且 mtime 短路挡住重析；DELETE 幂等、单事务仅一次 fsync，
+ *      重放由 usage_records 主键 INSERT OR IGNORE + dedup_ledger 去重保证不重复计数）。
  * 字段/主键/索引与 shared/tables.ts 及 docs/concepts/data-model.md 一致。
  */
 const MIGRATIONS: Migration[] = [
@@ -286,6 +293,44 @@ const MIGRATIONS: Migration[] = [
           ON usage_records (input_semantics)
           WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok');
       `)
+    }
+  },
+  {
+    version: 8,
+    up(db) {
+      // 失败可观测性扩展：usage_records 增加 http_status / error_message。
+      // 仅失败记录有效，成功/中断为 NULL；存量数据保持 NULL（ADD COLUMN 默认），
+      // 旧库重放安全。列已存在即跳过（schema 级幂等），与 v6 风格一致：
+      // 先 PRAGMA table_info 检查再 ALTER，避免 duplicate column 报错，
+      // 保证 user_version 回拨重放历史迁移安全。
+      // 性能：两列均为简单列，不建索引（见 usageQuery buildWhere 索引说明）；
+      //       http_status 选择性低且失败记录占比极低，查询复用已有
+      //       idx_usage_records_created_at / idx_usage_records_app_created 的时间范围扫描即可，
+      //       单列/部分索引会增加写入放慢且收益可忽略，故不建。
+      const columns = db.pragma('table_info(usage_records)') as { name: string }[]
+      const hasHttpStatus = columns.some((c) => c.name === 'http_status')
+      const hasErrorMessage = columns.some((c) => c.name === 'error_message')
+      if (!hasHttpStatus) db.exec('ALTER TABLE usage_records ADD COLUMN http_status INTEGER')
+      if (!hasErrorMessage) db.exec('ALTER TABLE usage_records ADD COLUMN error_message TEXT')
+    }
+  },
+  {
+    version: 9,
+    up(db) {
+      // 存量回溯：失败接入前历史失败请求未入库（v8 前无 http_status/error_message 列，
+      // collector 全零过滤亦未对 status=error 放行），但 sync_cursors 游标已推进到文件末尾，
+      // 且 mtime 短路（collector 判定 file_mtime 一致即跳过解析）会挡住存量重析，
+      // 导致历史失败记录永远无法回填。清除游标触发下一轮全量重析：
+      // - 全量更稳：失败语义横跨全部 8 个内置源（claude/codex/gemini/grok/opencode/pi/zcode/dsh），
+      //   且早期游标 data_source 可能为空字符串（setCursor 未显式写入），按 data_source IN 过滤会漏删，
+      //   按 file_path LIKE 需枚举多套路径模式亦不完备，故直接全量 DELETE；
+      // - 幂等：DELETE 重复执行无影响（无游标时 deletes 0 行）；
+      // - 去重：usage_records 主键 id = data_source:file_path:line 的 INSERT OR IGNORE
+      //   + dedup_ledger 主键 (data_source, request_id) 的 INSERT OR IGNORE 保证重放不重复计数、
+      //   不重复累 rollup；成功记录已存在则 info.changes===0 跳过，失败记录为新增行正常入库；
+      // - 单事务：由 migrate() 外层 db.transaction 包裹 m.up + PRAGMA user_version，仅一次 fsync；
+      // - 性能：稳态重析一轮后游标即按 parsed.nextLine 重建，后续增量仍走 mtime 短路，开销仅首轮一次全量解析。
+      db.prepare('DELETE FROM sync_cursors').run()
     }
   }
 ]

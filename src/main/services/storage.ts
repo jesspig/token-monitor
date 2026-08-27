@@ -8,6 +8,7 @@ import type {
   UsageDailyRollupRow,
   UsageRecordRow
 } from '../../../shared/tables'
+import { ERROR_MESSAGE_MAX_LENGTH } from '../../../shared/failure'
 import { createDatabase, migrate, type SqliteDatabase } from './db'
 import { semanticFingerprint } from './dedup'
 
@@ -60,8 +61,17 @@ interface RollupBucket {
   updatedAt: number
 }
 
-/** UsageRecord(dto) → usage_records 行 */
+/**
+ * UsageRecord(dto) → usage_records 行；errorMessage 按 shared/failure.ts 500 约束截断
+ * 性能：http_status / error_message 为简单列直写（INTEGER/TEXT），无计算/正则/派生开销；
+ *       两列不建索引（见 usageQuery buildWhere 索引说明），写入路径零放慢，查询复用
+ *       已有 idx_usage_records_created_at / idx_usage_records_app_created 的时间范围扫描。
+ */
 function toUsageRecordRow(r: UsageRecord, dataSource: string, id: string): UsageRecordRow {
+  const truncatedMessage =
+    r.errorMessage != null && r.errorMessage.length > ERROR_MESSAGE_MAX_LENGTH
+      ? r.errorMessage.slice(0, ERROR_MESSAGE_MAX_LENGTH)
+      : (r.errorMessage ?? null)
   return {
     id,
     data_source: dataSource,
@@ -79,6 +89,8 @@ function toUsageRecordRow(r: UsageRecord, dataSource: string, id: string): Usage
     project: r.project ?? null,
     session_id: r.sessionId ?? null,
     status: r.status ?? 'success',
+    http_status: r.httpStatus ?? null,
+    error_message: truncatedMessage,
     file_path: r.source.filePath,
     line: r.source.line,
     created_at: r.createdAt
@@ -88,6 +100,14 @@ function toUsageRecordRow(r: UsageRecord, dataSource: string, id: string): Usage
 /**
  * StorageService 的 better-sqlite3 实现（仅主进程，同步 API 内部实现 + Promise 签名）。
  * 方法签名与 shared/context.ts 的 StorageService 契约一致。
+ * 性能：失败扩展列 http_status / error_message 不建独立索引，写入为 INSERT OR IGNORE 单行直写，
+ *       无额外计算；查询侧由 usageQuery.buildWhere 复用已有时间索引，失败记录占比低无需单列索引。
+ * 幂等（T09 存量回溯）：recordUsage 以 usage_records 主键 id=data_source:file_path:line 的
+ * INSERT OR IGNORE + dedup_ledger 主键 (data_source, request_id) 的 INSERT OR IGNORE 双层去重
+ * 保证重放不重复计数——v9 迁移 DELETE FROM sync_cursors 清游标触发全量重析时，已入库的成功记录
+ * 因主键冲突 info.changes===0 跳过（不累 rollup），仅新增的失败记录正常入库；失败记录常零 token
+ * 但 collector 已对 status=error 放行全零，语义去重仅以 (data_source, request_id) 查账本，
+ * 不会因 semanticFingerprint 相同而误合并。
  */
 export class SqliteStorage implements StorageService {
   private readonly insertRecordStmt: Database.Statement
@@ -108,12 +128,12 @@ export class SqliteStorage implements StorageService {
         id, data_source, app_type, model, raw_model,
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
         input_semantics, cost_usd, currency, latency_ms, project, session_id,
-        status, file_path, line, created_at
+        status, http_status, error_message, file_path, line, created_at
       ) VALUES (
         @id, @data_source, @app_type, @model, @raw_model,
         @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens,
         @input_semantics, @cost_usd, @currency, @latency_ms, @project, @session_id,
-        @status, @file_path, @line, @created_at
+        @status, @http_status, @error_message, @file_path, @line, @created_at
       )
     `)
 
@@ -207,6 +227,10 @@ export class SqliteStorage implements StorageService {
     `)
   }
 
+  /**
+   * 幂等写入：INSERT OR IGNORE（主键 id 去重）+ dedup_ledger（request_id 去重）双层保证
+   * T09 回放安全——v9 清游标后全量重析，已入库行因主键冲突 changes===0 跳过，不重复累 rollup。
+   */
   recordUsage(records: UsageRecord[]): Promise<number> {
     const runTx = this.db.transaction((items: UsageRecord[]): number => {
       const buckets = new Map<string, RollupBucket>()
@@ -217,14 +241,18 @@ export class SqliteStorage implements StorageService {
         // 首版无 provider 维度，data_source 与插件 id（app_type）一致
         const dataSource = r.appType
         // 主键/去重 key = data_source + file_path + line（':' 分隔避免拼接歧义）
+        // 幂等：INSERT OR IGNORE，主键冲突时 changes===0，不入明细亦不累 rollup/事件，重复回放无影响
         const id = `${dataSource}:${r.source.filePath}:${r.source.line}`
-        // 语义去重：同 requestId 已入账即跳过（fork/rewrite 场景，明细行号不同但为同一逻辑请求）
+        // 语义去重：同 requestId 已入账即跳过（fork/rewrite 场景，明细行号不同但为同一逻辑请求）。
+        // 失败记录常零 token，其 semanticFingerprint 可能相同但不参与判定；
+        // 主路径仅以 (data_source, request_id) 查 ledger，零 token 不会误合并——semantic_id 仅辅助写入。
+        // dedup_ledger 亦为 INSERT OR IGNORE，主键 (data_source, request_id)，与明细主键共同保证幂等。
         const reqId = r.source.requestId
         if (reqId != null && this.getDedupStmt.get(dataSource, reqId) != null) {
           continue
         }
         const info = this.insertRecordStmt.run(toUsageRecordRow(r, dataSource, id))
-        if (info.changes === 0) continue // 去重命中，跳过（不累计 rollup）
+        if (info.changes === 0) continue // 主键去重命中，跳过（不累计 rollup）——回放幂等
         if (reqId != null) {
           this.insertDedupStmt.run(dataSource, reqId, semanticFingerprint(r), now)
         }

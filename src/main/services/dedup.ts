@@ -8,6 +8,8 @@ import { createHash } from 'node:crypto'
  * - 兜底：指纹预留。无 requestId 的记录退回既有 (file,line) 主键去重；
  *   semanticFingerprint 仅用于回填 ledger 的 semantic_id 列，供未来
  *   指纹级判重扩展使用，不参与当前判定。
+ * - 失败零 token 说明：失败记录 token 常为零，semanticFingerprint 可能相同但不用于去重判定；
+ *   主路径仍以 (data_source, request_id) 为准，semantic_id 仅辅助存储，零 token 不会误合并。
  */
 
 /** 语义指纹的最小入参（结构化最小类型，不强制整个 UsageRecord） */
