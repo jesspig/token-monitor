@@ -30,7 +30,7 @@ import {
 import { cleanupOldRecords } from './services/retention'
 import { schedulerService } from './services/scheduler'
 import { SqliteStorage } from './services/storage'
-import { createUsageQuery, type UsageQueryService } from './services/usageQuery'
+import { createQueryClient, type QueryClientService } from './worker/queryClient'
 import { watcherService } from './services/watcher'
 
 /**
@@ -70,7 +70,7 @@ export interface Host {
   storage: StorageService
   /** PricingServiceImpl（含 invalidateCache，IPC 更新定价后需失效缓存） */
   pricing: PricingServiceImpl
-  usageQuery: UsageQueryService
+  usageQuery: QueryClientService
   events: EventBus
   /** 阶段二（插件装载+调度注册）完成后 resolve；失败则 reject，消费方据此等待就绪 */
   ready: Promise<void>
@@ -124,7 +124,8 @@ function createSettingsStore(
     retentionDays: DEFAULT_RETENTION_DAYS,
     dataDir: dir,
     statsRefreshIntervalMs: DEFAULT_STATS_REFRESH_INTERVAL_MS,
-    pricingSyncIntervalMs: DEFAULT_PRICING_SYNC_INTERVAL_MS
+    pricingSyncIntervalMs: DEFAULT_PRICING_SYNC_INTERVAL_MS,
+    closeToTray: true
   }
   if (file) {
     try {
@@ -219,7 +220,7 @@ export async function bootstrapHost(options: HostOptions = {}): Promise<HostBoot
     }
   }))
 
-  const usageQuery = createUsageQuery(db)
+  const usageQuery = createQueryClient(dataDir, db)
   let currentSyncIntervalMs = settings.get().syncIntervalMs
   let currentPricingSyncIntervalMs = settings.get().pricingSyncIntervalMs
 
@@ -426,6 +427,7 @@ export async function bootstrapHost(options: HostOptions = {}): Promise<HostBoot
         if (lifecycle.isMounted(p.id)) lifecycle.unmount(ctx, p)
       }
       storage.close()
+      usageQuery.terminate()
     }
   }
 
