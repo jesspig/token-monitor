@@ -7,7 +7,6 @@ import { WatcherServiceImpl } from './watcher'
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms))
 
-/** 轮询等待条件成立，避免依赖固定延时造成 flaky */
 async function waitFor(cond: () => boolean, timeoutMs = 3000, stepMs = 20): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (!cond()) {
@@ -35,7 +34,6 @@ describe('WatcherServiceImpl', () => {
     let changed = 0
     disposers.push(service.registerWatcher(dir, () => { changed++ }))
 
-    // 等待 chokidar 完成初始扫描与事件监听就绪
     await sleep(300)
     writeFileSync(join(dir, 'a.jsonl'), 'line1\n')
 
@@ -55,7 +53,6 @@ describe('WatcherServiceImpl', () => {
     writeFileSync(file, '1\n')
     writeFileSync(file, '2\n')
     writeFileSync(file, '3\n')
-    // 等待 debounce 窗口完全结束
     await sleep(600)
 
     expect(changed).toBe(1)
@@ -74,7 +71,7 @@ describe('WatcherServiceImpl', () => {
     const afterFirst = changed
 
     dispose()
-    await sleep(200) // 等待 watcher 关闭
+    await sleep(200)
     writeFileSync(file, '2\n')
     writeFileSync(file, '3\n')
     await sleep(300)

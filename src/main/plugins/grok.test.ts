@@ -5,10 +5,8 @@ import fs from 'node:fs'
 import { grokPlugin, detectFromRoot, listFilesFromRoot, loadModelMap } from './grok'
 import type { PluginContext } from '../../../shared/context'
 
-/** parseFile 不使用 ctx 上的服务，测试时给个空壳即可 */
 const ctx = {} as PluginContext
 
-/** inference_done 事件行样例（字段可覆盖；noTime 时不写任何时间字段） */
 const inferenceLine = (o: {
   sessionId?: string
   sid?: unknown
@@ -34,7 +32,6 @@ const inferenceLine = (o: {
   if (o.sid !== undefined) row.sid = o.sid
   if (o.loopIndex !== undefined) (row.ctx as Record<string, unknown>).loop_index = o.loopIndex
   if (o.noTime) {
-    // 不写时间字段
   } else if (o.timestamp !== undefined || o.ts !== undefined || o.time !== undefined) {
     if (o.timestamp !== undefined) row.timestamp = o.timestamp
     if (o.ts !== undefined) row.ts = o.ts
@@ -45,11 +42,9 @@ const inferenceLine = (o: {
   return JSON.stringify(row)
 }
 
-/** summary.json 内容（current_model_id 为主字段） */
 const summaryJson = (model: string): string =>
   JSON.stringify({ current_model_id: model, version: 1, last_active_at: '2026-08-19T10:00:00+08:00' })
 
-/** 建临时 sessions 树：{ sessionId: model } */
 function makeSessions(root: string, sessions: Record<string, string>): void {
   for (const [id, model] of Object.entries(sessions)) {
     const dir = path.join(root, 'sessions', id)
@@ -62,7 +57,7 @@ let tmpDir = ''
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-plugin-'))
-  await loadModelMap(tmpDir) // 重置映射缓存，保证测试隔离
+  await loadModelMap(tmpDir)
 })
 
 afterEach(() => {
@@ -199,8 +194,8 @@ describe('parseFile unified.jsonl', () => {
     const file = path.join(tmpDir, 'logs', 'unified.jsonl')
     fs.mkdirSync(path.dirname(file), { recursive: true })
 
-    const brokenMid = '{this is broken json' // 中间损坏行
-    const trailingHalf = '{"msg":"shell.turn.inference_done","sessionId":"sess-1","ctx":{"prompt_tokens":' // 尾部半行
+    const brokenMid = '{this is broken json'
+    const trailingHalf = '{"msg":"shell.turn.inference_done","sessionId":"sess-1","ctx":{"prompt_tokens":'
     fs.writeFileSync(file, [inferenceLine(), inferenceLine(), brokenMid, trailingHalf].join('\n'), 'utf8')
 
     const res = await grokPlugin.parseFile(ctx, file, 0)
@@ -209,7 +204,6 @@ describe('parseFile unified.jsonl', () => {
     expect(res.nextLine).toBe(4)
     expect(res.eof).toBe(true)
 
-    // 尾部半行补全后，从 nextLine=4 续读只产出 line 4，不重放 line 1/2
     fs.writeFileSync(
       file,
       [
@@ -248,12 +242,10 @@ describe('parseFile unified.jsonl', () => {
     expect(res.nextLine).toBe(4)
     expect(res.eof).toBe(true)
 
-    // 未追加内容时续读：无新增
     const res2 = await grokPlugin.parseFile(ctx, file, res.nextLine)
     expect(res2.records).toHaveLength(0)
     expect(res2.eof).toBe(true)
 
-    // 追加一行后再续读：只产出该新增行
     fs.appendFileSync(file, `\n${inferenceLine({ timestamp: '2026-08-19T10:00:15+08:00' })}`, 'utf8')
     const res3 = await grokPlugin.parseFile(ctx, file, res.nextLine)
     expect(res3.records).toHaveLength(1)
@@ -319,7 +311,6 @@ describe('parseFile unified.jsonl', () => {
 })
 
 describe('parseFile requestId 组合键', () => {
-  /** 建好映射并写入单行样例，返回首条记录的 source */
   async function parseSingleSource(line: string): Promise<{ filePath: string; line: number; requestId?: string }> {
     makeSessions(tmpDir, { 'sess-1': 'grok-3-fast' })
     await loadModelMap(tmpDir)
@@ -393,7 +384,6 @@ describe('listFilesFromRoot 收集范围', () => {
     fs.writeFileSync(path.join(logDir, 'unified.jsonl'), '', 'utf8')
     fs.writeFileSync(path.join(s1, 'summary.json'), summaryJson('grok-3'), 'utf8')
     fs.writeFileSync(path.join(s2, 'summary.json'), summaryJson('grok-3-mini'), 'utf8')
-    // 过滤项：临时文件、非 summary 的 json、目录外散落文件
     fs.writeFileSync(path.join(logDir, 'unified.jsonl.tmp'), '', 'utf8')
     fs.writeFileSync(path.join(s1, 'event.jsonl'), '', 'utf8')
     fs.writeFileSync(path.join(s1, 'summary.json.tmp'), '', 'utf8')
@@ -425,16 +415,13 @@ describe('每轮同步重建模型映射（listFiles 入口）', () => {
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, inferenceLine({ sessionId: 'sess-new' }), 'utf8')
 
-    // 第一轮：sess-new 尚无 summary.json → 映射缺失，该行被静默跳过
     await grokPlugin.listFiles(ctx)
     const r1 = await grokPlugin.parseFile(ctx, file, 0)
     expect(r1.records).toHaveLength(0)
     expect(r1.nextLine).toBe(2)
 
-    // summary 新增 sess-new 映射后进入第二轮
     makeSessions(tmpDir, { 'sess-new': 'grok-4' })
 
-    // 第二轮：listFiles 无条件重建映射 → 同一 sessionId 的行正常产出
     const files = await grokPlugin.listFiles(ctx)
     expect(files.some((e) => e.path.endsWith(path.join('sessions', 'sess-new', 'summary.json')))).toBe(true)
     const r2 = await grokPlugin.parseFile(ctx, file, 0)
@@ -488,7 +475,6 @@ describe('parseFile 失败分支（T01 宽松 error 探测）', () => {
     expect(r.status).toBe('error')
     expect(r.errorMessage).toBe('rate limited')
     expect(r.httpStatus).toBe(429)
-    // tokens 保留原值（满足“全 0 或保留原 tokens”）
     expect(r.inputTokens).toBe(50)
     expect(r.outputTokens).toBe(20)
     expect(r.cacheReadTokens).toBe(5)
@@ -595,7 +581,6 @@ describe('parseFile 失败分支（T01 宽松 error 探测）', () => {
   })
 
   it('失败仍需模型映射，无映射跳过', async () => {
-    // 不建 sess-1 映射
     await loadModelMap(tmpDir)
     const file = path.join(tmpDir, 'logs', 'unified.jsonl')
     fs.mkdirSync(path.dirname(file), { recursive: true })

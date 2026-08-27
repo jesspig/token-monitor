@@ -4,7 +4,7 @@ title: 监控插件
 description: MonitorPlugin 统一接口与 8 个内置监控插件（claude/codex/opencode/gemini/grok/pi/zcode/dsh）实现清单；失败可观测性（T01 矩阵，status/errorMessage/httpStatus）。
 tags: [plugin, monitor, cli, claude, codex, opencode, gemini, grok, pi, zcode, dsh, failure-observability]
 resource: src/main/plugins/
-timestamp: 2026-08-27T02:12:00+08:00
+timestamp: 2026-08-28T02:27:00+08:00
 ---
 
 # 监控插件
@@ -53,7 +53,7 @@ interface MonitorPlugin {
 
 ## 失败判定（已实现，2026-08-27，T01 矩阵 SSOT）
 
-> 契约 SSOT：`shared/failure.ts`（常量与判定矩阵注释）与 `shared/dto.ts` 顶部矩阵注释为准，本节为面向实现的逐插件展开；`shared/failure.ts:ERROR_MESSAGE_MAX_LENGTH=500` 与 `IGNORED_FAILURE_STATUSES=['cancelled','interrupted']` 为截断与中断忽略的唯一来源。约束：`httpStatus` / `errorMessage` 仅 `status='error'` 时有效，成功/中断为 `undefined`（存储层为 `NULL`，见 [数据模型](data-model.md) v8）；`status` 缺省视为 `'success'`。
+> 契约 SSOT：`shared/failure.ts` 的 `isIgnoredFailureReason` / `IGNORED_FAILURE_STATUSES` / `ERROR_MESSAGE_MAX_LENGTH` 常量与 `shared/dto.ts` 的 `UsageRecord` / `RequestStatus` 类型（代码注释已于 2026-08-28 全部移除，知识库为唯一事实来源），本节为面向实现的逐插件展开；`shared/failure.ts` 的 `ERROR_MESSAGE_MAX_LENGTH=500` 与 `IGNORED_FAILURE_STATUSES=['cancelled','interrupted']` 为截断与中断忽略的唯一来源。约束：`httpStatus` / `errorMessage` 仅 `status='error'` 时有效，成功/中断为 `undefined`（存储层为 `NULL`，见 [数据模型](data-model.md) v8）；`status` 缺省视为 `'success'`。
 
 通用规则：HTTP 4xx/5xx、isApiErrorMessage、LLM failure、`status != completed/success` 即判 `error`；`cancelled` / `interrupted`（大小写不敏感，`isIgnoredFailureReason`）属用户中断，**忽略不计 error**——插件层不产出 error 记录，collector 不放行亦不入库，不触发失败告警与 rollup `error_count`。
 

@@ -7,7 +7,6 @@ export interface RangeSelectorProps {
   value: RangeKey
   onChange: (value: RangeKey) => void
   options: RangeOption[]
-  /** 当前自定义区间（null = 未设置）；未提供时隐藏「自定义」入口 */
   customRange?: CustomRange | null
   onCustomRangeChange?: (r: CustomRange | null) => void
 }
@@ -15,7 +14,6 @@ export interface RangeSelectorProps {
 const DATE_INPUT_CLASS =
   'min-w-0 flex-1 rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1 text-xs text-neutral-200 [color-scheme:dark] focus:border-neutral-600 focus:outline-none'
 
-/** 时间范围筛选（今日 / 7 天 / 30 天 + 可选「自定义」日期区间面板） */
 export function RangeSelector({
   value,
   onChange,
@@ -26,7 +24,6 @@ export function RangeSelector({
   const [panelOpen, setPanelOpen] = useState(false)
   const [draftStart, setDraftStart] = useState('')
   const [draftEnd, setDraftEnd] = useState('')
-  // customRange?: … | null 中 null 即「未设置」，无法与未传区分；以回调是否提供作为自定义入口开关
   const customEnabled = onCustomRangeChange !== undefined
 
   const togglePanel = (): void => {
@@ -35,7 +32,6 @@ export function RangeSelector({
     setPanelOpen((v) => !v)
   }
 
-  // 两值齐备且 start ≤ end（YYYY-MM-DD 字典序即时间序）才可应用
   const draftValid =
     draftStart !== '' && draftEnd !== '' && customRangeToMs({ start: draftStart, end: draftEnd }) !== null && draftStart <= draftEnd
 

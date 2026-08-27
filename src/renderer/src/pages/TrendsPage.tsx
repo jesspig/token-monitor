@@ -38,7 +38,6 @@ const tooltipStyle = {
 const tickStyle = { fill: '#737373', fontSize: 11 }
 const axisLineStyle = { stroke: '#262626' }
 
-/** 趋势数据点：请求 / 各类 Token / 成本（成本单位 USD） */
 interface TrendRow {
   label: string
   requestCount: number
@@ -49,13 +48,10 @@ interface TrendRow {
   cost: number
 }
 
-/** HourlyStats.hour（0–23）→ 'HH:00' 横轴标签，与原 formatHour 视觉一致 */
 function hourLabel(hour: number): string {
   return `${String(hour).padStart(2, '0')}:00`
 }
 
-/** 今日 / 24 小时：映射后端按小时分桶序列（原前端分桶已移除，不再受明细分页截断影响）；
- * 跨天窗口（≥2 个不同 dayKey）时标签带日期 'MM-DD HH:00'，单一日期维持 'HH:00' */
 function buildHourlyRows(data: HourlyStats[]): TrendRow[] {
   const rows = data ?? []
   const crossDay = new Set(rows.map((h) => h.dayKey)).size >= 2
@@ -71,7 +67,6 @@ function buildHourlyRows(data: HourlyStats[]): TrendRow[] {
   }))
 }
 
-/** 其余范围：映射按天聚合序列 */
 function buildDailyRows(data: DailyStats[]): TrendRow[] {
   return (data ?? []).map((d) => ({
     label: d.date.slice(5),
@@ -84,11 +79,9 @@ function buildDailyRows(data: DailyStats[]): TrendRow[] {
   }))
 }
 
-/** 趋势页：请求 / Token / 成本 时间趋势（今日与 24 小时按小时，其余按天） */
 export default function TrendsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('7d')
   const [customRange, setCustomRange] = useState<CustomRange | null>(null)
-  // custom 且区间合法时按自定义毫秒区间查询，否则回退既有五档（custom 无区间时 rangeToFilters 内部回退 7 天）
   const filters = useMemo(() => {
     if (range === 'custom' && customRange) {
       return rangeToFilters('custom', customRangeToMs(customRange) ?? {})
@@ -96,8 +89,6 @@ export default function TrendsPage(): ReactElement {
     return rangeToFilters(range)
   }, [range, customRange])
   const dailyQuery = useDailyTrends(filters)
-  // 今日小时趋势改由后端分桶（原 pageSize:500 明细截断问题随之消除）；
-  // queryKey 复用 daily-trends 一级前缀，纳入既有 usage-updated 失效清单
   const hourlyQuery = useQuery({
     queryKey: ['daily-trends', 'hourly', filters],
     queryFn: () => api.getHourlyTrends(filters),

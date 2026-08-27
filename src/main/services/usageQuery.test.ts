@@ -6,16 +6,9 @@ import { cleanupOldRecords } from './retention'
 import { SqliteStorage } from './storage'
 import { createUsageQuery, FILTER_OPTIONS_LIMIT, type UsageQueryService } from './usageQuery'
 
-/**
- * 用量查询服务单测：直接向 :memory: 库写入 usage_records 构造数据（不经过 recordUsage，
- * 隔离 query 层自身逻辑），聚合断言前用 refreshRollups 从明细重建日聚合镜像
- * （等价 storage.recordUsage 实时维护的结果）；另设 describe 走真实 recordUsage 写入路径，
- * 覆盖「清理后历史趋势仍可查」、rollup 路径聚合正确性与 project/status/keyword 回退明细。
- */
 
 const DAY_MS = 86_400_000
 
-/** epoch ms → YYYY-MM-DD（本地时区），与 storage.ts / usageQuery.ts 的日期口径一致 */
 function toDateKey(ms: number): string {
   const d = new Date(ms)
   const y = d.getFullYear()
@@ -36,7 +29,6 @@ function fromMicroUsd(micro: number): string {
   return (micro / MICRO_PER_USD).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0'
 }
 
-/** 单个 (date, app_type, model) 桶的累计器（与 storage.ts 的 RollupBucket 同构） */
 interface RollupBucket {
   date: string
   appType: string
@@ -52,10 +44,6 @@ interface RollupBucket {
   latencyMsTotal: number
 }
 
-/**
- * 测试辅助：按 storage.recordUsage 同款桶逻辑，从 usage_records 全量重建 usage_daily_rollups
- * （本地日归桶 / success+error 计数 / 微美元费用 / latency_ms_total 含 NULL 计 0）。
- */
 function refreshRollups(db: SqliteDatabase): void {
   const rows = db.prepare('SELECT * FROM usage_records').all() as UsageRecordRow[]
   const buckets = new Map<string, RollupBucket>()
@@ -122,7 +110,89 @@ function refreshRollups(db: SqliteDatabase): void {
   }
 }
 
-/** 构造一条 usage_records 行并直接写入，返回行 id */
+interface HourlyBucket {
+  date: string
+  hour: number
+  appType: string
+  model: string
+  requestCount: number
+  successCount: number
+  errorCount: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  costMicroUsd: number
+  latencyMsTotal: number
+}
+
+function refreshHourlyRollups(db: SqliteDatabase): void {
+  const rows = db.prepare('SELECT * FROM usage_records').all() as UsageRecordRow[]
+  const buckets = new Map<string, HourlyBucket>()
+  for (const r of rows) {
+    const date = toDateKey(r.created_at)
+    const hour = new Date(r.created_at).getHours()
+    const key = `${r.app_type}\u0000${date}\u0000${hour}\u0000${r.model}`
+    let b = buckets.get(key)
+    if (!b) {
+      b = {
+        date,
+        hour,
+        appType: r.app_type,
+        model: r.model,
+        requestCount: 0,
+        successCount: 0,
+        errorCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        costMicroUsd: 0,
+        latencyMsTotal: 0
+      }
+      buckets.set(key, b)
+    }
+    b.requestCount++
+    if (r.status === 'error') b.errorCount++
+    else b.successCount++
+    b.inputTokens += r.input_tokens
+    b.outputTokens += r.output_tokens
+    b.cacheReadTokens += r.cache_read_tokens
+    b.cacheCreationTokens += r.cache_creation_tokens
+    b.costMicroUsd += toMicroUsd(r.cost_usd)
+    b.latencyMsTotal += r.latency_ms ?? 0
+  }
+
+  db.prepare('DELETE FROM usage_hourly_rollups').run()
+  const insertH = db.prepare(`
+    INSERT INTO usage_hourly_rollups (
+      date, hour, app_type, model, request_count, success_count, error_count,
+      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, latency_ms_total, updated_at
+    ) VALUES (
+      @date, @hour, @app_type, @model, @request_count, @success_count, @error_count,
+      @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens, @cost_usd, @latency_ms_total, @updated_at
+    )
+  `)
+  for (const b of buckets.values()) {
+    insertH.run({
+      date: b.date,
+      hour: b.hour,
+      app_type: b.appType,
+      model: b.model,
+      request_count: b.requestCount,
+      success_count: b.successCount,
+      error_count: b.errorCount,
+      input_tokens: b.inputTokens,
+      output_tokens: b.outputTokens,
+      cache_read_tokens: b.cacheReadTokens,
+      cache_creation_tokens: b.cacheCreationTokens,
+      cost_usd: fromMicroUsd(b.costMicroUsd),
+      latency_ms_total: b.latencyMsTotal,
+      updated_at: Date.now()
+    })
+  }
+}
+
 function insert(db: SqliteDatabase, overrides: Partial<UsageRecordRow> = {}): string {
   const row: UsageRecordRow = {
     id: `t:${Math.random().toString(36).slice(2)}`,
@@ -164,21 +234,12 @@ function insert(db: SqliteDatabase, overrides: Partial<UsageRecordRow> = {}): st
   return row.id
 }
 
-/** 内存库 + 迁移 + 查询服务实例，返回可直查的 db 句柄 */
 function makeQuery(): { query: UsageQueryService; db: SqliteDatabase } {
   const db = createDatabase(':memory:')
   migrate(db)
   return { query: createUsageQuery(db), db }
 }
 
-/**
- * 标准数据集（5 条，跨 2 天 / 3 app / 3 模型）：
- * A   claude  claude-sonnet-4  success 08-18 10:00  in100  out50  cr20  cc10  $0.001  lat800  proj=alpha  sess-a
- * B   claude  claude-sonnet-4  error   08-18 12:00  in200  out100 cr0   cc0   cost=null lat=null
- * C   codex   gpt-5            success 08-19 09:00  in10   out20  cr5   cc2   $0.010000 lat100
- * D   codex   gpt-5            success 08-19 10:00  in30   out40  cr5   cc3   $0.020000 lat200 proj=alpha sess-abc
- * E   gemini  gemini-2.5-pro   success 08-19 11:00  in1000 out500 cr400 cc100 $0.005    lat300 proj=beta  sess-x
- */
 function seed(db: SqliteDatabase): void {
   const d1a = new Date('2026-08-18T10:00:00+08:00').getTime()
   const d1b = new Date('2026-08-18T12:00:00+08:00').getTime()
@@ -271,7 +332,6 @@ function seed(db: SqliteDatabase): void {
     created_at: d2c
   })
 
-  // 聚合查询走 usage_daily_rollups：从已插明细重建日聚合镜像（等价 recordUsage 维护结果）
   refreshRollups(db)
 }
 
@@ -325,7 +385,6 @@ describe('getUsageSummary', () => {
     seed(db)
     const start = new Date('2026-08-19T09:30:00+08:00').getTime()
     const s = await query.getUsageSummary({ startTime: start })
-    // 日粒度下推：start 所在日 2026-08-19 全天计入 → C、D、E 三条（含 09:30 前的 C）
     expect(s.totalRequests).toBe(3)
     expect(s.totalCost).toBe('0.035')
     expect(s.inputTokens).toBe(1040)
@@ -391,14 +450,11 @@ describe('getDailyTrends', () => {
 })
 
 describe('getHourlyTrends', () => {
-  /** 与实现同口径的期望桶号：本地时区小时（断言不绑定机器时区） */
   function toHour(ms: number): number {
     return new Date(ms).getHours()
   }
 
   it('跨小时多条记录分桶正确，费用微美元聚合并格式化', async () => {
-    // Arrange：同一本地日的 09 / 10 / 23 点共 4 条（10 点桶两条，含 error 与无费用记录）；
-    // 相邻时刻相差 ≥1 小时，任意时区下均不落同桶，期望桶号按运行时区动态推导
     const { query, db } = makeQuery()
     const t9 = new Date('2026-08-19T09:00:00+08:00').getTime()
     const t10 = new Date('2026-08-19T10:00:00+08:00').getTime()
@@ -441,12 +497,12 @@ describe('getHourlyTrends', () => {
       file_path: '/sessions/gemini/h.jsonl'
     })
 
+    refreshHourlyRollups(db)
     const hourly = await query.getHourlyTrends({
       startTime: new Date('2026-08-19T00:00:00+08:00').getTime(),
       endTime: new Date('2026-08-19T23:59:59+08:00').getTime()
     })
 
-    // Assert：恰好 3 个桶且按 hour 升序
     const expectedHours = [toHour(t9), toHour(t10), toHour(t23)].sort((a, b) => a - b)
     expect(hourly.map((h) => h.hour)).toEqual(expectedHours)
 
@@ -461,7 +517,6 @@ describe('getHourlyTrends', () => {
       successCount: 1,
       errorCount: 0
     })
-    // 同桶两条聚合：'0.02' + null 费用 → '0.02'；success / error 分别计数
     expect(byHour.get(toHour(t10))).toMatchObject({
       requestCount: 2,
       inputTokens: 230,
@@ -486,10 +541,10 @@ describe('getHourlyTrends', () => {
 
   it('本地时区边界：23 点的记录归入 23 桶', async () => {
     const { query, db } = makeQuery()
-    // 本地 Date 构造器直接指定本地 23:59，与 strftime localtime 归桶口径天然一致
     const day = new Date(2026, 7, 19)
     insert(db, { id: 'LATE', created_at: day.getTime() + 23 * 3_600_000 + 59 * 60_000 })
 
+    refreshHourlyRollups(db)
     const hourly = await query.getHourlyTrends({
       startTime: day.getTime(),
       endTime: day.getTime() + 24 * 3_600_000 - 1
@@ -500,12 +555,12 @@ describe('getHourlyTrends', () => {
 
   it('跨天滚动窗口：不同日期同钟点分属两个独立桶（dayKey 区分）', async () => {
     const { query, db } = makeQuery()
-    // 本地 Date 构造器直接指定两天各自的 09:08，模拟 24h 滚动窗口横跨两个自然日
     const yesterday = new Date(2026, 7, 18, 9, 8).getTime()
     const today = new Date(2026, 7, 19, 9, 8).getTime()
     insert(db, { id: 'D1H9', created_at: yesterday })
     insert(db, { id: 'D2H9', created_at: today })
 
+    refreshHourlyRollups(db)
     const hourly = await query.getHourlyTrends({ startTime: yesterday, endTime: today })
 
     expect(hourly).toHaveLength(2)
@@ -518,9 +573,9 @@ describe('getHourlyTrends', () => {
   it('filters 时间范围生效：范围外记录不入桶', async () => {
     const { query, db } = makeQuery()
     seed(db)
-    // 仅覆盖 08-18 全天：命中 A（10 点）、B（12 点），排除 08-19 的 C/D/E
     const start = new Date('2026-08-18T00:00:00+08:00').getTime()
     const end = new Date('2026-08-18T23:59:59+08:00').getTime()
+    refreshHourlyRollups(db)
     const hourly = await query.getHourlyTrends({ startTime: start, endTime: end })
 
     const d1a = new Date('2026-08-18T10:00:00+08:00').getTime()
@@ -532,13 +587,126 @@ describe('getHourlyTrends', () => {
 
   it('默认限定今天：历史记录被过滤，当日记录可见', async () => {
     const { query, db } = makeQuery()
-    seed(db) // 全部为 08-18/08-19 历史数据
+    seed(db)
     expect(await query.getHourlyTrends({})).toEqual([])
 
     insert(db, { id: 'NOW', created_at: Date.now(), file_path: '/s/now.jsonl', line: 9 })
+    refreshHourlyRollups(db)
     const hourly = await query.getHourlyTrends({})
     expect(hourly).toHaveLength(1)
     expect(hourly[0]).toMatchObject({ hour: toHour(Date.now()), requestCount: 1 })
+  })
+
+  it('物化路径：经 recordUsage 写入后读 usage_hourly_rollups，按 (dayKey,hour) 桶与手工聚合一致', async () => {
+    const { storage, query, db } = makeStorageAndQuery()
+    const startOfToday = new Date()
+    startOfToday.setHours(0, 0, 0, 0)
+    const startTime = startOfToday.getTime()
+    const endTime = Date.now()
+    const atHour = (h: number, o: Partial<UsageRecord> = {}): UsageRecord =>
+      makeRecord({ createdAt: startOfToday.getTime() + h * 3_600_000 + 30 * 60_000, ...o })
+
+    await storage.recordUsage([
+      atHour(8, { source: { filePath: '/s/a.jsonl', line: 1 } }),
+      atHour(8, {
+        inputTokens: 30,
+        outputTokens: 40,
+        cacheReadTokens: 5,
+        cacheCreationTokens: 3,
+        costUsd: '0.02',
+        source: { filePath: '/s/a.jsonl', line: 2 }
+      }),
+      atHour(15, {
+        status: 'error',
+        inputTokens: 5,
+        outputTokens: 5,
+        costUsd: '0.003',
+        source: { filePath: '/s/b.jsonl', line: 1 }
+      })
+    ])
+
+    const hourly = await query.getHourlyTrends({ startTime, endTime })
+    const byHour = new Map(hourly.map((h) => [h.hour, h]))
+
+    expect(byHour.get(8)).toMatchObject({
+      requestCount: 2,
+      successCount: 2,
+      errorCount: 0,
+      inputTokens: 130,
+      outputTokens: 90,
+      cacheReadTokens: 25,
+      cacheCreationTokens: 13,
+      costUsd: '0.021'
+    })
+    expect(byHour.get(15)).toMatchObject({
+      requestCount: 1,
+      successCount: 0,
+      errorCount: 1,
+      inputTokens: 5,
+      outputTokens: 5,
+      costUsd: '0.003'
+    })
+    expect(hourly.reduce((n, h) => n + h.requestCount, 0)).toBe(3)
+
+    const rollupRows = db
+      .prepare('SELECT COUNT(*) AS c FROM usage_hourly_rollups')
+      .get() as { c: number }
+    expect(rollupRows.c).toBeGreaterThanOrEqual(2)
+  })
+
+  it('回退路径：带 status 维度筛选时回退 usage_records 全扫，error 桶计数正确且不混入 success', async () => {
+    const { storage, query } = makeStorageAndQuery()
+    const startOfToday = new Date()
+    startOfToday.setHours(0, 0, 0, 0)
+    const startTime = startOfToday.getTime()
+    const endTime = Date.now()
+    const atHour = (h: number, o: Partial<UsageRecord> = {}): UsageRecord =>
+      makeRecord({ createdAt: startOfToday.getTime() + h * 3_600_000 + 30 * 60_000, ...o })
+
+    await storage.recordUsage([
+      atHour(8, {
+        status: 'error',
+        inputTokens: 1,
+        outputTokens: 1,
+        costUsd: '0.001',
+        source: { filePath: '/s/e.jsonl', line: 1 }
+      }),
+      atHour(8, {
+        status: 'success',
+        inputTokens: 10,
+        outputTokens: 10,
+        costUsd: '0.002',
+        source: { filePath: '/s/s.jsonl', line: 1 }
+      }),
+      atHour(9, {
+        status: 'error',
+        inputTokens: 2,
+        outputTokens: 2,
+        costUsd: '0.001',
+        source: { filePath: '/s/e.jsonl', line: 2 }
+      })
+    ])
+
+    const errorOnly = await query.getHourlyTrends({ status: 'error', startTime, endTime })
+    const eByHour = new Map(errorOnly.map((h) => [h.hour, h]))
+    expect(eByHour.get(8)).toMatchObject({
+      requestCount: 1,
+      successCount: 0,
+      errorCount: 1,
+      inputTokens: 1,
+      outputTokens: 1
+    })
+    expect(eByHour.get(9)).toMatchObject({
+      requestCount: 1,
+      successCount: 0,
+      errorCount: 1,
+      inputTokens: 2,
+      outputTokens: 2
+    })
+
+    const all = await query.getHourlyTrends({ startTime, endTime })
+    const aByHour = new Map(all.map((h) => [h.hour, h]))
+    expect(aByHour.get(8)).toMatchObject({ requestCount: 2, successCount: 1, errorCount: 1 })
   })
 })
 
@@ -558,7 +726,7 @@ describe('getModelStats', () => {
       cacheReadTokens: 20,
       cacheCreationTokens: 10,
       costUsd: '0.001',
-      avgLatencyMs: 400, // rollup 口径：latency_ms_total/request_count = (800+0)/2，B 的 null 计 0
+      avgLatencyMs: 400,
       successRate: 0.5
     })
     const gpt5 = stats[1]
@@ -643,7 +811,7 @@ describe('getRequestLogs', () => {
     seed(db)
 
     const byProject = await query.getRequestLogs({ keyword: 'alpha' })
-    expect(byProject.total).toBe(2) // A、D
+    expect(byProject.total).toBe(2)
     expect(byProject.items.map((r) => r.id)).toEqual(['D', 'A'])
 
     const bySession = await query.getRequestLogs({ keyword: 'sess-abc' })
@@ -700,7 +868,6 @@ describe('getRequestLogDetail', () => {
   })
 })
 
-/** 构造一条经 recordUsage 写入的测试用量记录（默认 1 天前） */
 function makeRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
   return {
     appType: 'claude',
@@ -724,7 +891,6 @@ function countRows(db: SqliteDatabase, table: string): number {
   return (db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c
 }
 
-/** 内存库 + 迁移 + 真实写入存储 + 查询服务 */
 function makeStorageAndQuery(): {
   storage: SqliteStorage
   query: UsageQueryService
@@ -738,7 +904,6 @@ function makeStorageAndQuery(): {
 
 describe('聚合查询数据源切换（rollups 镜像与明细回退）', () => {
   it('清理后历史趋势仍可查：91 天前明细被删，日聚合保留且聚合查询可见', async () => {
-    // Arrange：经 recordUsage 写入一条 91 天前的记录（同步维护对应日聚合桶）
     const { storage, query, db } = makeStorageAndQuery()
     const oldCreatedAt = Date.now() - 91 * DAY_MS
     await storage.recordUsage([
@@ -746,10 +911,8 @@ describe('聚合查询数据源切换（rollups 镜像与明细回退）', () =>
     ])
     expect(countRows(db, 'usage_records')).toBe(1)
 
-    // Act：90 天保留策略清理过期明细
     expect(cleanupOldRecords(db, 90)).toBe(1)
 
-    // Assert：明细已删，但 rollup 未清理，聚合查询仍返回该日期数据
     expect(countRows(db, 'usage_records')).toBe(0)
     expect(countRows(db, 'usage_daily_rollups')).toBe(1)
     const daily = await query.getDailyTrends({})
@@ -763,7 +926,6 @@ describe('聚合查询数据源切换（rollups 镜像与明细回退）', () =>
   })
 
   it('经 recordUsage 写入后，rollup 路径聚合结果正确（计数/token/费用/成功率/均延迟）', async () => {
-    // Arrange：同一天 3 条记录、2 个模型（含 error 与无费用记录）
     const { storage, query } = makeStorageAndQuery()
     const t1 = Date.now() - DAY_MS
     await storage.recordUsage([
@@ -793,7 +955,6 @@ describe('聚合查询数据源切换（rollups 镜像与明细回退）', () =>
       })
     ])
 
-    // Assert 汇总：in310 out170 cr25 cc12 费用 0.001+0.01=0.011 成功率 2/3
     const s = await query.getUsageSummary({})
     expect(s.totalRequests).toBe(3)
     expect(s.successCount).toBe(2)
@@ -807,7 +968,6 @@ describe('聚合查询数据源切换（rollups 镜像与明细回退）', () =>
     expect(s.cacheHitRate).toBeCloseTo(25 / (310 + 25), 10)
     expect(s.successRate).toBeCloseTo(2 / 3, 10)
 
-    // Assert 按天趋势：单日一桶
     const daily = await query.getDailyTrends({})
     expect(daily).toHaveLength(1)
     expect(daily[0]).toMatchObject({
@@ -822,7 +982,6 @@ describe('聚合查询数据源切换（rollups 镜像与明细回退）', () =>
       costUsd: '0.011'
     })
 
-    // Assert 按模型：均延迟 = latency_ms_total/request_count（800+400)/2=600；成功率 1/2
     const stats = await query.getModelStats({})
     expect(stats.map((m) => m.model)).toEqual(['claude-sonnet-4', 'gpt-5'])
     expect(stats[0]).toMatchObject({
@@ -844,7 +1003,6 @@ describe('聚合查询数据源切换（rollups 镜像与明细回退）', () =>
       successRate: 1
     })
 
-    // Assert 按应用
     const apps = await query.getAppStats({})
     expect(apps.map((a) => a.appType)).toEqual(['claude', 'codex'])
     expect(apps[0].requestCount).toBe(2)
@@ -854,7 +1012,6 @@ describe('聚合查询数据源切换（rollups 镜像与明细回退）', () =>
   })
 
   it('project/status/sessionId/keyword 过滤时回退明细表：清空 rollups 后仍能查出正确结果', async () => {
-    // Arrange：2 条记录后清空 rollup 表 —— 可下推查询归零，带不支持维度的查询必须命中明细
     const { storage, query, db } = makeStorageAndQuery()
     const t1 = Date.now() - DAY_MS
     await storage.recordUsage([
@@ -873,10 +1030,8 @@ describe('聚合查询数据源切换（rollups 镜像与明细回退）', () =>
     ])
     db.prepare('DELETE FROM usage_daily_rollups').run()
 
-    // 反证：无维度筛选走 rollup 路径，此时应为 0
     expect((await query.getUsageSummary({})).totalRequests).toBe(0)
 
-    // Act + Assert：各不可下推维度均回退明细表并返回正确结果
     expect((await query.getUsageSummary({ project: 'alpha' })).totalRequests).toBe(1)
     expect((await query.getUsageSummary({ status: 'error' })).totalRequests).toBe(1)
     const models = await query.getModelStats({ sessionId: 'sess-a' })
@@ -893,8 +1048,7 @@ describe('聚合查询数据源切换（rollups 镜像与明细回退）', () =>
 describe('getFilterOptions', () => {
   it('distinct 去重、排除 null 与空串、升序返回', async () => {
     const { query, db } = makeQuery()
-    seed(db) // 标准数据集已含重复模型（claude-sonnet-4 ×2、gpt-5 ×2）与重复项目（alpha ×2）、null 项目（B、C）
-    // 追加空串项目：必须被排除
+    seed(db)
     insert(db, { id: 'F', model: 'claude-sonnet-4', project: '', file_path: '/s/f.jsonl', line: 3 })
 
     const opts = await query.getFilterOptions()
@@ -905,7 +1059,6 @@ describe('getFilterOptions', () => {
   it('各维度超过上限时截断为前 FILTER_OPTIONS_LIMIT 个（升序）', async () => {
     const { query, db } = makeQuery()
     for (let i = 0; i < FILTER_OPTIONS_LIMIT + 5; i++) {
-      // 定长补零保证字典序 = 数值序，截断结果确定
       const tag = String(i).padStart(4, '0')
       insert(db, {
         id: `X${tag}`,

@@ -5,7 +5,6 @@ function columnsOf(db: SqliteDatabase, table: string): string[] {
   return (db.pragma(`table_info(${table})`) as { name: string }[]).map((c) => c.name)
 }
 
-/** v5 存量库的最小表结构：sync_cursors（无 byte_offset 列）+ usage_records（后续索引类迁移依赖） */
 const LEGACY_V5_SCHEMA = `
   CREATE TABLE sync_cursors (
     file_path   TEXT    NOT NULL PRIMARY KEY,
@@ -19,12 +18,18 @@ const LEGACY_V5_SCHEMA = `
     data_source           TEXT    NOT NULL,
     app_type              TEXT    NOT NULL,
     model                 TEXT    NOT NULL,
+    raw_model             TEXT,
     input_tokens          INTEGER NOT NULL DEFAULT 0,
     output_tokens         INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
     input_semantics       INTEGER NOT NULL DEFAULT 0,
     cost_usd              TEXT,
+    currency              TEXT,
+    latency_ms            INTEGER,
+    project               TEXT,
+    session_id            TEXT,
+    status                TEXT    NOT NULL DEFAULT 'success',
     file_path             TEXT    NOT NULL,
     line                  INTEGER NOT NULL,
     created_at            INTEGER NOT NULL
@@ -37,7 +42,7 @@ describe('schema 迁移', () => {
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(9)
+      expect(db.pragma('user_version', { simple: true })).toBe(10)
       expect(columnsOf(db, 'sync_cursors')).toContain('byte_offset')
       const indexes = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_usage_records_%'")
@@ -61,9 +66,7 @@ describe('schema 迁移', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(9)
-      // v6 原语义为存量行 byte_offset 为 NULL，但 v9 存量回溯全量 DELETE FROM sync_cursors，
-      // migrate() 到 9 后该行已被清除，故期望为 undefined；索引断言仍需保留
+      expect(db.pragma('user_version', { simple: true })).toBe(10)
       const row = db.prepare('SELECT * FROM sync_cursors').get() as
         | {
             file_path: string
@@ -78,6 +81,15 @@ describe('schema 迁移', () => {
         .map((r) => (r as { name: string }).name)
       expect(indexNames).toContain('idx_usage_records_zero_cost')
       expect(indexNames).toContain('idx_usage_records_cached_input')
+      expect(indexNames).toContain('idx_usage_records_status')
+      expect(indexNames).toContain('idx_usage_records_project')
+      expect(indexNames).toContain('idx_usage_records_session_id')
+      const hourlyIndexes = (
+        db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_hourly_rollups'")
+          .all() as { name: string }[]
+      ).map((r) => r.name)
+      expect(hourlyIndexes).toContain('idx_usage_hourly_rollups_date')
     } finally {
       db.close()
     }

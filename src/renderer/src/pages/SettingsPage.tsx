@@ -12,10 +12,6 @@ const INPUT_CLS =
   'w-full rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-neutral-600 focus:outline-none'
 const LABEL_CLS = 'mb-1 block text-xs font-medium text-neutral-400'
 
-/**
- * 预算输入解析：空串 → null（不启用）；非法（非数值/负数）返回错误信息；合法返回数值。
- * 0 视为合法值，语义与 null 一致（不启用告警）。
- */
 function parseBudgetInput(raw: string): { value: number | null; error: string | null } {
   const text = raw.trim()
   if (text === '') return { value: null, error: null }
@@ -24,7 +20,6 @@ function parseBudgetInput(raw: string): { value: number | null; error: string | 
   return { value: n, error: null }
 }
 
-/** 设置页：同步间隔 / 数据保留策略 / 数据目录 / 预算上限 */
 export default function SettingsPage(): ReactElement {
   const { data, isLoading } = useSettings()
   const qc = useQueryClient()
@@ -37,8 +32,8 @@ export default function SettingsPage(): ReactElement {
   const [dailyBudget, setDailyBudget] = useState('')
   const [monthlyBudget, setMonthlyBudget] = useState('')
   const [budgetError, setBudgetError] = useState('')
+  const [closeToTray, setCloseToTray] = useState(false)
 
-  // 仅首载回填一次：后续轮询/失效返回的新 data 引用不得覆盖用户正在编辑的输入
   const hydratedRef = useRef(false)
   useEffect(() => {
     if (!data || hydratedRef.current) return
@@ -50,6 +45,7 @@ export default function SettingsPage(): ReactElement {
     setDataDir(data.dataDir)
     setDailyBudget(data.dailyBudgetUsd != null ? String(data.dailyBudgetUsd) : '')
     setMonthlyBudget(data.monthlyBudgetUsd != null ? String(data.monthlyBudgetUsd) : '')
+    setCloseToTray(data.closeToTray ?? true)
   }, [data])
 
   async function handleSave(): Promise<void> {
@@ -68,7 +64,8 @@ export default function SettingsPage(): ReactElement {
       pricingSyncIntervalMs: Math.max(1, Number(pricingSyncMin) || 5) * 60_000,
       dataDir: dataDir.trim() || data?.dataDir || '',
       dailyBudgetUsd: daily.value,
-      monthlyBudgetUsd: monthly.value
+      monthlyBudgetUsd: monthly.value,
+      closeToTray
     }
     await api.updateSettings(payload)
     setCachedSettings(payload)
@@ -147,6 +144,18 @@ export default function SettingsPage(): ReactElement {
                 placeholder="~/.config/token-monitor"
                 className={INPUT_CLS}
               />
+            </div>
+            <div className="md:col-span-2 flex items-center gap-2">
+              <input
+                id="close-to-tray"
+                type="checkbox"
+                checked={closeToTray}
+                onChange={(e) => setCloseToTray(e.target.checked)}
+                className="h-4 w-4 rounded border-neutral-700 bg-neutral-900"
+              />
+              <label className={LABEL_CLS} htmlFor="close-to-tray">
+                关闭窗口时最小化到系统托盘（后台常驻）
+              </label>
             </div>
             <div>
               <label className={LABEL_CLS} htmlFor="daily-budget">

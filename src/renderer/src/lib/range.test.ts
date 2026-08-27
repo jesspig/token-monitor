@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DAY_MS, customRangeToMs, rangeToFilters } from './range'
 
-// 固定系统时刻：本地 2026-08-15 12:00:00
 const NOW = new Date(2026, 7, 15, 12, 0, 0).getTime()
 
 beforeEach(() => {

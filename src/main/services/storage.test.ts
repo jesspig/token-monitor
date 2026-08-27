@@ -13,7 +13,6 @@ import { createDatabase, migrate, type SqliteDatabase } from './db'
 import { SqliteStorage, openStorage } from './storage'
 import { semanticFingerprint } from './dedup'
 
-/** 构造一条可复用的测试用量记录 */
 function makeRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
   return {
     appType: 'claude',
@@ -33,7 +32,6 @@ function makeRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
   }
 }
 
-/** 内存库 + 迁移 + 存储实例，返回可直查的 db 句柄 */
 function makeStorage(): { storage: StorageService; db: SqliteDatabase } {
   const db = createDatabase(':memory:')
   migrate(db)
@@ -46,8 +44,8 @@ describe('数据库迁移', () => {
     const db = createDatabase(dir)
     try {
       migrate(db)
-      migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(9)
+      migrate(db)
+      expect(db.pragma('user_version', { simple: true })).toBe(10)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
@@ -60,6 +58,7 @@ describe('数据库迁移', () => {
         'model_pricing',
         'sync_cursors',
         'usage_daily_rollups',
+        'usage_hourly_rollups',
         'usage_records'
       ])
     } finally {
@@ -182,7 +181,6 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
     })
   }
 
-  /** 已应用 v2 的库（回拨 user_version），插入存量数据后 migrate 即触发 v3 */
   function makeDirtyV2Db(): SqliteDatabase {
     const db = createDatabase(':memory:')
     migrate(db)
@@ -243,7 +241,6 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
       latency_ms: 200,
       created_at: DAY_20 + 3_600_000
     })
-    // 污染的日聚合：request_count 含脏行、gemini 为纯脏桶
     insertLegacyRollup(db, {
       date: DAY_19_KEY,
       app_type: 'claude',
@@ -301,7 +298,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     expect(db.pragma('user_version', { simple: true })).toBe(2)
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(9)
+    expect(db.pragma('user_version', { simple: true })).toBe(10)
 
     const zeroCount = db.prepare(`SELECT COUNT(*) AS c FROM usage_records WHERE ${ZERO_COND}`).get() as { c: number }
     expect(zeroCount.c).toBe(0)
@@ -311,8 +308,6 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
       'claude:/legacy/sessions.jsonl:4',
       'codex:/legacy/sessions.jsonl:1'
     ])
-    // v3 原语义为“游标不受影响”，但 v9 存量回溯全量 DELETE FROM sync_cursors 触发重析，
-    // migrate() 到最新版（9）后 sync_cursors 已被全量清空，故此处期望为 undefined
     const cursor = db.prepare('SELECT * FROM sync_cursors WHERE file_path = ?').get('/legacy/sessions.jsonl') as
       | SyncCursorRow
       | undefined
@@ -378,7 +373,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     db.pragma('user_version = 2')
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(9)
+    expect(db.pragma('user_version', { simple: true })).toBe(10)
     expect(snapshot()).toEqual(before)
   })
 })
@@ -421,7 +416,6 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
     })
   }
 
-  /** 已应用 v3 的库（回拨 user_version），插入存量数据后 migrate 即触发 v4 */
   function makeDirtyV3Db(): SqliteDatabase {
     const db = createDatabase(':memory:')
     migrate(db)
@@ -438,7 +432,6 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
         model: 'qwen3-coder-plus',
         input_semantics: 1
       })
-      // 已是 2 的 opencode 行与未知口径 0 行均不在修正范围
       insertLegacyRecord(db, {
         id: 'opencode:/a.jsonl:2',
         app_type: 'opencode',
@@ -460,7 +453,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(9)
+      expect(db.pragma('user_version', { simple: true })).toBe(10)
       const rows = db
         .prepare('SELECT id, input_semantics FROM usage_records ORDER BY id')
         .all() as { id: string; input_semantics: number }[]
@@ -479,8 +472,8 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
     const db = createDatabase(':memory:')
     try {
       migrate(db)
-      migrate(db) // 第二次执行应无副作用
-      expect(db.pragma('user_version', { simple: true })).toBe(9)
+      migrate(db)
+      expect(db.pragma('user_version', { simple: true })).toBe(10)
     } finally {
       db.close()
     }
@@ -502,7 +495,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       db.pragma('user_version = 3')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(9)
+      expect(db.pragma('user_version', { simple: true })).toBe(10)
       expect(snapshot()).toEqual(before)
     } finally {
       db.close()
@@ -511,7 +504,6 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 })
 
 describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
-  /** 已应用 v4 的库（回拨 user_version），migrate 即触发 v5 */
   function makeDirtyV4Db(): SqliteDatabase {
     const db = createDatabase(':memory:')
     migrate(db)
@@ -537,9 +529,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(9)
-      // v5 原语义为仅清除 dsh 游标、其他保留；但 v9 存量回溯为全量 DELETE FROM sync_cursors，
-      // migrate() 到 9 后两者均被清除，故此处两者均期望为空/undefined
+      expect(db.pragma('user_version', { simple: true })).toBe(10)
       const dsh = db
         .prepare('SELECT COUNT(*) AS c FROM sync_cursors WHERE file_path LIKE ?')
         .get('%\\.dsh\\sessions%') as { c: number }
@@ -566,9 +556,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       db.pragma('user_version = 4')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(9)
-      // v5 原语义为幂等重跑后 snapshot 不变，但 v9 存量回溯全量清游标，
-      // 回拨到 4 再 migrate 到 9 会触发 v9 的 DELETE，故重跑后为空而非 before
+      expect(db.pragma('user_version', { simple: true })).toBe(10)
       expect(snapshot()).toEqual([])
       expect(before).toHaveLength(1)
     } finally {
@@ -579,11 +567,11 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
 describe('recordUsage 去重', () => {
   it('重复行只入一次，返回实际新增条数', async () => {
-    const { storage, db } = makeStorage()
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
     expect(await storage.recordUsage([makeRecord()])).toBe(1)
-    // 同 file+line 再写一次 → 0
     expect(await storage.recordUsage([makeRecord()])).toBe(0)
-    // 同一批内重复也只入一次
     expect(
       await storage.recordUsage([
         makeRecord({ source: { filePath: '/a.jsonl', line: 2 } }),
@@ -595,7 +583,9 @@ describe('recordUsage 去重', () => {
   })
 
   it('id 由 data_source + file_path + line 组成，跨 app 不冲突', async () => {
-    const { storage, db } = makeStorage()
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
     await storage.recordUsage([
       makeRecord({ source: { filePath: '/x.jsonl', line: 1 } }),
       makeRecord({ appType: 'codex', model: 'gpt-5', source: { filePath: '/x.jsonl', line: 1 } })
@@ -611,9 +601,10 @@ describe('recordUsage 去重', () => {
   })
 
   it('同 requestId 不同 (file_path, line)：第二次被语义去重拒绝，明细与 rollup 只计一次', async () => {
-    const { storage, db } = makeStorage()
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
     const first = makeRecord({ source: { filePath: '/main/a.jsonl', line: 1, requestId: 'msg_001' } })
-    // fork 场景：同一逻辑请求出现在 subagents 文件的不同行
     const forked = makeRecord({ source: { filePath: '/main/subagents/b.jsonl', line: 42, requestId: 'msg_001' } })
 
     expect(await storage.recordUsage([first])).toBe(1)
@@ -628,7 +619,9 @@ describe('recordUsage 去重', () => {
   })
 
   it('同批次内两条同 requestId 记录：仅首条入库', async () => {
-    const { storage, db } = makeStorage()
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
     const added = await storage.recordUsage([
       makeRecord({ source: { filePath: '/a.jsonl', line: 1, requestId: 'msg_002' } }),
       makeRecord({ source: { filePath: '/a.jsonl', line: 2, requestId: 'msg_002' } })
@@ -641,7 +634,9 @@ describe('recordUsage 去重', () => {
   })
 
   it('无 requestId 记录走旧主键去重，ledger 无行', async () => {
-    const { storage, db } = makeStorage()
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
     expect(await storage.recordUsage([makeRecord()])).toBe(1)
     expect(await storage.recordUsage([makeRecord({ source: { filePath: '/other.jsonl', line: 9 } })])).toBe(1)
     expect(await storage.recordUsage([makeRecord({ source: { filePath: '/other.jsonl', line: 9 } })])).toBe(0)
@@ -650,9 +645,10 @@ describe('recordUsage 去重', () => {
   })
 
   it('ledger 按 request_id 判定而非指纹：重复 requestId 即使 token 字段不同仍被拒', async () => {
-    const { storage, db } = makeStorage()
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
     const first = makeRecord({ source: { filePath: '/a.jsonl', line: 1, requestId: 'msg_003' }, inputTokens: 100 })
-    // 同 requestId 但 token/费用字段不同（如 rewrite 后数值变化）→ 指纹不同仍须按 request_id 拒绝
     const rewritten = makeRecord({
       source: { filePath: '/b.jsonl', line: 7, requestId: 'msg_003' },
       inputTokens: 999,
@@ -673,7 +669,9 @@ describe('recordUsage 去重', () => {
 
 describe('usage_daily_rollups 日聚合', () => {
   it('按 (date, app_type, model) 累计计数/token/费用/耗时', async () => {
-    const { storage, db } = makeStorage()
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
     const base = {
       appType: 'codex' as const,
       model: 'gpt-5',
@@ -690,7 +688,6 @@ describe('usage_daily_rollups 日聚合', () => {
       makeRecord({ ...base, source: { filePath: '/codex/a.jsonl', line: 1 } }),
       makeRecord({ ...base, source: { filePath: '/codex/a.jsonl', line: 2 } }),
       makeRecord({ ...base, status: 'error', source: { filePath: '/codex/a.jsonl', line: 3 } }),
-      // 不同 app_type 独立成桶
       makeRecord({
         ...base,
         appType: 'claude',
@@ -721,11 +718,13 @@ describe('usage_daily_rollups 日聚合', () => {
   })
 
   it('跨批次累计，重复行不重复累计', async () => {
-    const { storage, db } = makeStorage()
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
     const r1 = makeRecord({ source: { filePath: '/a.jsonl', line: 1 } })
     const r2 = makeRecord({ source: { filePath: '/a.jsonl', line: 2 } })
     await storage.recordUsage([r1])
-    await storage.recordUsage([r1, r2]) // r1 为重复 → 只累计 r2
+    await storage.recordUsage([r1, r2])
     const row = db.prepare('SELECT * FROM usage_daily_rollups').get() as UsageDailyRollupRow
     expect(row.request_count).toBe(2)
     expect(row.success_count).toBe(2)
@@ -750,7 +749,6 @@ describe('sync_cursors 游标', () => {
     await storage.setCursor('/a.jsonl', 10, 1000)
     await storage.setCursor('/a.jsonl', 20, 1000)
     expect(await storage.getCursor('/a.jsonl')).toBe(20)
-    // 文件被 truncate/替换：mtime 变化 → 游标重置 0，下轮全量重读
     await storage.setCursor('/a.jsonl', 30, 2000)
     expect(await storage.getCursor('/a.jsonl')).toBe(0)
   })
@@ -789,7 +787,6 @@ describe('sync_cursors byte_offset 游标（v6）', () => {
 
     await storage.setCursor('/a.jsonl.zstd', 30, 1000, 4096)
     await storage.setCursor('/b.jsonl.zstd', 5, 500, 128)
-    // 文件被 truncate/替换：mtime 变化 → 行号归零且字节游标一并清空
     await storage.setCursor('/b.jsonl.zstd', 8, 900, 512)
     meta = await storage.getCursorMeta('/b.jsonl.zstd')
     expect(meta).toMatchObject({ lineOffset: 0, byteOffset: null })
@@ -813,7 +810,9 @@ describe('sync_cursors byte_offset 游标（v6）', () => {
   })
 
   it('v5 时代旧行（byte_offset 列 NULL）读到 null 语义；缺省写入保留 NULL，显式写入覆盖', async () => {
-    const { storage, db } = makeStorage()
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
     db.prepare(
       `INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, updated_at)
        VALUES ('/old.jsonl.zstd', 'dsh', 9, 77, 1)`
@@ -858,7 +857,6 @@ describe('model_pricing CRUD', () => {
       output_per_million: 15,
       cost_multiplier: 1
     })
-    // 覆盖更新（upsert 不新增行）
     await storage.updateModelPricing(entry({ input_per_million: 3.5, output_per_million: 16, updated_at: 222 }))
     list = await storage.getModelPricing()
     expect(list).toHaveLength(1)
@@ -870,7 +868,7 @@ describe('model_pricing CRUD', () => {
     await storage.updateModelPricing(entry())
     await storage.deleteModelPricing('claude-sonnet-4')
     expect(await storage.getModelPricing()).toEqual([])
-    await storage.deleteModelPricing('not-exist') // 幂等
+    await storage.deleteModelPricing('not-exist')
   })
 
   it('批量插入 N 条返回 N 且全表可查', async () => {
@@ -889,7 +887,6 @@ describe('model_pricing CRUD', () => {
 
   it('批量写入时 user 分级行不被 sync 行覆盖，其余行照常写入', async () => {
     const { storage } = makeStorage()
-    // 预置 user 行（手动编辑缺省即 user）
     await storage.updateModelPricing(entry({ input_per_million: 99, updated_at: 123 }), 'user')
 
     const imported = await storage.updateModelPricingBatch(
@@ -918,5 +915,186 @@ describe('model_pricing CRUD', () => {
     const { storage } = makeStorage()
     expect(await storage.updateModelPricingBatch([], 'seed')).toBe(0)
     expect(await storage.getModelPricing()).toEqual([])
+  })
+})
+
+describe('usage_hourly_rollups 小时桶增量维护', () => {
+  function hourBucket(hour: number): { createdAt: number; date: string; hour: number } {
+    const createdAt = Date.UTC(2026, 7, 19, hour, 0, 0)
+    const d = new Date(createdAt)
+    const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+      d.getDate()
+    ).padStart(2, '0')}`
+    return { createdAt, date, hour: d.getHours() }
+  }
+
+  function hourlyRow(
+    db: SqliteDatabase,
+    date: string,
+    hour: number,
+    appType: string,
+    model: string
+  ): Record<string, unknown> {
+    return db
+      .prepare(
+        'SELECT * FROM usage_hourly_rollups WHERE date=? AND hour=? AND app_type=? AND model=?'
+      )
+      .get(date, hour, appType, model) as Record<string, unknown>
+  }
+
+  it('按 (date,hour,app_type,model) 聚合计数/token/费用/耗时，跨小时跨 app 独立成桶', async () => {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
+    const h10 = hourBucket(10)
+    const h14 = hourBucket(14)
+
+    await storage.recordUsage([
+      makeRecord({
+        ...h10,
+        appType: 'codex',
+        model: 'gpt-5',
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 5,
+        cacheCreationTokens: 2,
+        costUsd: '0.010000',
+        latencyMs: 100,
+        source: { filePath: '/a.jsonl', line: 1 }
+      }),
+      makeRecord({
+        ...h10,
+        appType: 'codex',
+        model: 'gpt-5',
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 5,
+        cacheCreationTokens: 2,
+        costUsd: '0.010000',
+        latencyMs: 100,
+        source: { filePath: '/a.jsonl', line: 2 }
+      }),
+      makeRecord({
+        ...h10,
+        appType: 'codex',
+        model: 'gpt-5',
+        status: 'error',
+        inputTokens: 1,
+        outputTokens: 1,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        latencyMs: 0,
+        costUsd: '0.001000',
+        source: { filePath: '/a.jsonl', line: 3 }
+      }),
+      makeRecord({
+        ...h14,
+        appType: 'claude',
+        model: 'claude-sonnet-4',
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadTokens: 20,
+        cacheCreationTokens: 10,
+        costUsd: '0.001000',
+        latencyMs: 800,
+        source: { filePath: '/b.jsonl', line: 1 }
+      })
+    ])
+
+    const codex = hourlyRow(db, h10.date, h10.hour, 'codex', 'gpt-5')
+    expect(codex).toBeDefined()
+    expect(codex.request_count).toBe(3)
+    expect(codex.success_count).toBe(2)
+    expect(codex.error_count).toBe(1)
+    expect(codex.input_tokens).toBe(21)
+    expect(codex.output_tokens).toBe(41)
+    expect(codex.cache_read_tokens).toBe(10)
+    expect(codex.cache_creation_tokens).toBe(4)
+    expect(codex.cost_usd).toBe('0.021')
+    expect(codex.latency_ms_total).toBe(200)
+
+    const claude = hourlyRow(db, h14.date, h14.hour, 'claude', 'claude-sonnet-4')
+    expect(claude.request_count).toBe(1)
+    expect(claude.success_count).toBe(1)
+    expect(claude.error_count).toBe(0)
+    expect(claude.input_tokens).toBe(100)
+    expect(claude.output_tokens).toBe(50)
+    expect(claude.cache_read_tokens).toBe(20)
+    expect(claude.cache_creation_tokens).toBe(10)
+    expect(claude.cost_usd).toBe('0.001')
+    expect(claude.latency_ms_total).toBe(800)
+  })
+
+  it('同一 (date,hour,app_type,model) 跨批次累加，相同记录重放不翻倍', async () => {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
+    const h10 = hourBucket(10)
+    const batchA = [
+      makeRecord({
+        ...h10,
+        appType: 'codex',
+        model: 'gpt-5',
+        inputTokens: 10,
+        outputTokens: 20,
+        costUsd: '0.010000',
+        latencyMs: 100,
+        source: { filePath: '/a.jsonl', line: 1 }
+      }),
+      makeRecord({
+        ...h10,
+        appType: 'codex',
+        model: 'gpt-5',
+        inputTokens: 10,
+        outputTokens: 20,
+        costUsd: '0.010000',
+        latencyMs: 100,
+        source: { filePath: '/a.jsonl', line: 2 }
+      })
+    ]
+    const batchB = [
+      makeRecord({
+        ...h10,
+        appType: 'codex',
+        model: 'gpt-5',
+        inputTokens: 10,
+        outputTokens: 20,
+        costUsd: '0.010000',
+        latencyMs: 100,
+        source: { filePath: '/a.jsonl', line: 3 }
+      }),
+      makeRecord({
+        ...h10,
+        appType: 'codex',
+        model: 'gpt-5',
+        inputTokens: 10,
+        outputTokens: 20,
+        costUsd: '0.010000',
+        latencyMs: 100,
+        source: { filePath: '/a.jsonl', line: 4 }
+      })
+    ]
+
+    await storage.recordUsage(batchA)
+    await storage.recordUsage(batchB)
+
+    const accumulated = hourlyRow(db, h10.date, h10.hour, 'codex', 'gpt-5')
+    expect(accumulated.request_count).toBe(4)
+    expect(accumulated.input_tokens).toBe(40)
+    expect(accumulated.output_tokens).toBe(80)
+    expect(accumulated.cost_usd).toBe('0.04')
+
+    const before = (
+      db.prepare('SELECT SUM(request_count) AS s FROM usage_hourly_rollups').get() as { s: number | null }
+    ).s
+    expect(before).toBe(4)
+
+    await storage.recordUsage([...batchA, ...batchB])
+    const after = (
+      db.prepare('SELECT SUM(request_count) AS s FROM usage_hourly_rollups').get() as { s: number | null }
+    ).s
+    expect(after).toBe(before)
+    const replayed = hourlyRow(db, h10.date, h10.hour, 'codex', 'gpt-5')
+    expect(replayed.request_count).toBe(4)
   })
 })

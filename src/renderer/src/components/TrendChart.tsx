@@ -15,7 +15,6 @@ export interface TrendPoint {
   tokens: number
 }
 
-/** 请求 / Token 双轴迷你趋势图（Dashboard 与趋势页共用） */
 export const TrendChart = memo(function TrendChart({
   data,
   height = 220

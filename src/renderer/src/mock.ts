@@ -17,15 +17,7 @@ import type {
 import type { ModelPricingRow } from '../../../shared/tables'
 import { DAY_MS, startOfToday } from './lib/range'
 
-/**
- * Mock 数据源：在后端（src/main + preload）实现完整 RendererApi 之前，
- * 用确定性伪随机数据让渲染层骨架可独立运行。
- *
- * - 单例数据集在模块加载时生成一次（日志/汇总/趋势/统计互相一致）。
- * - 所有方法返回 Promise，契约与 shared/ipc.ts 的 RendererApi 完全对齐。
- */
 
-/** 确定性伪随机数（种子固定，重渲染不抖动） */
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0
   return () => {
@@ -102,7 +94,6 @@ function buildRecords(): RequestLogDetail[] {
   for (let offset = 29; offset >= 0; offset--) {
     const dayStart = todayStart - offset * DAY_MS
     const dateStr = toDateStr(dayStart)
-    // 今日只生成到当前时刻，保证汇总/趋势/日志一致
     const span = offset === 0 ? Math.max(1, NOW - dayStart) : DAY_MS - 1
     const count = 6 + Math.floor(rnd() * 28)
 
@@ -125,7 +116,6 @@ function buildRecords(): RequestLogDetail[] {
               cacheCreation * def.cacheCreationPerM) /
             1_000_000
           : null
-      // 失败样本：随机 httpStatus 与错误文案，便于前端展示层验证截断/详情
       const HTTP_ERROR_CODES = [400, 401, 403, 404, 429, 500, 502, 503] as const
       const ERROR_TEMPLATES = [
         'API Error 429: rate limit exceeded, retry after 60s',
@@ -237,7 +227,6 @@ function filterDaily(filters: LogFilters): DailyStats[] {
   })
 }
 
-/** 按本地时区 (dayKey, hour) 双维聚合（与后端 getHourlyTrends 同口径：跨天窗口不合并同钟点；不补零，仅返回有数据的桶） */
 function aggregateHourly(records: RequestLogDetail[]): HourlyStats[] {
   const map = new Map<string, HourlyStats>()
   for (const r of records) {
@@ -399,7 +388,6 @@ let SETTINGS: AppSettings = {
   pricingSyncIntervalMs: 300_000
 }
 
-/** 预算占比与超限判定（与主进程 budget.ts 同口径：null/<=0 视同未设置=不告警，严格大于才判超限） */
 function evaluateBudget(costMicro: number, budget: number | null | undefined) {
   const effective = budget != null && budget > 0 ? budget : null
   if (effective == null) return { ratio: null as number | null, exceeded: false, normalized: null }
@@ -407,7 +395,6 @@ function evaluateBudget(costMicro: number, budget: number | null | undefined) {
   return { ratio, exceeded: ratio > 1, normalized: effective }
 }
 
-/** 按当前 Mock 记录集聚合今日/本月费用（本地时区），结合 SETTINGS 预算得出状态 */
 function buildBudgetStatus(): BudgetStatus {
   const todayKey = toDateStr(NOW)
   const monthPrefix = todayKey.slice(0, 7)
@@ -435,7 +422,6 @@ function buildBudgetStatus(): BudgetStatus {
   }
 }
 
-/** models.dev 目录 Mock 小样本（确定性，模拟全量同步导入的条目） */
 const MODELSDEV_MOCK_CATALOG: ModelsDevCatalogEntry[] = [
   {
     provider: 'anthropic',
@@ -475,7 +461,6 @@ const MODELSDEV_MOCK_CATALOG: ModelsDevCatalogEntry[] = [
   }
 ]
 
-/** 目录条目 → 定价行并 upsert 进 Mock 定价表（Mock 不区分 seed/sync/user 分级） */
 function upsertCatalogEntry(entry: ModelsDevCatalogEntry): void {
   const row: ModelPricingRow = {
     model_id: entry.modelId,
@@ -492,7 +477,6 @@ function upsertCatalogEntry(entry: ModelsDevCatalogEntry): void {
   PRICING = idx >= 0 ? PRICING.map((p, i) => (i === idx ? row : p)) : [...PRICING, row]
 }
 
-/** 生成与 RendererApi 契约对齐的 Mock 实现 */
 export function createMockApi(): RendererApi {
   return {
     ping: async () => 'pong',

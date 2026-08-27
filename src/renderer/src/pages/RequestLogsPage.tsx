@@ -22,7 +22,6 @@ import { RANGE_OPTIONS, customRangeToMs, rangeToFilters, type CustomRange, type 
 
 type StatusFilter = 'all' | 'success' | 'error'
 
-/** 可筛选的应用列表（第一阶段 5 个内置监控插件） */
 const APP_TYPES = Object.keys(APP_META) as AppType[]
 
 const INPUT_SEMANTICS_LABEL: Record<number, string> = {
@@ -36,17 +35,14 @@ const TD = 'px-3 py-2 text-sm text-neutral-300'
 
 const MODEL_FILTER_RENDER_LIMIT = 200
 
-/** 失败错误文案表格内截断长度（详情抽屉完整展示） */
 const ERROR_PREVIEW_LEN = 64
 
 function truncateError(msg: string, len = ERROR_PREVIEW_LEN): string {
   return msg.length > len ? `${msg.slice(0, len)}…` : msg
 }
 
-/** 关键字搜索防抖：keyword 翻译成 4 列前置通配 LIKE（无索引全表扫描），逐键即时查询会打满主进程 */
 const KEYWORD_DEBOUNCE_MS = 300
 
-/** 请求日志页：筛选栏 + 分页表格 + 行详情抽屉 */
 export default function RequestLogsPage(): ReactElement {
   const [range, setRange] = useState<RangeKey>('30d')
   const [customRange, setCustomRange] = useState<CustomRange | null>(null)
@@ -58,20 +54,17 @@ export default function RequestLogsPage(): ReactElement {
   const [page, setPage] = useState(1)
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
-  // 查询用关键字防抖发布；发布后回到第 1 页（挂载时 setPage(1) 对相同值 bail out）
   const debouncedKeyword = useDebouncedValue(keyword, KEYWORD_DEBOUNCE_MS)
   useEffect(() => {
     setPage(1)
   }, [debouncedKeyword])
 
-  // 筛选候选随数据同步缓慢变化，长 staleTime 避免每次进入页面都重复查询
   const { data: filterOptions } = useQuery({
     queryKey: ['filter-options'],
     queryFn: () => api.getFilterOptions(),
     staleTime: 10 * 60 * 1000
   })
   const projectOptions = filterOptions?.projects ?? []
-  // 候选未加载或已不含当前选择（数据被清理）时视为未选，避免筛出恒空结果
   const knownProject = projectOptions.includes(project) ? project : undefined
 
   const filters = useMemo<LogFilters>(
@@ -138,7 +131,7 @@ export default function RequestLogsPage(): ReactElement {
     <div className="space-y-6">
       <PageHeader title="请求日志" description="按应用 / 模型 / 项目 / 时间 / 状态筛选的用量明细" />
 
-      {/* 筛选栏：时间范围 + 应用 + 关键字 + 状态 + 模型多选 + 项目 */}
+      {}
       <div className="flex flex-wrap items-center gap-2">
         <RangeSelector
           value={range}
@@ -316,11 +309,6 @@ export default function RequestLogsPage(): ReactElement {
   )
 }
 
-/**
- * 模型多选下拉：按钮 + 弹出勾选面板（点击面板外关闭）。
- * 模型候选可达数百个，原生 multiple select 需 Ctrl 点选且占高，
- * 故用无依赖的轻量弹层；列表限高滚动。
- */
 function ModelFilter({
   options,
   selected,
@@ -481,7 +469,6 @@ function Row({
   )
 }
 
-/** 应用徽标 */
 function AppBadge({ app }: { app: AppType }): ReactElement {
   return (
     <span
@@ -492,7 +479,6 @@ function AppBadge({ app }: { app: AppType }): ReactElement {
   )
 }
 
-/** 状态徽章：成功绿 / 失败红；失败时叠加 httpStatus（如 403/500），复用现有 Badge/Tag 样式 */
 function StatusBadge({
   status,
   httpStatus
@@ -517,7 +503,6 @@ function StatusBadge({
   )
 }
 
-/** 详情抽屉：固定右侧面板，展示 RequestLogDetail 全字段 */
 function DetailDrawer({ record: r, onClose }: { record: RequestLogDetail; onClose: () => void }): ReactElement {
   return (
     <div className="fixed inset-0 z-40" role="dialog" aria-modal="true">
@@ -646,7 +631,6 @@ function DetailRow({ label, children }: { label: string; children: ReactNode }):
 
 type PageItem = number | 'left-gap' | 'right-gap'
 
-/** 分页页码窗口：围绕当前页最多 7 个，两端截断处用省略号 */
 export function pageList(current: number, total: number): PageItem[] {
   if (total <= 7) {
     return Array.from({ length: total }, (_, i) => i + 1)

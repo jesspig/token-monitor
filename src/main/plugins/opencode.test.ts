@@ -15,7 +15,6 @@ import {
 } from './opencode'
 import type { PluginContext } from '../../../shared/context'
 
-/** parseFile 不使用 ctx 上的服务，测试时给个空壳即可 */
 const ctx = {} as PluginContext
 
 let tmpDir = ''
@@ -28,7 +27,6 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
 
-/** 构造 opencode 风格 SQLite（message + session 表） */
 function buildOpencodeDb(
   dbPath: string,
   opts: {
@@ -73,7 +71,6 @@ function buildOpencodeDb(
   db.close()
 }
 
-/** assistant 消息样例（db 行：data JSON + time_created 列；字段可覆盖） */
 function asstMsg(o: {
   id?: string
   time?: number
@@ -105,7 +102,6 @@ function asstMsg(o: {
   }
 }
 
-/** user 消息样例（无 tokens，不应产出记录） */
 const userMsg = (o: { id?: string; time?: number } = {}): {
   id: string
   sessionId: string
@@ -212,7 +208,6 @@ describe('listFilesFromRoot 收集范围', () => {
 })
 
 describe('listFilesFromRoot WAL 感知 mtime', () => {
-  /** 写入空文件并设置指定 mtime（epoch ms），返回实际 stat 到的毫秒值（规避文件系统时间精度截断） */
   function writeWithMtime(p: string, atMs: number): number {
     fs.writeFileSync(p, '')
     const t = new Date(atMs)
@@ -307,7 +302,7 @@ describe('parseDbFile 解析与水位游标', () => {
     const res = parseDbFile(dbPath, 0)
     expect(res.records).toHaveLength(1)
     expect(res.records[0].source.line).toBe(2_000)
-    expect(res.nextLine).toBe(4_000) // 水位覆盖所有新行（含未产出记录的行）
+    expect(res.nextLine).toBe(4_000)
     expect(res.eof).toBe(true)
   })
 
@@ -322,7 +317,6 @@ describe('parseDbFile 解析与水位游标', () => {
     expect(r1.records.map((r) => r.source.line)).toEqual([1_000, 2_000])
     expect(r1.nextLine).toBe(2_000)
 
-    // 追加更新的消息后再解析：只产出新增（time > 2_000）
     const db = new Database(dbPath)
     db.prepare(
       'INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)'
@@ -338,7 +332,6 @@ describe('parseDbFile 解析与水位游标', () => {
     expect(r2.nextLine).toBe(4_000)
     expect(r2.eof).toBe(true)
 
-    // 无新增：nextLine 返回原 fromLine
     const r3 = parseDbFile(dbPath, r2.nextLine)
     expect(r3.records).toHaveLength(0)
     expect(r3.nextLine).toBe(4_000)
@@ -366,7 +359,6 @@ describe('parseDbFile 解析与水位游标', () => {
     expect(r1.nextLine).toBe(0)
     expect(r1.eof).toBe(true)
 
-    // 仅含空库（无 message 表）
     const emptyDb = path.join(tmpDir, 'empty.db')
     const db = new Database(emptyDb)
     db.exec('CREATE TABLE unrelated (x TEXT)')
@@ -403,7 +395,6 @@ describe('parseJsonFile 旧版 JSON 源', () => {
     expect(r1.nextLine).toBe(1)
     expect(r1.eof).toBe(true)
 
-    // 文件未变 + fromLine>0：跳过，游标不倒退
     const r2 = parseJsonFile(file, r1.nextLine)
     expect(r2.records).toHaveLength(0)
     expect(r2.nextLine).toBe(1)
@@ -540,8 +531,6 @@ describe('失败分支（T01 宽松 error 探测）', () => {
       status: 'failed',
       id: 'm-status'
     }
-    // 移除 tokens 以验证失败路径即使无 tokens 仍可产出（tokens 全 0）
-    // 但为保留 tokens 场景，这里保留原 tokens；另起一个用例测全 0
     fs.writeFileSync(file, JSON.stringify(data), 'utf8')
     const res = parseJsonFile(file, 0)
     expect(res.records).toHaveLength(1)
@@ -604,14 +593,12 @@ describe('失败分支（T01 宽松 error 探测）', () => {
 
   it('db 源 SQLite 附加 error 列亦产出 error（宽松兼容）', () => {
     const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
-    // 建表时显式包含 error 列
     const db = new Database(dbPath)
     db.exec(`
       CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT);
       CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT, error TEXT);
     `)
     const data = asstMsg({ id: 'm-db-err', time: 7_000 }).data as Record<string, unknown>
-    // data 内无 error，但行级 error 列有值
     db.prepare('INSERT INTO session (id, directory) VALUES (?, ?)').run('sess-1', '/p')
     db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data, error) VALUES (?, ?, ?, ?, ?, ?)').run(
       'm-db-err',

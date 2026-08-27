@@ -14,7 +14,6 @@ import {
 } from './pricing'
 import { openStorage, SqliteStorage } from './storage'
 
-/** 构造一条可复用的测试用量记录 */
 function makeRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
   return {
     appType: 'claude',
@@ -70,7 +69,6 @@ describe('normalizeModelId', () => {
   it('去掉版本/日期后缀（-YYYY-MM-DD、-YYYYMMDD）', () => {
     expect(normalizeModelId('claude-sonnet-4-5-2025-09-29')).toBe('claude-sonnet-4-5')
     expect(normalizeModelId('claude-sonnet-4-5-20250929')).toBe('claude-sonnet-4-5')
-    // 数字版本不应被误伤
     expect(normalizeModelId('gpt-4o-mini')).toBe('gpt-4o-mini')
     expect(normalizeModelId('claude-sonnet-4-5')).toBe('claude-sonnet-4-5')
   })
@@ -111,7 +109,6 @@ describe('seedPricing', () => {
     const storage = openStorage(':memory:')
     await seedPricing(storage)
 
-    // 用户以 'user' 来源手改 sonnet 行
     const sonnet = (await storage.getModelPricing()).find(
       (r) => r.model_id === 'claude-sonnet-4-5'
     ) as ModelPricingRow
@@ -119,7 +116,6 @@ describe('seedPricing', () => {
       { ...sonnet, input_per_million: 99, updated_at: 123 },
       'user'
     )
-    // grok 行被 models.dev 式 'sync' 写入干扰价（非 user 行可被覆盖）
     const grok = (await storage.getModelPricing()).find(
       (r) => r.model_id === 'grok-4'
     ) as ModelPricingRow
@@ -164,8 +160,6 @@ describe('PricingService', () => {
     const storage = openStorage(':memory:')
     await seedPricing(storage)
     const svc = createPricingService(storage)
-    // claude 形态（semantics=2）：input 为纯新输入全额计价
-    // 1000×3 + 2000×15 + 3000×0.3 = 33900 微美元 = 0.0339 USD
     const cost = await svc.calcCost(
       makeRecord({
         model: 'claude-sonnet-4-5',
@@ -182,7 +176,6 @@ describe('PricingService', () => {
     const storage = openStorage(':memory:')
     await seedPricing(storage)
     const svc = createPricingService(storage)
-    // 1000×3.75 = 3750 微美元 = 0.00375 USD
     const cost = await svc.calcCost(makeRecord({ model: 'claude-sonnet-4-5', cacheCreationTokens: 1000 }))
     expect(cost).toBe('0.00375')
   })
@@ -211,7 +204,6 @@ describe('PricingService', () => {
     const row = (await svc.getPrice('claude-sonnet-4-5')) as ModelPricingRow
     await storage.updateModelPricing({ ...row, cost_multiplier: 2, updated_at: Date.now() })
     ;(svc as PricingServiceImpl).invalidateCache()
-    // 1000×3×2 = 6000 微美元 = 0.006 USD
     expect(await svc.calcCost(makeRecord({ inputTokens: 1000 }))).toBe('0.006')
   })
 
@@ -223,7 +215,6 @@ describe('PricingService', () => {
 
     const row = (await svc.getPrice('claude-sonnet-4-5')) as ModelPricingRow
     await storage.updateModelPricing({ ...row, input_per_million: 4, updated_at: Date.now() })
-    // 未失效前命中缓存旧值
     expect((await svc.getPrice('claude-sonnet-4-5'))?.input_per_million).toBe(3)
     svc.invalidateCache()
     expect((await svc.getPrice('claude-sonnet-4-5'))?.input_per_million).toBe(4)
@@ -231,7 +222,6 @@ describe('PricingService', () => {
 })
 
 describe('calcCost 输入语义', () => {
-  /** claude-sonnet-4-5 seed 价：in=3 / out=15 / read=0.3 / write=3.75（USD 每百万） */
   async function makeSvc() {
     const storage = openStorage(':memory:')
     await seedPricing(storage)
@@ -240,7 +230,6 @@ describe('calcCost 输入语义', () => {
 
   it('semantics=2（claude 形态）：input 全额计价，不扣缓存', async () => {
     const { svc } = await makeSvc()
-    // 1000×3 + 800×0.3 + 100×3.75 = 3000 + 240 + 375 = 3615 微美元
     const cost = await svc.calcCost(
       makeRecord({
         inputTokens: 1000,
@@ -254,7 +243,6 @@ describe('calcCost 输入语义', () => {
 
   it('semantics=1（codex 形态）：input 先扣 cacheRead 再计价', async () => {
     const { svc } = await makeSvc()
-    // freshInput=20000 → 20000×3 + 80000×0.3 + 0×3.75 = 84000 微美元
     const cost = await svc.calcCost(
       makeRecord({
         inputTokens: 100000,
@@ -269,7 +257,6 @@ describe('calcCost 输入语义', () => {
 
   it('semantics=1 且 cacheCreation>0：read 与 write 一并扣减', async () => {
     const { svc } = await makeSvc()
-    // freshInput=15000 → 15000×3 + 80000×0.3 + 5000×3.75 = 45000+24000+18750 = 87750 微美元
     const cost = await svc.calcCost(
       makeRecord({
         inputTokens: 100000,
@@ -284,7 +271,6 @@ describe('calcCost 输入语义', () => {
 
   it('semantics=1 扣穿防御：cache 总量超过 input 时 freshInput 钳为 0，费用仅剩 output/cache 项', async () => {
     const { svc } = await makeSvc()
-    // 0×3 + 2000×15 + 3000×0.3 + 2000×3.75 = 30000+900+7500 = 38400 微美元
     const cost = await svc.calcCost(
       makeRecord({
         inputTokens: 1000,
@@ -299,7 +285,6 @@ describe('calcCost 输入语义', () => {
 
   it('semantics=0（未知口径）：input 全额计价，与旧行为一致', async () => {
     const { svc } = await makeSvc()
-    // 1000×3 + 800×0.3 = 3240 微美元（若按 semantics=1 扣减则只有 240）
     const cost = await svc.calcCost(
       makeRecord({
         inputTokens: 1000,
@@ -315,7 +300,6 @@ describe('calcCost 输入语义', () => {
     const row = (await svc.getPrice('claude-sonnet-4-5')) as ModelPricingRow
     await storage.updateModelPricing({ ...row, cost_multiplier: 2, updated_at: Date.now() })
     ;(svc as PricingServiceImpl).invalidateCache()
-    // (20000×3 + 1000×15 + 80000×0.3) × 2 = 99000×2 = 198000 微美元
     const cost = await svc.calcCost(
       makeRecord({
         inputTokens: 100000,
@@ -329,7 +313,6 @@ describe('calcCost 输入语义', () => {
 })
 
 describe('定价匹配增强', () => {
-  /** 构造最小可用定价行 */
   function makeRow(modelId: string, inputPerMillion: number): ModelPricingRow {
     return {
       model_id: modelId,
@@ -373,8 +356,6 @@ describe('定价匹配增强', () => {
     const storage = openStorage(':memory:')
     await seedPricing(storage)
     const svc = createPricingService(storage)
-    // 'claude-opus-4.5' 若先走短 ID 前缀会命中 'claude-opus-4'（input=15），
-    // 正确排序下应经点转横线精确命中 'claude-opus-4-5'（input=5）
     const row = await svc.getPrice('claude-opus-4.5')
     expect(row?.model_id).toBe('claude-opus-4-5')
     expect(row?.input_per_million).toBe(5)
@@ -411,14 +392,12 @@ describe('定价匹配增强', () => {
 describe('recalcCachedInputCosts', () => {
   const CREATED_AT = new Date('2026-08-19T10:00:00Z').getTime()
 
-  /** 内存库 + 迁移 + 存储实例，返回可直查的 db 句柄 */
   function makeDb(): { storage: SqliteStorage; db: SqliteDatabase } {
     const db = createDatabase(':memory:')
     migrate(db)
     return { storage: new SqliteStorage(db), db }
   }
 
-  /** 直插一条存量明细行（绕过 recordUsage，精确控制 semantics/cost/rollup 有无） */
   function insertLegacyRow(
     db: SqliteDatabase,
     seed: {
@@ -470,8 +449,6 @@ describe('recalcCachedInputCosts', () => {
   it('codex 形态存量行重算：明细精确等于新公式值，rollup 按差额同步修正', async () => {
     const { storage, db } = makeDb()
     const svc = await makeSeededSvc(storage)
-    // recordUsage 同时落明细与日聚合；cost_usd 为旧口径高估值
-    // （input 未扣缓存全额计价：100000×1.25 + 1000×10 + 80000×0.125 = 0.145 USD）
     await storage.recordUsage([
       makeRecord({
         appType: 'codex',
@@ -489,7 +466,6 @@ describe('recalcCachedInputCosts', () => {
 
     const result = await recalcCachedInputCosts(db, svc)
 
-    // 新公式：freshInput=20000 → 20000×1.25 + 1000×10 + 80000×0.125 = 0.045 USD
     expect(result).toEqual({ scanned: 1, updated: 1 })
     const expected = await svc.calcCost(
       makeRecord({
@@ -509,7 +485,6 @@ describe('recalcCachedInputCosts', () => {
     expect(detail.cost_usd).toBe('0.045')
 
     const rollup = db.prepare('SELECT cost_usd FROM usage_daily_rollups').get() as { cost_usd: string }
-    // 原聚合 0.145 + delta(-0.1) = 0.045，维持「聚合 ≡ 组内明细之和」不变量
     expect(rollup.cost_usd).toBe('0.045')
   })
 
@@ -538,7 +513,6 @@ describe('recalcCachedInputCosts', () => {
 
     const second = await recalcCachedInputCosts(db, svc)
 
-    // semantics 不改写、候选仍在扫描范围，但重算一致零写入（幂等关键）
     expect(second).toEqual({ scanned: 1, updated: 0 })
     expect(snapshot()).toEqual(before)
   })
@@ -546,7 +520,6 @@ describe('recalcCachedInputCosts', () => {
   it('扫描范围仅限 codex/gemini/grok：opencode/claude 行不计入 scanned 且不改动', async () => {
     const { storage, db } = makeDb()
     const svc = await makeSeededSvc(storage)
-    // 模拟 v4 之前的错标状态：opencode 行 semantics=1（其 input 本为纯新输入，不得触碰）
     insertLegacyRow(db, {
       id: 'opencode:/o.jsonl:1',
       app_type: 'opencode',
@@ -563,7 +536,6 @@ describe('recalcCachedInputCosts', () => {
       input_tokens: 5000,
       cost_usd: '0.5'
     })
-    // grok 行在扫描范围内且定价可命中 → 被重算更新
     insertLegacyRow(db, {
       id: 'grok:/g.jsonl:1',
       app_type: 'grok',
@@ -584,7 +556,6 @@ describe('recalcCachedInputCosts', () => {
         (r) => [r.id, r.cost_usd]
       )
     )
-    // grok 新公式：fresh=10000 → 10000×1.25 + 500×2.5 + 40000×0.2 = 0.02175 USD
     expect(byId.get('grok:/g.jsonl:1')).toBe('0.02175')
     expect(byId.get('opencode:/o.jsonl:1')).toBe('0.5')
     expect(byId.get('claude:/c.jsonl:1')).toBe('0.5')

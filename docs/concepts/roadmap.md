@@ -3,13 +3,16 @@ type: roadmap
 title: 里程碑与风险
 description: M1–M7 实施路线图与待研究点；插件框架先行，再铺开内置监控插件。
 tags: [roadmap, milestone, risk, planning, plugin]
-timestamp: 2026-08-20T01:15:00+08:00
+timestamp: 2026-08-28T02:27:00+08:00
 ---
 
 # 里程碑与风险
 
 > [!note] 当前状态
 > **第一阶段 M1–M6 已完成**（2026-08-20）：脚手架、插件框架内核与数据层、5 个监控插件、可视化、设置与健壮性、electron-builder 打包均已落地并通过编译/测试。M7（扩展更多监控插件 / 代理拦截 / 云账单 / 导出）待后续迭代。
+
+> [!note] 截至 2026-08-28
+> 已交付 8 个内置监控插件、统计查询卸载到只读 worker 线程、系统托盘后台常驻；全部代码注释已于本日移除，`docs/` 为唯一事实来源（代码注释已于 2026-08-28 全部移除，知识库为唯一事实来源）。具体路线图与各概念实现见 [总体架构](architecture.md) / [插件体系](plugin-architecture.md) / [监控插件](monitor-plugins.md) / [数据流](data-flow.md) 等各概念页。
 
 ## 实施路线图
 

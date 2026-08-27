@@ -6,7 +6,6 @@ import { SqliteStorage } from './storage'
 
 const DAY_MS = 86_400_000
 
-/** 构造一条可复用的测试用量记录（默认 1 天前） */
 function makeRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
   return {
     appType: 'claude',
@@ -43,11 +42,9 @@ describe('数据保留清理（retention）', () => {
       makeRecord({ createdAt: now - 100 * DAY_MS, source: { filePath: '/s/old-1.jsonl', line: 1 } }),
       makeRecord({ createdAt: now - 100 * DAY_MS, source: { filePath: '/s/old-2.jsonl', line: 1 } })
     ])
-    // 4 条明细 + 2 个日聚合桶（1 天前 / 100 天前）
     expect(count(db, 'usage_records')).toBe(4)
     expect(count(db, 'usage_daily_rollups')).toBe(2)
 
-    // 90 天保留：仅删除 100 天前那批（2 条），1 天前的保留
     expect(cleanupOldRecords(db, 90)).toBe(2)
     expect(count(db, 'usage_records')).toBe(2)
     const remaining = db
@@ -55,7 +52,6 @@ describe('数据保留清理（retention）', () => {
       .all() as { created_at: number }[]
     expect(remaining.every((r) => r.created_at > now - 2 * DAY_MS)).toBe(true)
 
-    // usage_daily_rollups 为历史趋势数据，不随明细清理
     expect(count(db, 'usage_daily_rollups')).toBe(2)
   })
 

@@ -4,7 +4,7 @@ title: UI 页面规划
 description: 渲染层页面：Dashboard（预算横幅）、趋势（渐变面积双轴）、日志（模型/项目/自定义时间筛选）、统计、定价（只读列表+全量同步）、监控源（含 CLI 版本）、设置。
 tags: [ui, react, dashboard, recharts, budget]
 resource: src/renderer/src/
-timestamp: 2026-08-26T03:21:00+08:00
+timestamp: 2026-08-28T02:27:00+08:00
 ---
 
 # UI 页面规划
@@ -23,6 +23,7 @@ timestamp: 2026-08-26T03:21:00+08:00
 | 定价配置 | 模型价格**只读列表**（含来源列 seed/sync/user，50/页分页 `PRICING_PAGE_SIZE`）+「立即全量同步」按钮；增删改与在线目录浏览已下线 | ✅ `PricingPage.tsx` |
 | 监控源 | 各 CLI 适配器状态（已检测/未安装/**CLI 版本**/最近同步时间/错误数） | ✅ `SourcesPage.tsx` |
 | 设置 | 同步间隔、数据保留策略、日/月预算字段、统计自动刷新间隔（秒）/ 价格同步间隔（分钟）、数据目录等（定价自动同步无启停开关，仅暴露同步间隔）；统计自动刷新间隔仅控制用量类图表轮询（2026-08-26 收窄）；表单回填仅首载一次，不被数据刷新覆盖编辑中输入 | ✅ `SettingsPage.tsx` |
+| 设置·关闭到托盘 | `closeToTray`（默认 true）：窗口关闭时隐藏到托盘而非退出，由 `tray.ts` 与 `index.ts` 协同实现，详见 [总体架构](architecture.md) | ✅ `SettingsPage.tsx` / `src/main/tray.ts` |
 
 ## 交互要点
 

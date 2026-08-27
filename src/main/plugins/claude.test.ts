@@ -6,13 +6,11 @@ import { claudePlugin, detectFromRoot, foldById, listFilesFromRoot } from './cla
 import type { PluginContext } from '../../../shared/context'
 import type { UsageRecord } from '../../../shared/dto'
 
-/** parseFile 不使用 ctx 上的服务，测试时给个空壳即可 */
 const ctx = {} as PluginContext
 
 const USER_TS = '2026-08-19T10:00:00+08:00'
 const ASST_TS = '2026-08-19T10:00:05+08:00'
 
-/** user 行样例 */
 const userLine = (): string =>
   JSON.stringify({
     type: 'user',
@@ -25,7 +23,6 @@ const userLine = (): string =>
     message: { role: 'user', content: 'hello' }
   })
 
-/** assistant 行样例（含 message.usage，字段可覆盖；id 为 message.id 语义请求 ID） */
 const assistantLine = (o: {
   uuid?: string
   id?: string
@@ -97,9 +94,9 @@ describe('detect', () => {
 describe('parseFile 增量解析', () => {
   it('从 0 解析：跳过 user/损坏行，尾部半行不阻塞，游标停在最后成功解析行', async () => {
     const file = path.join(tmpDir, 'main.jsonl')
-    const brokenMid = '{this is broken json' // 中间损坏行
+    const brokenMid = '{this is broken json'
     const trailingHalf =
-      '{"type":"assistant","uuid":"a-2","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input_tokens":' // 尾部半行（未写完）
+      '{"type":"assistant","uuid":"a-2","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input_tokens":'
     fs.writeFileSync(file, [userLine(), assistantLine(), brokenMid, trailingHalf].join('\n'), 'utf8')
 
     const res = await claudePlugin.parseFile(ctx, file, 0)
@@ -124,7 +121,6 @@ describe('parseFile 增量解析', () => {
     expect(r.createdAt).toBe(Date.parse(ASST_TS))
     expect(r.source).toEqual({ filePath: file, line: 2 })
 
-    // 尾部半行补全后，从 nextLine 续读只产出新增（line 4），不重放 line 2
     fs.writeFileSync(
       file,
       [
@@ -156,12 +152,10 @@ describe('parseFile 增量解析', () => {
     expect(res.nextLine).toBe(4)
     expect(res.eof).toBe(true)
 
-    // 未追加内容时续读：无新增
     const res2 = await claudePlugin.parseFile(ctx, file, res.nextLine)
     expect(res2.records).toHaveLength(0)
     expect(res2.eof).toBe(true)
 
-    // 追加一行后再续读：只产出该新增行
     fs.appendFileSync(file, `\n${assistantLine({ uuid: 'a-3', timestamp: '2026-08-19T10:00:15+08:00' })}`, 'utf8')
     const res3 = await claudePlugin.parseFile(ctx, file, res.nextLine)
     expect(res3.records).toHaveLength(1)
@@ -235,12 +229,11 @@ describe('parseFile 增量解析', () => {
 
   it('message.id 写入 source.requestId；缺失/非字符串时不设置（退回旧去重）', async () => {
     const file = path.join(tmpDir, 'main.jsonl')
-    // 带 id：fork 场景同一消息出现在不同文件也能语义判重
     fs.writeFileSync(
       file,
       [
         assistantLine({ uuid: 'a-1', id: 'msg_01ABC' }),
-        assistantLine({ uuid: 'a-2', timestamp: '2026-08-19T10:00:10+08:00' }), // 无 id
+        assistantLine({ uuid: 'a-2', timestamp: '2026-08-19T10:00:10+08:00' }),
         JSON.stringify({
           type: 'assistant',
           uuid: 'a-3',
@@ -248,7 +241,7 @@ describe('parseFile 增量解析', () => {
           sessionId: 'sess-1',
           cwd: '/Users/a/b',
           message: { role: 'assistant', id: 42, model: 'claude-sonnet-4-5', usage: { input_tokens: 1, output_tokens: 1 } }
-        }) // 非字符串 id
+        })
       ].join('\n'),
       'utf8'
     )
@@ -262,7 +255,6 @@ describe('parseFile 增量解析', () => {
 })
 
 describe('失败请求可观测（isApiErrorMessage === true）', () => {
-  /** 构造失败行（T01 矩阵：isApiErrorMessage === true => error） */
   const errorLine = (o: {
     uuid?: string
     id?: string
@@ -338,7 +330,6 @@ describe('失败请求可观测（isApiErrorMessage === true）', () => {
 
   it('model 缺失时兜底 <synthetic>；无 message.model 且无 msg 时亦为 <synthetic>', async () => {
     const file = path.join(tmpDir, 'main.jsonl')
-    // 无 model 字段
     const lineNoModel = JSON.stringify({
       type: 'assistant',
       uuid: 'u-err-2',
@@ -360,14 +351,11 @@ describe('失败请求可观测（isApiErrorMessage === true）', () => {
 
   it('errorMessage 优先取顶层 content[0].text，其次 message.content；超 500 截断', async () => {
     const file = path.join(tmpDir, 'main.jsonl')
-    // 顶层与 message 同时有 content，优先顶层
     fs.writeFileSync(
       file,
       [
         errorLine({ uuid: 'u-1', id: 'msg_a', apiErrorStatus: 400, contentText: 'top level error', messageContentText: 'message level error' }),
-        // 仅 message.content 有文本
         errorLine({ uuid: 'u-2', id: 'msg_b', apiErrorStatus: 400, contentText: undefined, messageContentText: 'from message', extraTopContent: [] } as any),
-        // message.content 为字符串形态
         JSON.stringify({
           type: 'assistant',
           uuid: 'u-3',
@@ -378,7 +366,6 @@ describe('失败请求可观测（isApiErrorMessage === true）', () => {
           apiErrorStatus: 502,
           message: { role: 'assistant', id: 'msg_c', model: 'claude-sonnet-4-5', content: 'string content error' }
         }),
-        // 超长截断
         errorLine({ uuid: 'u-4', id: 'msg_d', apiErrorStatus: 529, contentText: 'x'.repeat(800) })
       ].join('\n'),
       'utf8'
@@ -406,7 +393,6 @@ describe('失败请求可观测（isApiErrorMessage === true）', () => {
       message: { role: 'assistant', content: [{ type: 'text', text: 'bad status type' }] }
     })
     const lineWithId = errorLine({ uuid: 'u-5', id: 'msg_has_id', apiErrorStatus: 401, contentText: 'unauthorized' })
-    // 顶层无 id 也无 uuid 情况（message 无 id，row 无 uuid）→ 无 requestId
     const lineNoId = JSON.stringify({
       type: 'assistant',
       timestamp: '2026-08-19T10:00:24+08:00',
@@ -454,7 +440,6 @@ describe('失败请求可观测（isApiErrorMessage === true）', () => {
     })
     fs.writeFileSync(file, [falseLine, stringLine].join('\n'), 'utf8')
     const res = await claudePlugin.parseFile(ctx, file, 0)
-    // 两行均为 isApiErrorMessage !== true，走 success 路径均产出 success（有 usage + model）
     expect(res.records).toHaveLength(2)
     expect(res.records[0].status).toBe('success')
     expect(res.records[1].status).toBe('success')
@@ -475,7 +460,6 @@ describe('失败请求可观测（isApiErrorMessage === true）', () => {
   })
 
   it('error 记录不被折叠逻辑吞并：同 message.id 的 error 与 success 并存，success 仍按 output 最大折叠', async () => {
-    // 构造：两条 success 同 id 会折叠为 1，另有一条 error 同 id 应独立保留
     const file = path.join(tmpDir, 'main.jsonl')
     fs.writeFileSync(
       file,
@@ -519,7 +503,6 @@ describe('失败请求可观测（isApiErrorMessage === true）', () => {
 })
 
 describe('流式分片按 message.id 折叠', () => {
-  /** foldById 单测用的最小记录构造器（line 兼作 createdAt，便于断言最终行） */
   const foldRecord = (o: { requestId?: string; output: number; line: number }): UsageRecord => ({
     appType: 'claude',
     model: 'claude-sonnet-4-5',
@@ -618,7 +601,6 @@ describe('listFilesFromRoot 收集范围', () => {
     fs.writeFileSync(path.join(sub, 'sub-1.jsonl'), userLine())
     fs.writeFileSync(path.join(sub, 'sub-2.jsonl'), userLine())
     fs.writeFileSync(path.join(wf, 'deep-1.jsonl'), userLine())
-    // 项目目录外的散落 jsonl 不收集
     fs.writeFileSync(path.join(root, 'loose.jsonl'), userLine())
 
     const entries = listFilesFromRoot(root)

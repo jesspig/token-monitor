@@ -4,7 +4,7 @@ title: 定价与费用
 description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填与存量缓存口径重算；费用 = fresh_input × input 价 + 其余 token × 各自价格，input 按 semantics 三态扣减。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-08-26T03:21:00+08:00
+timestamp: 2026-08-28T02:27:00+08:00
 ---
 
 # 定价与费用
@@ -38,7 +38,7 @@ timestamp: 2026-08-26T03:21:00+08:00
 | 1 | input 为含缓存读写的总量 | `max(0, input − cacheRead − cacheCreation)` |
 | 2 | input 已为纯新输入 | inputTokens |
 
-五源实际口径（2026-08-23 经上游源码逐一核实）：claude 与 opencode 上游已扣减缓存（=2，不扣）；codex / gemini / grok 的 input_tokens 为含缓存总量（=1，扣 read+write，三源 write 桶实际恒为 0）。旧公式对 semantics=1 全额计价曾造成缓存部分重复计费、费用系统性高估，已修复。
+8 源实际口径（最初 5 个内置源经 2026-08-23 上游源码逐一核实；pi / zcode / dsh 于 2026-08-23 后续接入，其 semantics 各自正确：pi=2、zcode=1、dsh=2）：claude 与 opencode 上游已扣减缓存（=2，不扣）；codex / gemini / grok / zcode 的 input_tokens 为含缓存总量（=1，扣 read+write，四源 write 桶实际恒为 0）。旧公式对 semantics=1 全额计价曾造成缓存部分重复计费、费用系统性高估，已修复。
 
 ## 模型 ID 归一化（已实现，8 步规则）
 
