@@ -4,7 +4,7 @@ title: 总体架构
 description: 插件宿主（Electron 主进程）承担全部数据逻辑，渲染进程经 preload contextBridge 白名单通信。
 tags: [architecture, electron, main-process, renderer, ipc, plugin-host]
 resource: src/main/
-timestamp: 2026-08-27T17:37:26+08:00
+timestamp: 2026-08-28T02:27:00+08:00
 ---
 
 # 总体架构
@@ -22,7 +22,7 @@ Electron 主进程（插件宿主）
 │   ├── lifecycle.ts   依赖解析与装载/卸载（可逆清理）
 │   └── event-bus.ts   类型化事件（usage-updated，200ms 防抖）
 ├── plugins/        监控插件（每个监控对象一个模块：<id>.ts）
-│   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts
+│   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts pi.ts zcode.ts dsh.ts
 ├── services/       核心服务（注册进 ctx，供插件注入）
 │   ├── storage.ts     SQLite 读写 + 日聚合 + 小时聚合物化（v10）
 │   ├── pricing.ts     定价与费用计算 + 零成本回填

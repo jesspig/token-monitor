@@ -4,7 +4,7 @@ title: 同步与去重
 description: 增量游标 + mtime 短路 + chokidar 定向监听 + 定时兜底扫描；主键幂等去重 + fork/rewrite 语义去重账本；失败零 token 放行与存量回溯 v9 全量清游标幂等重放；清理前预回填。
 tags: [sync, dedup, cursor, mtime-shortcut, chokidar, watcher, failure-observability]
 resource: src/main/services/storage.ts
-timestamp: 2026-08-27T02:12:00+08:00
+timestamp: 2026-08-28T02:27:00+08:00
 ---
 
 # 同步与去重
@@ -35,7 +35,7 @@ timestamp: 2026-08-27T02:12:00+08:00
 
 1. **主键去重**：记录 id = `data_source:file_path:line`（`:` 分隔），入库用 `INSERT OR IGNORE`；命中即跳过，且**不累计**进日聚合。v9 全量重析时已入库的成功记录因该主键冲突 `info.changes===0` 跳过，不重复累 `rollup`/`addedRecords`（见下方「失败存量回溯」）。
 2. **语义去重（fork/rewrite 场景）**：八插件均产出稳定 `source.requestId`——claude=`message.id`/`uuid`、codex=`threadId:行timestamp:in-cached-out` / stream_error 无 id（退回主键）、opencode=`db 行主键 id`（`SELECT m.*` 兼容 `message.id` 回退）、gemini=消息 `id`、grok=`sid:loop_index` 全量重析、pi/zcode/dsh 见 [监控插件](monitor-plugins.md) 失败判定表。`recordUsage` 事务内按 `(data_source, request_id)` 查 `dedup_ledger`（`SELECT ... WHERE data_source=? AND request_id=?`），命中即跳过（不入明细、不计 rollup、不计 addedRecords、不触发 usage-updated）；插入成功回填账本 `semantic_id=sha256 前 16 位`（仅存证，判定按 `request_id` 直配）；失败记录常零 token，其 `semantic_id` 可能相同但**不参与判定**，主路径仍以 `(data_source, request_id)` 为准，不会误合并。无 requestId 的记录退回主键去重。
-3. 入库前另有一道数据质量闸门：解析产物中 input / output / cache_read / cache_creation **四项全 0** 的记录被 `collector.isAllZeroUsage` 统一拦截不入库（游标仍按 nextLine 正常推进），避免空转请求污染明细与聚合；**失败例外（2026-08-27）**：`status==='error'` 的记录即使四项全 0 亦**放行**（`isAllZeroUsage` 判定首行 `if (record.status==='error') return false`，`shared/failure.ts` 矩阵），保证零 token 失败可观测；`cancelled/interrupted` 属中断忽略由插件层不产 error 本闸门不涉；存量同类脏数据由 v3 迁移一次性清洗（见 [数据模型](data-model.md) v3）。
+3. 入库前另有一道数据质量闸门：解析产物中 input / output / cache_read / cache_creation **四项全 0** 的记录被 `collector.isAllZeroUsage` 统一拦截不入库（游标仍按 nextLine 正常推进），避免空转请求污染明细与聚合；**失败例外（2026-08-27）**：`status==='error'` 的记录即使四项全 0 亦**放行**（`isAllZeroUsage` 判定首行 `if (record.status==='error') return false`，依据 `shared/failure.ts` 的 `IGNORED_FAILURE_STATUSES` / `isIgnoredFailureReason` 常量与代码实现；代码注释已于 2026-08-28 全部移除，知识库为唯一事实来源），保证零 token 失败可观测；`cancelled/interrupted` 属中断忽略由插件层不产 error 本闸门不涉；存量同类脏数据由 v3 迁移一次性清洗（见 [数据模型](data-model.md) v3）。
 4. 失败文案截断：`collector.truncateErrorMessage` 对 `status='error'` 记录的 `errorMessage` 入库前再做 `slice(0,500)`（`shared/failure.ts:ERROR_MESSAGE_MAX_LENGTH`），DTO 层不限长，存储层 `toUsageRecordRow` 亦二次截断，双层收敛；成功记录零开销。
 5. opencode 新版 db 源的 line 由 `time_created` 水位派生并严格递增，保证跨轮唯一。
 

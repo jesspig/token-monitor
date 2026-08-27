@@ -1,10 +1,10 @@
 ---
 type: data-model
 title: 数据模型
-description: SQLite 五张核心表：明细、日聚合、定价、同步游标、去重账本；失败可观测性扩展（http_status/error_message，v8/v9）。
+description: SQLite 六张核心表：明细、日聚合、定价、同步游标、去重账本；失败可观测性扩展（http_status/error_message，v8/v9）。
 tags: [data-model, sqlite, schema, usage, failure-observability]
 resource: src/main/services/db.ts
-timestamp: 2026-08-27T17:37:26+08:00
+timestamp: 2026-08-28T02:27:00+08:00
 ---
 
 # 数据模型
@@ -23,7 +23,7 @@ timestamp: 2026-08-27T17:37:26+08:00
 | `sync_cursors` | 增量同步游标（v6 起含可空 `byte_offset` 压缩字节游标，dsh zstd 用） | `file_path` |
 | `dedup_ledger` | 去重账本（**已接入写入路径**，2026-08-23；fork/rewrite 语义去重生效） | `(data_source, request_id)` |
 
-索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`；v7 起明细另有两个部分索引（见下方「v7 部分索引迁移」）；**v8 新增的 `http_status` / `error_message` 不建独立索引**——失败记录占比极低（<1%），查询复用已有 `created_at` / `(app_type, created_at)` 的时间范围扫描即可，单列/部分索引增写入开销而收益可忽略（见 [同步与去重](sync-mechanism.md) 索引说明与 `usageQuery.ts:buildWhere` 注释）；**v10 起明细新增 `idx_usage_records_status(status)` / `idx_usage_records_project(project)` / `idx_usage_records_session_id(session_id)` 三单列索引（见下方「v10 迁移」），小时表另有 `idx_usage_hourly_rollups_date(date, app_type)`**。
+索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`；v7 起明细另有两个部分索引（见下方「v7 部分索引迁移」）；**v8 新增的 `http_status` / `error_message` 不建独立索引**——失败记录占比极低（<1%），查询复用已有 `created_at` / `(app_type, created_at)` 的时间范围扫描即可，单列/部分索引增写入开销而收益可忽略（见 [同步与去重](sync-mechanism.md) 索引说明与 `usageQuery.ts` 的 `buildWhere` 函数实现）；**v10 起明细新增 `idx_usage_records_status(status)` / `idx_usage_records_project(project)` / `idx_usage_records_session_id(session_id)` 三单列索引（见下方「v10 迁移」），小时表另有 `idx_usage_hourly_rollups_date(date, app_type)`**。
 
 ## 日聚合查询语义
 
@@ -158,7 +158,7 @@ CREATE INDEX idx_usage_records_app_created ON usage_records (app_type, created_a
 - `project` / `session_id` 记录会话归属（可选）。
 - `status` 三态语义（v1 起列，v8 起失败可观测）：
   - `'success'`（默认，缺省即 success）：正常完成，已计费或零成本但成功；
-  - `'error'`：失败（判定矩阵见 `shared/failure.ts` SSOT 与 `shared/dto.ts` 顶部注释，亦见 [监控插件](monitor-plugins.md) 失败判定表）；仅此时 `http_status` / `error_message` 有效；
+  - `'error'`：失败（判定详见 `shared/failure.ts` 的 `isIgnoredFailureReason` / `IGNORED_FAILURE_STATUSES` 与 `shared/dto.ts` 的 `UsageRecord` / `RequestStatus` 类型；代码注释已于 2026-08-28 全部移除，知识库为唯一事实来源，亦见 [监控插件](monitor-plugins.md) 失败判定表）；仅此时 `http_status` / `error_message` 有效；
   - 中断忽略（`cancelled` / `interrupted`，大小写不敏感，`shared/failure.ts:IGNORED_FAILURE_STATUSES`）：**不计 error**——插件层判定为中断即不产出 error 记录，亦不触发失败告警；`status` 保持缺省 success（不单独建 `'cancelled'` 状态），`http_status`/`error_message` 保持 `NULL`（见 `shared/failure.ts:isIgnoredFailureReason`）。
 - `http_status`（`INTEGER`，可空，仅失败有效）：HTTP 状态码（如 429/500/529 等）；成功/中断/存量为 `NULL`；由各插件按源提取（claude `apiErrorStatus`、zcode `error_code`、其余宽松探测），失败时宽松取首个有限数字（含字符串数字兼容），无精确码则不设（保持 `NULL`）。
 - `error_message`（`TEXT`，可空，仅失败有效）：截断后的错误文案，**最长 500 字符**（`shared/failure.ts:ERROR_MESSAGE_MAX_LENGTH=500`，`storage.ts:toUsageRecordRow` 入库前 `slice(0,500)`，DTO 层不限长）；成功/中断/存量为 `NULL`；由插件按源提取（见失败判定表），表格内预览截断 64 字符、详情抽屉完整展示。

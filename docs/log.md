@@ -2,6 +2,10 @@
 
 > 仅保留最近 7 天。详细按小时记录见 [changelog/](changelog/)。
 
+## 2026-08-28
+
+- **代码注释全量移除 + 知识库一致性对齐**：移除全部源码注释（`docs/` 成为唯一事实来源）；增量修订 10 个概念页——过时「5→8 插件」表述、SSOT 锚点由代码注释改为代码符号（`isIgnoredFailureReason` / `IGNORED_FAILURE_STATUSES` / `buildWhere` 等）、`data-flow.md` 机制编号纠错（1–10 连续）、`pricing.md` 术语统一为 8 源、`ui-pages.md` 补 `closeToTray` 开关、`roadmap.md` 补当前状态；同步 `AGENTS.md`（插件数/单测数/计费语义/新增「项目知识库」章节）与 `index.md` 目录；各页 `timestamp` 刷新至 2026-08-28。详见 [changelog/2026-08-28-02](changelog/2026-08-28-02.md)。
+
 ## 2026-08-27
 
 - **第七轮迭代（小时物化 + worker 线程 offload + 系统托盘常驻）**：db 新增 v10 迁移建 `usage_hourly_rollups` 小时聚合物化表（主键 date,hour,app_type,model，与日聚合镜像同事务增量维护，小时查询无筛选维度读该表、带 status/project/sessionId/keyword 回退明细全扫，含一次性回填与三单列索引 idx_usage_records_status/project/session_id；createDatabase 启用 WAL）；统计查询 offload 到只读 worker 线程（`workers/query-worker.ts` 只读 better-sqlite3 连接读已提交快照 + `worker/queryClient.ts` 主线程 RPC 客户端，in-flight 去重收敛 usage-updated 失效风暴，`:memory:` 回退直查）；系统托盘后台常驻（`tray.ts` createTray，关窗隐藏不退出、单实例锁、`closeToTray` 默认 true、设置页开关、`before-quit` 清理）。typecheck / 单测 / build 见各概念页与 changelog。
@@ -32,7 +36,3 @@
 - **第四轮迭代（时间范围五档 + 统计页精简 + 设置拆分）**：时间范围扩为 today/24h/7d/14d/30d 五档，today 与 24h 走小时聚合、其余按天（后端 LogFilters 纯时间戳过滤不变）；统计页「按模型」视图移除「应用」列；AppSettings 新增 statsRefreshIntervalMs（默认 5000）与 pricingSyncIntervalMs（默认 300000），价格自动同步间隔与渲染端轮询间隔均改为设置可配。typecheck / 222 项单测通过。
 - **第三轮迭代（数据质量 + 定价自动化 + CLI 版本探测）**：全零 token 记录入库前统一拦截（游标照常推进）+ v3 迁移清洗存量脏明细并重建受影响日期日聚合；models.dev 定价改为每 5 分钟无条件自动同步（seed 仅离线兜底），定价页只读化、IPC 收窄至 17 方法；新增 CLI `--version` 探测并在监控源页展示；渲染端 5s 兜底轮询、固定侧边栏布局与深色滚动条。typecheck / 222 项单测通过。
 - **AGENTS.md 精简重写**：改为紧凑指令文件，补充 pnpm 非 TTY 环境坑（`$env:CI='true'`）与单文件测试命令，删除与 docs/ 重复的低信号内容。
-
-## 2026-08-21
-
-- **代码-文档一致性审计**：重读全部核心源码核对概念页，修订 7 页（监控插件/插件体系/总体架构/数据流/同步去重/数据模型/定价），清除已消解的 `[!todo]`，删除与实现不符的描述；typecheck / 156 项单测复验通过。

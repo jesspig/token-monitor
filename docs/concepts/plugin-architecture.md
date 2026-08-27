@@ -4,13 +4,13 @@ title: 插件体系
 description: 一切皆插件：监控对象以插件形式装载，宿主提供注册表、服务容器、依赖注入、生命周期与事件总线。
 tags: [plugin, architecture, registry, dependency-injection, lifecycle, event]
 resource: src/main/core/
-timestamp: 2026-08-26T00:21:00+08:00
+timestamp: 2026-08-28T02:27:00+08:00
 ---
 
 # 插件体系
 
 > [!note] 当前状态
-> **第一阶段已实现**（2026-08-20）。自研插件框架落地于 `src/main/core/`（registry / context / lifecycle / event-bus），5 个监控插件经其装载；现内置 8 插件，宿主阶段二以 `Promise.all` **并行装载**（2026-08-26：scopes 按 plugin.id 分 key、插件间无共享可变状态，并行安全）。
+> **第一阶段已实现**（2026-08-20）。自研插件框架落地于 `src/main/core/`（registry / context / lifecycle / event-bus），8 个监控插件经其装载；现内置 8 插件，宿主阶段二以 `Promise.all` **并行装载**（2026-08-26：scopes 按 plugin.id 分 key、插件间无共享可变状态，并行安全）。
 
 ## 设计原则：一切皆插件
 
@@ -24,7 +24,7 @@ timestamp: 2026-08-26T00:21:00+08:00
 │   ├── lifecycle.ts    依赖解析（deps）与装载/卸载；卸载调用 dispose 可逆清理
 │   └── event-bus.ts    类型化事件（usage-updated，200ms 防抖合并）
 ├── plugins/         监控插件（每个监控对象一个模块：<id>.ts）
-│   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts
+│   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts pi.ts zcode.ts dsh.ts
 ├── services/        核心服务（注册进 ctx，供插件注入）
 └── ipc/             IPC handler + 事件推送
 ```

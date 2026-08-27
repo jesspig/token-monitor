@@ -4,7 +4,7 @@ title: 数据流
 description: 会话日志经插件增量解析、失败零 token 放行、双层去重、按输入语义计费后写入明细与日聚合（error_count），再供前端查询与错误可观测展示。
 tags: [data-flow, pipeline, usage, sqlite, plugin, failure-observability]
 resource: src/main/collector.ts
-timestamp: 2026-08-27T17:37:26+08:00
+timestamp: 2026-08-28T02:27:00+08:00
 ---
 
 # 数据流
@@ -40,9 +40,9 @@ CLI 会话文件(JSONL / JSON / SQLite)
 5. **全零过滤与费用计算（含失败放行）**：入库前统一拦截 inputTokens / outputTokens / cacheReadTokens / cacheCreationTokens **四项全 0** 的记录（`isAllZeroUsage`，不入库，游标仍按 nextLine 正常推进）；**失败例外（2026-08-27）**：`status='error'` 时即使四项全 0 亦放行（`isAllZeroUsage` 首行 `status==='error' → false`），`truncateErrorMessage` 对失败文案截断 500 后再计费；其余记录按定价表 + 可配置 cost multiplier 计费——`syncOne` 对单文件记录一次调用 `pricing.calcCostBatch`（单次取定价索引后同步逐条计算）并按位回填，无定价项 costUsd 保持空（失败零 token 计费为 0，2026-08-26 批量化，语义与逐条 calcCost 完全一致）。
 6. **日聚合（含 error_count）与小时聚合**：入库同事务按 `(date, app_type, model)` 桶累加 upsert（`recordUsage` 实时维护镜像），并**同步按 `(date, hour, app_type, model)` 累桶维护 `usage_hourly_rollups`**（v10 新增，与日桶口径一致）；`success_count` / `error_count` 按 `status` 分桶累加（`status==='error'` 则 `errorCount++`，否则 `successCount++`），token/cost/latency 同步累加；费用以微美元整数精度累加后回写字符串；明细可裁剪（prune），历史趋势由 rollups 镜像保证（日/小时表均永不清理）；`status`/`httpStatus`/`project`/`sessionId` 筛选回退明细表，不经 rollups（rollup 无对应维度列，v10 起明细有 `status`/`project`/`session_id` 单列索引）。
 7. **实时刷新**：新增记录数 > 0 才发 `usage-updated`（200ms 防抖合并，`addedRecords` 含失败新增，语义去重命中不计入），渲染端 `useUsageEvents` 订阅后失效 6 个用量 queryKey 触发重拉；**重取风暴由 QueryClient in-flight 去重收敛**——相同 `(method+args)` 的并发查询只发一次 worker 请求，多个失效订阅共享同一 Promise。
-10. **统计查询 offload 到 worker 线程（2026-08-27）**：`usageQuery` 在文件库模式下经 `worker/queryClient.ts` 把全部聚合/明细查询转发给 `workers/query-worker.ts` 只读 worker 线程；worker 持独立 `better-sqlite3` 只读连接（WAL 下读已提交快照），主线程不再因同步 `better-sqlite3` 查询被阻塞；`:memory:` / worker 启动失败回退主进程直查（仍走同一 `createUsageQuery`，仅失线程隔离）；退出经 `before-quit` 调 `queryClient.terminate()` 终止 worker。
 8. **零成本回填与存量重算**：`pricing.backfillZeroCost` 重算 `cost=0/null` 明细并增量修正 rollup 费用（应用启动延迟 20s、每次 models.dev 全量同步触发）；`pricing.recalcCachedInputCosts` 以新计费公式按活定价重算 codex/gemini/grok 存量高估行（宿主启动延迟 30s 触发，幂等）；保留清理前也先尽力回填，防止缺价明细到期删除后永久无法回补。启动期三类重活与首轮采集错峰执行（10s/20s/30s，2026-08-24）。
-9. **失败可观测性全链路（2026-08-27，T01 矩阵）**：8 插件按各自判定产出 `status='error'` + `httpStatus`/`errorMessage`（见 [监控插件](monitor-plugins.md) 失败判定表，`shared/failure.ts` 为 SSOT；`cancelled/interrupted` 忽略）→ `collector` 对失败放行全零并截断 500 → `storage` 持久化 `http_status/error_message`（`toUsageRecordRow` 直写，`recordUsage` 增量 `error_count`）→ `usageQuery` 失败筛选回退明细表（`status`/`httpStatus|statusCode`，复用时间索引）→ 前端请求日志「错误」列（`httpStatus` 徽章 + `errorMessage` 预览截断 64，`title` 悬停完整）与详情抽屉「错误信息」区完整展示；存量失败由 v9 `DELETE FROM sync_cursors` 全量重析回填，幂等重放保证见 [同步与去重](sync-mechanism.md) 失败存量回溯。
+9. **失败可观测性全链路（2026-08-27，T01 矩阵）**：8 插件按各自判定产出 `status='error'` + `httpStatus`/`errorMessage`（见 [监控插件](monitor-plugins.md) 失败判定表，`shared/failure.ts` 的 `isIgnoredFailureReason` / `IGNORED_FAILURE_STATUSES` / `ERROR_MESSAGE_MAX_LENGTH` 为唯一 SSOT；代码注释已于 2026-08-28 全部移除，知识库为唯一事实来源；`cancelled/interrupted` 忽略）→ `collector` 对失败放行全零并截断 500 → `storage` 持久化 `http_status/error_message`（`toUsageRecordRow` 直写，`recordUsage` 增量 `error_count`）→ `usageQuery` 失败筛选回退明细表（`status`/`httpStatus|statusCode`，复用时间索引，见 `usageQuery.ts` 的 `buildWhere` 函数实现）→ 前端请求日志「错误」列（`httpStatus` 徽章 + `errorMessage` 预览截断 64，`title` 悬停完整）与详情抽屉「错误信息」区完整展示；存量失败由 v9 `DELETE FROM sync_cursors` 全量重析回填，幂等重放保证见 [同步与去重](sync-mechanism.md) 失败存量回溯。
+10. **统计查询 offload 到 worker 线程（2026-08-27）**：`usageQuery` 在文件库模式下经 `worker/queryClient.ts` 把全部聚合/明细查询转发给 `workers/query-worker.ts` 只读 worker 线程；worker 持独立 `better-sqlite3` 只读连接（WAL 下读已提交快照），主线程不再因同步 `better-sqlite3` 查询被阻塞；`:memory:` / worker 启动失败回退主进程直查（仍走同一 `createUsageQuery`，仅失线程隔离）；退出经 `before-quit` 调 `queryClient.terminate()` 终止 worker。
 
 ## 关联页面
 
