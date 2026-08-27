@@ -154,7 +154,76 @@ function toUsageRecord(
   line: number
 ): UsageRecord | null {
   const payload = getPayloadObj(row)
-  if (row.type !== 'event_msg' || !payload || payload.type !== 'token_count') return null
+  if (row.type !== 'event_msg' || !payload) return null
+
+  // turn_aborted(interrupted) 属用户中断，忽略不计 error（shared/failure.ts）
+  if (payload.type === 'turn_aborted') return null
+
+  if (payload.type === 'stream_error') {
+    // stream_error → error 记录（T01 矩阵 codex 分支）
+    // 性能：追加的 if 分支，单次字符串相等 + 宽松取字段，无正则/全表扫描，成功路径零回退
+    const model = state.model ?? 'unknown'
+    const rawModel = model
+
+    // createdAt：行顶层 timestamp → payload/info 时间 → Date.now() 兜底
+    let createdAt = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN
+    if (Number.isNaN(createdAt)) {
+      const payloadTs = toStr(payload.timestamp) ?? toStr(payload.time)
+      if (payloadTs) {
+        const p = Date.parse(payloadTs)
+        if (!Number.isNaN(p)) createdAt = p
+      }
+    }
+    if (Number.isNaN(createdAt)) {
+      const info = payload.info
+      if (info && typeof info === 'object') {
+        const infoObj = info as Record<string, unknown>
+        const infoTs = toStr(infoObj.time) ?? toStr(infoObj.timestamp)
+        if (infoTs) {
+          const p = Date.parse(infoTs)
+          if (!Number.isNaN(p)) createdAt = p
+        }
+      }
+    }
+    if (Number.isNaN(createdAt)) createdAt = Date.now()
+
+    // httpStatus：payload.codex_error_info.http_status_code（如有），宽松兼容下划线/驼峰
+    let httpStatus: number | undefined
+    const errInfo = payload.codex_error_info
+    if (errInfo && typeof errInfo === 'object') {
+      const ei = errInfo as Record<string, unknown>
+      const raw =
+        ei.http_status_code ?? ei.httpStatusCode ?? ei.http_status ?? ei.status_code ?? ei.statusCode
+      if (typeof raw === 'number' && Number.isFinite(raw)) httpStatus = raw
+      else if (typeof raw === 'string' && raw.trim() !== '') {
+        const n = Number(raw)
+        if (Number.isFinite(n)) httpStatus = n
+      }
+    }
+
+    // errorMessage：payload.message（宽松取字符串，缺失则 undefined）
+    const errorMessage = toStr(payload.message)
+
+    return {
+      appType: 'codex',
+      model,
+      rawModel,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      inputSemantics: 1,
+      status: 'error',
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(errorMessage !== undefined ? { errorMessage } : {}),
+      createdAt,
+      project: state.cwd,
+      sessionId: state.sessionId,
+      source: { filePath, line }
+    }
+  }
+
+  if (payload.type !== 'token_count') return null
 
   const model = state.model
   if (!model) return null // 无当前模型（尚未出现 turn_context）→ 跳过

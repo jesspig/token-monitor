@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import type { MonitorPlugin } from '../../../shared/plugin'
 import type { PluginContext } from '../../../shared/context'
 import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../shared/dto'
+import { ERROR_MESSAGE_MAX_LENGTH, isIgnoredFailureReason } from '../../../shared/failure'
 
 /**
  * grok 监控插件（docs/concepts/monitor-plugins.md）。
@@ -152,6 +153,150 @@ export async function loadModelMap(root: string): Promise<Map<string, string>> {
 /** 宽松取数字：缺失/非有限数 → 0 */
 const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 
+/** 截断错误文案至 500（存储层 SSOT 为 shared/failure.ts ERROR_MESSAGE_MAX_LENGTH） */
+function truncateMessage(text: string): string {
+  return text.length > ERROR_MESSAGE_MAX_LENGTH ? text.slice(0, ERROR_MESSAGE_MAX_LENGTH) : text
+}
+
+/** 宽松提取 httpStatus：遍历候选 key，取首个有限数字（字符串数字亦兼容） */
+function extractHttpStatus(row: Record<string, unknown>, ctx: Record<string, unknown>): number | undefined {
+  const candidates = [
+    row.httpStatus,
+    row.http_status,
+    (row as Record<string, unknown>).http_status_code,
+    (row as Record<string, unknown>).httpStatusCode,
+    row.statusCode,
+    row.status_code,
+    ctx.httpStatus,
+    ctx.http_status,
+    (ctx as Record<string, unknown>).http_status_code,
+    (ctx as Record<string, unknown>).httpStatusCode,
+    ctx.statusCode,
+    ctx.status_code
+  ]
+  for (const raw of candidates) {
+    if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+    if (typeof raw === 'string' && raw.trim() !== '') {
+      const n = Number(raw.trim())
+      if (Number.isFinite(n)) return n
+    }
+  }
+  // 嵌套 error 对象内亦尝试
+  for (const holder of [row.error, ctx.error, (row as Record<string, unknown>).errorMessage, ctx.errorMessage]) {
+    if (holder && typeof holder === 'object') {
+      const o = holder as Record<string, unknown>
+      const raw = o.httpStatus ?? o.http_status ?? o.statusCode ?? o.status_code ?? o.code
+      if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+      if (typeof raw === 'string' && raw.trim() !== '') {
+        const n = Number(raw.trim())
+        if (Number.isFinite(n)) return n
+      }
+    }
+  }
+  return undefined
+}
+
+/** 宽松提取错误文案：优先 error 字段，其次 errorMessage/error_message/message */
+function extractErrorMessage(row: Record<string, unknown>, ctx: Record<string, unknown>): string | undefined {
+  const candidates: unknown[] = [
+    row.error,
+    (row as Record<string, unknown>).errorMessage,
+    (row as Record<string, unknown>).error_message,
+    ctx.error,
+    (ctx as Record<string, unknown>).errorMessage,
+    (ctx as Record<string, unknown>).error_message,
+    (row as Record<string, unknown>).message,
+    ctx.message
+  ]
+  for (const raw of candidates) {
+    if (typeof raw === 'string' && raw.trim() !== '') return truncateMessage(raw.trim())
+    if (raw && typeof raw === 'object') {
+      const o = raw as Record<string, unknown>
+      const inner = o.message ?? o.error ?? o.text ?? o.content
+      if (typeof inner === 'string' && inner.trim() !== '') return truncateMessage(inner.trim())
+      try {
+        const s = JSON.stringify(raw)
+        if (s && s !== '{}' && s.trim() !== '') return truncateMessage(s)
+      } catch {
+        // ignore
+      }
+    }
+  }
+  // status 非 success 时以 status 文案作为错误文案兜底
+  const statusRaw = (row.status ?? ctx.status) as unknown
+  if (typeof statusRaw === 'string' && statusRaw.trim() !== '' && statusRaw.trim().toLowerCase() !== 'success') {
+    return truncateMessage(statusRaw.trim())
+  }
+  return undefined
+}
+
+/** 判断是否为中断忽略（cancelled/interrupted）— 宽松包含匹配，兼容 shared/failure 的精确匹配 */
+function isIgnoredText(text: string): boolean {
+  const lower = text.trim().toLowerCase()
+  if (isIgnoredFailureReason(lower)) return true
+  return lower.includes('cancelled') || lower.includes('canceled') || lower.includes('interrupted')
+}
+
+/**
+ * 检测 inference_done 行是否属失败：存在 error 字段或 status 非 success
+ * 性能：追加的宽松 if 分支，线性遍历少量候选 key + 字符串比较，无正则/全表扫描；
+ *       失败文案截断为单次 slice，单行 O(1) 判定，成功路径仅多一次非空检查。
+ */
+function detectGrokFailure(row: Record<string, unknown>, ctx: Record<string, unknown>): {
+  isFailure: boolean
+  errorMessage?: string
+  httpStatus?: number
+  isIgnored: boolean
+} {
+  const isNonEmpty = (v: unknown): boolean => {
+    if (v === undefined || v === null) return false
+    if (typeof v === 'string' && v.trim() === '') return false
+    return true
+  }
+  const hasErrorField =
+    isNonEmpty(row.error) ||
+    isNonEmpty((row as Record<string, unknown>).errorMessage) ||
+    isNonEmpty((row as Record<string, unknown>).error_message) ||
+    isNonEmpty(ctx.error) ||
+    isNonEmpty((ctx as Record<string, unknown>).errorMessage) ||
+    isNonEmpty((ctx as Record<string, unknown>).error_message)
+
+  let statusIsFailure = false
+  const statusCandidates = [row.status, ctx.status]
+  for (const s of statusCandidates) {
+    if (typeof s === 'string' && s.trim() !== '' && s.trim().toLowerCase() !== 'success') {
+      statusIsFailure = true
+      break
+    }
+    if (typeof s === 'number' && Number.isFinite(s) && s >= 400) {
+      statusIsFailure = true
+      break
+    }
+  }
+
+  const isFailure = Boolean(hasErrorField || statusIsFailure)
+  if (!isFailure) return { isFailure: false, isIgnored: false }
+
+  const errorMessage = extractErrorMessage(row, ctx)
+  const httpStatus = extractHttpStatus(row, ctx)
+
+  // 中断忽略：error 文案或 status 文案包含 cancelled/interrupted 时忽略
+  const checkTexts: string[] = []
+  if (errorMessage) checkTexts.push(errorMessage)
+  for (const s of statusCandidates) if (typeof s === 'string') checkTexts.push(s)
+  for (const e of [row.error, ctx.error, (row as Record<string, unknown>).errorMessage, (ctx as Record<string, unknown>).errorMessage]) {
+    if (typeof e === 'string') checkTexts.push(e)
+    else if (e && typeof e === 'object') {
+      const o = e as Record<string, unknown>
+      const inner = o.message ?? o.error ?? o.type ?? o.code
+      if (typeof inner === 'string') checkTexts.push(inner)
+    }
+  }
+  const isIgnored = checkTexts.some((t) => isIgnoredText(t))
+
+  return { isFailure, errorMessage, httpStatus, isIgnored }
+}
+
 /** 宽松取行时间：timestamp/ts/time（行或 ctx），全部失败 → Date.now() */
 function extractTime(row: Record<string, unknown>, ctx: Record<string, unknown>): number {
   for (const key of ['timestamp', 'ts', 'time']) {
@@ -192,6 +337,30 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
   const loop = c.loop_index
   const loopIndex = typeof loop === 'number' && Number.isFinite(loop) ? loop : undefined
   const requestId = rawSid && loopIndex !== undefined ? `${rawSid}:${loopIndex}` : undefined
+
+  // 宽松失败分支（T01 grok 宽松探测）：含 error 字段或 status 非 success 的 inference_done 行判 error
+  const failure = detectGrokFailure(row, c)
+  if (failure.isFailure) {
+    if (failure.isIgnored) return null
+    return {
+      appType: 'grok',
+      model,
+      rawModel: model,
+      // 失败时保留原 tokens（如有），缺失则 0（满足“全 0 或保留原 tokens”契约）
+      inputTokens: toNum(c.prompt_tokens),
+      outputTokens: toNum(c.completion_tokens),
+      cacheReadTokens: toNum(c.cached_prompt_tokens),
+      cacheCreationTokens: 0,
+      inputSemantics: 1, // TOTAL：prompt_tokens 含缓存读
+      status: 'error',
+      ...(failure.httpStatus !== undefined ? { httpStatus: failure.httpStatus } : {}),
+      ...(failure.errorMessage !== undefined ? { errorMessage: failure.errorMessage } : {}),
+      createdAt: extractTime(row, c),
+      project: typeof row.project === 'string' ? row.project : typeof row.cwd === 'string' ? row.cwd : undefined,
+      sessionId,
+      source: requestId ? { filePath, line, requestId } : { filePath, line }
+    }
+  }
 
   return {
     appType: 'grok',

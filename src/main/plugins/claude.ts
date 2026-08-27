@@ -110,6 +110,108 @@ export function detectFromRoot(rootDir: string): Detection {
 /** 宽松取数字：缺失/非有限数 → 0 */
 const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 
+/** 失败合成模型（T01 矩阵固化）：claude 失败统一归为 <synthetic>，无上游模型时兜底 */
+const SYNTHETIC_MODEL = '<synthetic>'
+
+/** 截断错误文案至 500（存储层 SSOT 为 shared/failure.ts ERROR_MESSAGE_MAX_LENGTH） */
+function truncateMessage(text: string): string {
+  return text.length > 500 ? text.slice(0, 500) : text
+}
+
+/** 宽松提取错误文案：优先顶层 content[0].text，其次 message.content（数组首块 text 或字符串） */
+function extractErrorMessage(
+  row: Record<string, unknown>,
+  msg: Record<string, unknown> | null
+): string | undefined {
+  // 顶层 content 数组首块
+  if (Array.isArray(row.content) && row.content.length > 0) {
+    const first = row.content[0] as Record<string, unknown> | null
+    if (first && typeof first.text === 'string' && first.text.trim() !== '') {
+      return truncateMessage(first.text)
+    }
+  }
+  if (typeof row.content === 'string' && row.content.trim() !== '') {
+    return truncateMessage(row.content as string)
+  }
+  if (msg) {
+    const mc = msg.content
+    if (Array.isArray(mc) && mc.length > 0) {
+      const first = mc[0] as Record<string, unknown> | null
+      if (first && typeof first.text === 'string' && first.text.trim() !== '') {
+        return truncateMessage(first.text)
+      }
+    }
+    if (typeof mc === 'string' && (mc as string).trim() !== '') {
+      return truncateMessage(mc as string)
+    }
+  }
+  return undefined
+}
+
+/**
+ * 失败行 → UsageRecord（T01 矩阵固化）。
+ * 触发条件：顶层 isApiErrorMessage === true（严格相等）。
+ * 产出：status='error'，httpStatus=apiErrorStatus（有限数字才写入），errorMessage 取
+ *       顶层 content[0].text 或 message.content 文本（截断 500），tokens 四项为 0，
+ *       model 取 message.model 或 <synthetic>，createdAt 取 timestamp，requestId 取
+ *       message.id 或 uuid（两者皆为 string 非空才采用）。
+ * 与 success 路径互斥：本函数在 parseFile 中优先于 toUsageRecord 调用；isApiErrorMessage
+ * 行无论是否同时满足 success 条件均按 error 产出，不进入 success 折叠语义。
+ * 性能：追加的 if 分支（isApiErrorMessage 严格相等 + 宽松取字段），无正则/全表扫描；
+ *       失败行仍按单行 O(1) 解析，成功路径零额外开销。
+ */
+function toErrorRecord(obj: unknown, filePath: string, line: number): UsageRecord | null {
+  if (!obj || typeof obj !== 'object') return null
+  const row = obj as Record<string, unknown>
+  if (row.isApiErrorMessage !== true) return null
+
+  const message = row.message
+  const msg = message && typeof message === 'object' ? (message as Record<string, unknown>) : null
+
+  const httpStatusRaw = row.apiErrorStatus
+  const httpStatus =
+    typeof httpStatusRaw === 'number' && Number.isFinite(httpStatusRaw) ? httpStatusRaw : undefined
+
+  const errorMessage = extractErrorMessage(row, msg)
+
+  let model: string
+  if (msg && typeof msg.model === 'string' && msg.model.trim() !== '') {
+    model = msg.model.trim()
+  } else {
+    model = SYNTHETIC_MODEL
+  }
+
+  let requestId: string | undefined
+  if (msg && typeof msg.id === 'string' && msg.id.trim() !== '') {
+    requestId = msg.id.trim()
+  } else if (typeof row.uuid === 'string' && row.uuid.trim() !== '') {
+    requestId = row.uuid.trim()
+  } else if (typeof row.id === 'string' && (row.id as string).trim() !== '') {
+    requestId = (row.id as string).trim()
+  }
+
+  const ts = typeof row.timestamp === 'string' ? row.timestamp : ''
+  const parsed = ts ? Date.parse(ts) : NaN
+
+  return {
+    appType: 'claude',
+    model,
+    rawModel: model,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    inputSemantics: 2,
+    status: 'error',
+    ...(httpStatus !== undefined ? { httpStatus } : {}),
+    ...(errorMessage !== undefined ? { errorMessage } : {}),
+    createdAt: Number.isNaN(parsed) ? Date.now() : parsed,
+    project: typeof row.cwd === 'string' ? row.cwd : undefined,
+    sessionId: typeof row.sessionId === 'string' ? row.sessionId : undefined,
+    source: { filePath, line, ...(requestId ? { requestId } : {}) }
+  }
+}
+
 /**
  * 单行 JSON → UsageRecord。
  * 仅 type==='assistant' 且 message.usage 存在时产出；
@@ -179,6 +281,11 @@ export function foldById(records: UsageRecord[]): UsageRecord[] {
   // requestId → 该请求在 out 中占位的下标（替换时位置不变）
   const slots = new Map<string, number>()
   for (const rec of records) {
+    // 失败记录按 message.id 独立，不参与 success 流式折叠（避免吞并）
+    if (rec.status === 'error') {
+      out.push(rec)
+      continue
+    }
     const rid = rec.source.requestId
     if (!rid) {
       out.push(rec)
@@ -246,6 +353,13 @@ async function parseFile(
       continue
     }
 
+    // 失败路径优先（T01 矩阵）：isApiErrorMessage === true 产出 error 记录，与 success 互斥
+    const errorRecord = toErrorRecord(obj, filePath, lineNumber)
+    if (errorRecord) {
+      buffered.push(errorRecord)
+      nextLine = lineNumber + 1
+      continue
+    }
     const record = toUsageRecord(obj, filePath, lineNumber)
     if (record) buffered.push(record)
     nextLine = lineNumber + 1

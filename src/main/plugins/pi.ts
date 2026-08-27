@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import type { MonitorPlugin } from '../../../shared/plugin'
 import type { PluginContext } from '../../../shared/context'
 import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../shared/dto'
+import { ERROR_MESSAGE_MAX_LENGTH, isIgnoredFailureReason } from '../../../shared/failure'
 
 /**
  * pi 监控插件（Pi Coding Agent，earendil-works 开源 TUI agent harness）。
@@ -122,10 +123,162 @@ export function detectFromRoot(root: string): Detection {
 /** 宽松取数字：缺失/非有限数 → 0 */
 const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 
+/** 截断错误文案至 500（存储层 SSOT 为 shared/failure.ts ERROR_MESSAGE_MAX_LENGTH） */
+function truncateMessage(text: string): string {
+  return text.length > ERROR_MESSAGE_MAX_LENGTH ? text.slice(0, ERROR_MESSAGE_MAX_LENGTH) : text
+}
+
+/** 宽松提取 httpStatus：遍历候选 key，取首个有限数字（字符串数字亦兼容） */
+function extractHttpStatus(entry: Record<string, unknown>, msg: Record<string, unknown>): number | undefined {
+  const pools: unknown[] = [
+    entry.httpStatus,
+    entry.http_status,
+    (entry as Record<string, unknown>).httpStatusCode,
+    (entry as Record<string, unknown>).http_status_code,
+    entry.statusCode,
+    entry.status_code,
+    entry.code,
+    msg.httpStatus,
+    msg.http_status,
+    (msg as Record<string, unknown>).httpStatusCode,
+    (msg as Record<string, unknown>).http_status_code,
+    msg.statusCode,
+    msg.status_code,
+    msg.code
+  ]
+  // 嵌套 error 对象内亦尝试
+  for (const holder of [entry.error, msg.error, (entry as Record<string, unknown>).errorMessage, (msg as Record<string, unknown>).errorMessage]) {
+    if (holder && typeof holder === 'object') {
+      const o = holder as Record<string, unknown>
+      const raw = o.httpStatus ?? o.http_status ?? o.statusCode ?? o.status_code ?? o.code ?? o.status
+      if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+      if (typeof raw === 'string' && raw.trim() !== '') {
+        const n = Number(raw.trim())
+        if (Number.isFinite(n)) return n
+      }
+    }
+  }
+  for (const raw of pools) {
+    if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+    if (typeof raw === 'string' && raw.trim() !== '') {
+      const n = Number(raw.trim())
+      if (Number.isFinite(n)) return n
+    }
+  }
+  return undefined
+}
+
+/** 宽松提取错误文案（pi）：优先 entry/msg 的 error 字段，无显式错误时以 status 文案兜底 */
+function extractErrorMessage(entry: Record<string, unknown>, msg: Record<string, unknown>): string | undefined {
+  const candidates: unknown[] = [
+    entry.error,
+    (entry as Record<string, unknown>).errorMessage,
+    (entry as Record<string, unknown>).error_message,
+    msg.error,
+    (msg as Record<string, unknown>).errorMessage,
+    (msg as Record<string, unknown>).error_message
+  ]
+  for (const raw of candidates) {
+    if (typeof raw === 'string' && raw.trim() !== '') return truncateMessage(raw.trim())
+    if (raw && typeof raw === 'object') {
+      const o = raw as Record<string, unknown>
+      const inner = o.message ?? o.error ?? o.text ?? o.content
+      if (typeof inner === 'string' && inner.trim() !== '') return truncateMessage(inner.trim())
+      try {
+        const s = JSON.stringify(raw)
+        if (s && s !== '{}' && s.trim() !== '') return truncateMessage(s)
+      } catch {
+        // ignore
+      }
+    }
+  }
+  // status 非 success/completed/ok 时以 status 文案作为错误文案兜底（参考 grok/opencode 宽松探测）
+  const statusCandidates = [
+    entry.status,
+    (entry as Record<string, unknown>).state,
+    msg.status,
+    (msg as Record<string, unknown>).state
+  ]
+  for (const s of statusCandidates) {
+    if (typeof s === 'string' && s.trim() !== '' && !['success', 'completed', 'ok'].includes(s.trim().toLowerCase())) {
+      return truncateMessage(s.trim())
+    }
+  }
+  return undefined
+}
+
+/** 判断是否为中断忽略（cancelled/interrupted）— 宽松包含匹配，兼容 shared/failure 的精确匹配 */
+function isIgnoredText(text: string): boolean {
+  const lower = text.trim().toLowerCase()
+  if (isIgnoredFailureReason(lower)) return true
+  return lower.includes('cancelled') || lower.includes('canceled') || lower.includes('interrupted')
+}
+
+/**
+ * 检测 pi 条目是否属失败：含 error/isError/失败状态的 assistant 消息
+ * 性能：追加的宽松 if 分支，线性遍历少量候选 key + 字符串比较，无正则/全表扫描；
+ *       中断忽略为轻量 includes，单行 O(1) 判定，成功路径零额外开销。
+ */
+function detectPiFailure(
+  entry: Record<string, unknown>,
+  msg: Record<string, unknown>
+): { isFailure: boolean; errorMessage?: string; httpStatus?: number; isIgnored: boolean } {
+  const isNonEmpty = (v: unknown): boolean => {
+    if (v === undefined || v === null) return false
+    if (typeof v === 'string' && v.trim() === '') return false
+    return true
+  }
+  const hasErrorField =
+    isNonEmpty(entry.error) ||
+    isNonEmpty((entry as Record<string, unknown>).errorMessage) ||
+    isNonEmpty((entry as Record<string, unknown>).error_message) ||
+    isNonEmpty(msg.error) ||
+    isNonEmpty((msg as Record<string, unknown>).errorMessage) ||
+    isNonEmpty((msg as Record<string, unknown>).error_message)
+
+  const isErrorFlag = entry.isError === true || (entry as Record<string, unknown>).is_error === true || msg.isError === true || (msg as Record<string, unknown>).is_error === true
+
+  let statusIsFailure = false
+  const statusCandidates = [entry.status, (entry as Record<string, unknown>).state, msg.status, (msg as Record<string, unknown>).state]
+  for (const s of statusCandidates) {
+    if (typeof s === 'string' && s.trim() !== '' && !['success', 'completed', 'ok'].includes(s.trim().toLowerCase())) {
+      statusIsFailure = true
+      break
+    }
+    if (typeof s === 'number' && Number.isFinite(s) && s >= 400) {
+      statusIsFailure = true
+      break
+    }
+  }
+
+  const isFailure = Boolean(hasErrorField || isErrorFlag || statusIsFailure)
+  if (!isFailure) return { isFailure: false, isIgnored: false }
+
+  const errorMessage = extractErrorMessage(entry, msg)
+  const httpStatus = extractHttpStatus(entry, msg)
+
+  const checkTexts: string[] = []
+  if (errorMessage) checkTexts.push(errorMessage)
+  for (const s of statusCandidates) if (typeof s === 'string') checkTexts.push(s)
+  for (const e of [entry.error, msg.error, (entry as Record<string, unknown>).errorMessage, (msg as Record<string, unknown>).errorMessage]) {
+    if (typeof e === 'string') checkTexts.push(e)
+    else if (e && typeof e === 'object') {
+      const o = e as Record<string, unknown>
+      const inner = o.message ?? o.error ?? o.type ?? o.code ?? o.status
+      if (typeof inner === 'string') checkTexts.push(inner)
+    }
+  }
+  // isError 标记本身不含文本，仍需检查相邻文案
+  const isIgnored = checkTexts.some((t) => isIgnoredText(t))
+
+  return { isFailure, errorMessage, httpStatus, isIgnored }
+}
+
 /**
  * 单个 message 条目 → UsageRecord。
- * 仅 message.role==='assistant' 且 message.usage 为对象时产出；
- * 无 model 或无 usage 的条目返回 null（跳过该条，不阻塞整体）。
+ * 成功路径：仅 message.role==='assistant' 且 message.usage 为对象时产出；
+ * 失败路径：含 error/isError/失败状态的 assistant 消息宽松产出 error 记录（tokens 保留原值或全 0，model 缺失时兜底 unknown）。
+ * 无 model 且非失败的条目返回 null（跳过该条，不阻塞整体）。
  * 条目 id（上游 UUID）作为稳定语义请求 ID 写入 source.requestId：
  * fork 提取分支会把同一逻辑条目复制进新文件，(file,line) 主键去重无法识别，
  * storage 按 (data_source, request_id) 语义判重；id 缺失时不设置，退回旧主键去重。
@@ -143,13 +296,7 @@ function toUsageRecord(
   const msg = message as Record<string, unknown>
   if (msg.role !== 'assistant') return null
 
-  const model = typeof msg.model === 'string' ? msg.model.trim() : ''
-  if (!model) return null // 无 model 条目跳过
-
-  const usage = msg.usage
-  if (!usage || typeof usage !== 'object') return null
-  const u = usage as Record<string, unknown>
-
+  const rawModel = typeof msg.model === 'string' ? msg.model.trim() : ''
   // 宽松取语义请求 ID：string 且非空才采用
   const requestId = typeof entry.id === 'string' && entry.id.trim() !== '' ? entry.id.trim() : undefined
 
@@ -158,10 +305,43 @@ function toUsageRecord(
   if (createdAt <= 0) createdAt = toNum(msg.timestamp)
   if (createdAt <= 0) createdAt = Date.now()
 
+  // 宽松失败分支（T01 pi 宽松探测）：条目含 error/isError/失败状态的 assistant 消息判 error
+  const failure = detectPiFailure(entry, msg)
+  if (failure.isFailure) {
+    if (failure.isIgnored) return null
+    const model = rawModel || 'unknown'
+    // 失败时保留原 tokens（如有），缺失则全 0
+    const usage = msg.usage && typeof msg.usage === 'object' ? (msg.usage as Record<string, unknown>) : null
+    const u = usage ?? {}
+    return {
+      appType: 'pi',
+      model,
+      rawModel: model,
+      inputTokens: toNum(u.input),
+      outputTokens: toNum(u.output),
+      cacheReadTokens: toNum(u.cacheRead),
+      cacheCreationTokens: toNum(u.cacheWrite),
+      inputSemantics: 2,
+      status: 'error',
+      ...(failure.httpStatus !== undefined ? { httpStatus: failure.httpStatus } : {}),
+      ...(failure.errorMessage !== undefined ? { errorMessage: failure.errorMessage } : {}),
+      createdAt,
+      project: session.project,
+      sessionId: session.sessionId,
+      source: { filePath, line, ...(requestId ? { requestId } : {}) }
+    }
+  }
+
+  if (!rawModel) return null // 无 model 的成功条目跳过
+
+  const usage = msg.usage
+  if (!usage || typeof usage !== 'object') return null
+  const u = usage as Record<string, unknown>
+
   return {
     appType: 'pi',
-    model,
-    rawModel: model,
+    model: rawModel,
+    rawModel: rawModel,
     inputTokens: toNum(u.input),
     outputTokens: toNum(u.output),
     cacheReadTokens: toNum(u.cacheRead),
