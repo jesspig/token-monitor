@@ -4,13 +4,13 @@ title: 总体架构
 description: 插件宿主（Electron 主进程）承担全部数据逻辑，渲染进程经 preload contextBridge 白名单通信。
 tags: [architecture, electron, main-process, renderer, ipc, plugin-host]
 resource: src/main/
-timestamp: 2026-08-26T00:21:00+08:00
+timestamp: 2026-08-27T17:37:26+08:00
 ---
 
 # 总体架构
 
 > [!note] 当前状态
-> **第一阶段已实现**（2026-08-20）。分层结构落地于 `src/main`（core/、plugins/、services/、ipc/）+ `src/preload` + `src/renderer`，与仓库实际代码一致。2026-08-22：IPC 收窄至 17 方法（定价只读化），新增 CLI 版本探测服务，schema 升级至 v3。**2026-08-26：启动拆两阶段（bootstrapHost 快速段 + startServices 阶段二），窗口创建不再被插件装载阻塞；全部 IPC handler 经 `host.ready` 门控；首轮采集错峰延迟触发**。
+> **第一阶段已实现**（2026-08-20）。分层结构落地于 `src/main`（core/、plugins/、services/、ipc/、worker/、workers/、tray.ts）+ `src/preload` + `src/renderer`，与仓库实际代码一致。2026-08-22：IPC 收窄至 17 方法（定价只读化），新增 CLI 版本探测服务，schema 升级至 v3。**2026-08-26：启动拆两阶段（bootstrapHost 快速段 + startServices 阶段二），窗口创建不再被插件装载阻塞；全部 IPC handler 经 `host.ready` 门控；首轮采集错峰延迟触发**。**2026-08-27：统计查询 offload 到只读 worker 线程（`worker/queryClient.ts` + `workers/query-worker.ts`，WAL 共享 DB）；新增系统托盘后台常驻（`tray.ts`，关窗隐藏不退出、单实例锁、closeToTray 设置）；schema 升级至 v10（`usage_hourly_rollups` + 三筛选索引）**。
 
 ## 分层结构
 
@@ -24,16 +24,21 @@ Electron 主进程（插件宿主）
 ├── plugins/        监控插件（每个监控对象一个模块：<id>.ts）
 │   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts
 ├── services/       核心服务（注册进 ctx，供插件注入）
-│   ├── storage.ts     SQLite 读写 + 日聚合
+│   ├── storage.ts     SQLite 读写 + 日聚合 + 小时聚合物化（v10）
 │   ├── pricing.ts     定价与费用计算 + 零成本回填
 │   ├── scheduler.ts   定时兜底扫描
 │   ├── watcher.ts     chokidar 文件监听
-│   ├── usageQuery.ts  聚合查询（优先读日聚合镜像，带维度筛选时回退明细；语句级预编译缓存 prepareCached）
+│   ├── usageQuery.ts  聚合查询（优先读日/小时聚合镜像，带维度筛选时回退明细；语句级预编译缓存 prepareCached）
 │   ├── modelsdev.ts   models.dev 目录拉取与定价同步
 │   ├── budget.ts      预算状态计算（只读 rollups 算今日/本月费用与占比）
 │   ├── cli-version.ts CLI 版本探测（execFile <cli> --version，进程级缓存）
-│   ├── db.ts          建库与迁移（v1 建表 → v6 字节游标列，见数据模型页）
+│   ├── db.ts          建库与迁移（v1 建表 → v10 小时物化+筛选索引；启用 WAL）+ 只读连接工厂
 │   └── retention.ts   明细保留清理
+├── worker/        主线程侧 worker 客户端
+│   └── queryClient.ts 统计查询 RPC 客户端（offload 到 worker 线程；in-flight 去重；:memory: 回退直查）
+├── workers/       独立线程入口
+│   └── query-worker.ts 只读 better-sqlite3 连接 + createUsageQuery（WAL 下读已提交快照）
+├── tray.ts        系统托盘（后台常驻入口：createTray）
 └── ipc/            IPC handler（17 方法）+ 事件推送
         │
         │ contextBridge (preload 白名单 API)
@@ -52,9 +57,13 @@ Renderer (React)：Dashboard(预算横幅) / 趋势 / 日志表 / 统计 / 定�
 | `core/lifecycle.ts` | 依赖解析（deps）、延迟装载队列与卸载可逆清理（dispose + scope disposer） |
 | `core/event-bus.ts` | 类型化事件；数据更新经 `usage-updated`（200ms 防抖合并）推送 |
 | `plugins/` | 监控插件：实现 `MonitorPlugin`（见 [监控插件](monitor-plugins.md)） |
-| `services/` | 核心服务：存储/定价(含零成本回填、批量计费 calcCostBatch)/调度/监听/查询(语句预编译缓存)/models.dev 同步/预算/CLI 版本探测/迁移/保留清理 |
-| `collector.ts` | 采集编排：探测 → 列文件 → 增量解析 → 全零过滤 → 批量计费（calcCostBatch 按位回填）→ 入库 → 推游标 → 发事件；首轮同步支持 initialSyncDelayMs 错峰；getPluginStatus 并行探测各 CLI 版本 |
+| `services/` | 核心服务：存储(含日/小时聚合)/定价(含零成本回填、批量计费 calcCostBatch)/调度/监听/查询(语句预编译缓存)/models.dev 同步/预算/CLI 版本探测/迁移(WAL+筛选索引)/保留清理 |
+| `worker/queryClient.ts` | 统计查询 RPC 客户端：`createQueryClient(dataDir, db)`；文件库模式把查询 offload 到 worker 线程，相同 `(method+args)` 并发请求 in-flight 去重收敛失效风暴；`:memory:`/启动失败回退主进程直查；`terminate()` 退出时终止 worker |
+| `workers/query-worker.ts` | worker 线程入口：以 `{ readonly: true, fileMustExist: true }` 打开同一 DB 文件只读连接（WAL 下读已提交快照，不阻塞主线程写者），经 `createUsageQuery` 承载查询并按消息 RPC 回传 |
+| `tray.ts` | 系统托盘：`createTray(iconPath, {showWindow, quitApp})` 返回 `TrayHandle{destroy()}`；右键「显示/退出」、左键恢复窗口；无法创建时回退无托盘模式不抛错 |
+| `collector.ts` | 采集编排：探测 → 列文件 → 增量解析 → 全零过滤 → 批量计费（calcCostBatch 按位回填）→ 入库（同事务维护日+小时聚合）→ 推游标 → 发事件；首轮同步支持 initialSyncDelayMs 错峰；getPluginStatus 并行探测各 CLI 版本 |
 | `ipc/register.ts` | IPC handler（17 方法：ping + 8 查询(含 hourly-trends/filter-options) + 2 定价(pricing:list / modelsdev-sync) + 2 插件 + 2 设置 + 1 预算 + 1 事件推送）；全部 handler 统一包装 `await host.ready` 门控，宿主未就绪时调用挂起等待 |
+| `index.ts` | 应用入口：单实例锁、窗口关→隐藏（closeToTray）、window-all-closed 常驻不退出、second-instance 聚焦、before-quit 清理（tray.destroy + host.dispose + usageQuery.terminate） |
 
 ## 关键约束
 
@@ -63,6 +72,8 @@ Renderer (React)：Dashboard(预算横幅) / 趋势 / 日志表 / 统计 / 定�
 - 插件只通过 `ctx` 访问服务，**不直接 import 宿主实现**；任何注册都必须可逆清理。
 - 启动期窗口与 IPC 不等待插件装载：阶段二经 `Host.ready` 暴露就绪态，IPC 层统一门控挂起，消费方（如首轮采集触发）显式 await。
 - 定价内存缓存（`invalidateCache`）在任何定价写入路径后必须失效；当前唯一写入路径是 models.dev 同步，宿主 `syncModelsDevPricing` 已内置失效与回填。
+- **统计查询线程边界**：文件库模式下，所有统计查询经 `worker/queryClient.ts` 转发到 `workers/query-worker.ts` 只读 worker 线程执行；worker 持独立 `better-sqlite3` **只读**连接（WAL 下读已提交快照），主线程不再因同步 `better-sqlite3` 查询被阻塞。写者（采集/`recordUsage`/迁移/回填）仍走主进程读写连接，与 worker 只读连接共享同一 DB 文件，靠 WAL 并发读写隔离；`:memory:` 模式无独立文件、回退主进程直查（无线程隔离）。worker 生命周期由 `QueryClient.terminate()` 在 `before-quit` 统一清理，宿主 `dispose` 前终止，避免线程泄漏。
+- **后台常驻生命周期**：`index.ts` 以 `app.requestSingleInstanceLock()` 实现单实例（第二实例聚焦已存在窗口后退出）；窗口 `close` 事件中若未显式退出且 `AppSettings.closeToTray` 为真则 `preventDefault()` + `hide()`（关窗隐藏而非退出），`window-all-closed` 在非 darwin 且未开启常驻时才 `app.quit()`（开启常驻则进程常驻不退出）；`closeToTray` 默认 `true`（宿主设置默认值，设置页新增开关可改），为 `true` 时在 `createWindow` 后创建系统托盘（`closeToTray` 关闭时销毁托盘）；真正退出经托盘「退出」或 `before-quit` 触发 `willQuit=true` 后 `tray.destroy()` + `host.dispose()`，与既有「插件宿主全在主进程、与窗口解耦」一致——窗口关闭不卸载插件、不停止采集，后台持续同步。
 
 ## 关联页面
 

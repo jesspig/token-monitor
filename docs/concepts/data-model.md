@@ -4,13 +4,13 @@ title: 数据模型
 description: SQLite 五张核心表：明细、日聚合、定价、同步游标、去重账本；失败可观测性扩展（http_status/error_message，v8/v9）。
 tags: [data-model, sqlite, schema, usage, failure-observability]
 resource: src/main/services/db.ts
-timestamp: 2026-08-27T02:12:00+08:00
+timestamp: 2026-08-27T17:37:26+08:00
 ---
 
 # 数据模型
 
 > [!note] 当前状态
-> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5；2026-08-26 升级至 v6/v7；**2026-08-27 升级至 v8/v9——失败可观测性**）。五张表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；v6 为 `sync_cursors` 增可空列 `byte_offset` 字节游标；v7 为 `usage_records` 新增两个部分索引服务回填/重算候选扫描；**v8 为 `usage_records` 新增 `http_status` / `error_message` 失败可观测列（INTEGER/TEXT，仅失败有效，存量 NULL，见下方 v8）；v9 清空 `sync_cursors` 触发失败记录存量回溯全量重析（见下方 v9）**；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`。
+> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5；2026-08-26 升级至 v6/v7；**2026-08-27 升级至 v8/v9——失败可观测性**；**同日升级至 v10——小时粒度物化 `usage_hourly_rollups` + `usage_records` 三筛选索引**）。六表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；v6 为 `sync_cursors` 增可空列 `byte_offset` 字节游标；v7 为 `usage_records` 新增两个部分索引服务回填/重算候选扫描；**v8 为 `usage_records` 新增 `http_status` / `error_message` 失败可观测列（INTEGER/TEXT，仅失败有效，存量 NULL，见下方 v8）；v9 清空 `sync_cursors` 触发失败记录存量回溯全量重析（见下方 v9）**；**v10 新增 `usage_hourly_rollups` 小时聚合物化表（日聚合镜像的小时版，见下方 v10）并为 `usage_records` 增加 `status` / `project` / `session_id` 三单列索引（服务状态与归属维度筛选，见索引章节）**；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`，**自 v10 起启用 WAL（`journal_mode = WAL`，见下方「WAL 与并发读」）**。
 
 ## 表清单
 
@@ -18,17 +18,25 @@ timestamp: 2026-08-27T02:12:00+08:00
 |---|---|---|
 | `usage_records` | 用量明细 | `id`（去重 key = `data_source:file_path:line`） |
 | `usage_daily_rollups` | 日聚合镜像（`recordUsage` 实时维护，聚合查询优先读它，见下方「查询语义」） | `(date, app_type, model)` |
+| `usage_hourly_rollups` | 小时粒度聚合物化表（`recordUsage` 同事务增量维护，前端「按小时下钻 / 实时筛选」优先读它，见下方「v10 迁移」） | `(date, hour, app_type, model)` |
 | `model_pricing` | 定价（含 `source` 来源分级：`seed`/`sync`/`user`） | `model_id` |
 | `sync_cursors` | 增量同步游标（v6 起含可空 `byte_offset` 压缩字节游标，dsh zstd 用） | `file_path` |
 | `dedup_ledger` | 去重账本（**已接入写入路径**，2026-08-23；fork/rewrite 语义去重生效） | `(data_source, request_id)` |
 
-索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`；v7 起明细另有两个部分索引（见下方「v7 部分索引迁移」）；**v8 新增的 `http_status` / `error_message` 不建独立索引**——失败记录占比极低（<1%），查询复用已有 `created_at` / `(app_type, created_at)` 的时间范围扫描即可，单列/部分索引增写入开销而收益可忽略（见 [同步与去重](sync-mechanism.md) 索引说明与 `usageQuery.ts:buildWhere` 注释）。
+索引：明细按 `created_at` 与 `(app_type, created_at)`；游标按 `data_source`；账本按 `semantic_id`；v7 起明细另有两个部分索引（见下方「v7 部分索引迁移」）；**v8 新增的 `http_status` / `error_message` 不建独立索引**——失败记录占比极低（<1%），查询复用已有 `created_at` / `(app_type, created_at)` 的时间范围扫描即可，单列/部分索引增写入开销而收益可忽略（见 [同步与去重](sync-mechanism.md) 索引说明与 `usageQuery.ts:buildWhere` 注释）；**v10 起明细新增 `idx_usage_records_status(status)` / `idx_usage_records_project(project)` / `idx_usage_records_session_id(session_id)` 三单列索引（见下方「v10 迁移」），小时表另有 `idx_usage_hourly_rollups_date(date, app_type)`**。
 
 ## 日聚合查询语义
 
 - `usage_daily_rollups` 由 `storage.recordUsage` 在入库同事务实时维护，是明细的**镜像**而非独立主数据；桶字段含 `request_count / success_count / error_count`（`status='error'` 时 `error_count++`，否则 `success_count++`，见 `storage.ts:recordUsage`），费用与 token 的聚合口径与明细一致。
 - `usageQuery.ts` 全部聚合类查询（汇总 / 日趋势 / 按模型 / 按应用）**优先读本表**；筛选条件包含 `status` / `httpStatus`（含别名 `statusCode`）/ `project` / `sessionId` / `keyword` 时回退明细表（rollup 桶不携带 `http_status`/`error_message`/`status` 细筛与文本维度，下推会丢条件，见 `usageQuery.ts:canUseRollups` / `buildWhere` / `buildRollupWhere`）。
 - 明细分页与详情查询始终走明细表，不经 rollups（失败筛选 `status='error'` / `http_status=429` 等在明细表以 `WHERE status=? AND http_status=?` 精确过滤，复用 `created_at` 时间索引范围扫描）。
+
+## 小时聚合查询语义（v10 起）
+
+- `usage_hourly_rollups` 为 `usage_daily_rollups` 的**小时版镜像**，桶字段口径完全一致（request_count / success_count / error_count / 各 token / cost_usd / latency_ms_total），主键升级为 `(date, hour, app_type, model)`（hour 为本地时区 0–23 整点）。
+- 由 `storage.recordUsage` 在入库**同事务**增量维护（与日桶同口径累桶，按 `(date,hour,app_type,model)` 查现有值后 `ON CONFLICT DO UPDATE` 累加，回放幂等），非独立主数据。
+- `usageQuery.queryHourlyRows`（`getHourlyTrends` 底层）读路径：**无筛选维度时（即 `canUseRollups(filters)` 为真，不含 status/project/sessionId/keyword/httpStatus）读 `usage_hourly_rollups` 小表**，按 `date BETWEEN ? AND ?` 取候选，可选附带 `app_type IN (...)` / `model IN (...)` 过滤，再按精确时间窗裁剪（rollup 按整天归桶，剔除首尾越界钟点桶），与对明细全扫结果一致；**任一筛选维度存在时回退 `usage_records` 全扫**（GROUP BY `day_key, hour`），保持原有行为（rollup 桶不携带 status/project/sessionId/keyword 细筛维度，下推会丢条件）。
+- WAL 与并发读：`createDatabase` 已设 `journal_mode = WAL`，统计查询经 worker 线程只读连接（见 [总体架构](architecture.md) 与 [数据流](data-flow.md)）读已提交快照，不阻塞主线程写者。
 
 ## v3 数据修复迁移（已实现，幂等）
 
@@ -75,6 +83,37 @@ timestamp: 2026-08-27T02:12:00+08:00
 - 单事务与性能：由 `migrate()` 外层 `db.transaction` 包裹 `m.up + PRAGMA user_version`，仅一次 `fsync`；稳态重析一轮后游标即按 `parsed.nextLine` 重建，后续增量仍走 mtime 短路，开销仅首轮一次全量解析。
 - 幂等与去重：`DELETE` 重复执行无影响（无游标时 deletes 0 行）；重放由双层幂等保证——`usage_records` 主键 `id=data_source:file_path:line` 的 `INSERT OR IGNORE`（`storage.ts:insertRecordStmt`，`info.changes===0` 跳过不累 rollup/事件）+ `dedup_ledger` 主键 `(data_source, request_id)` 的 `INSERT OR IGNORE`（与明细同事务），成功记录因主键冲突跳过、仅新增的失败记录正常入库且增量修正 `usage_daily_rollups.error_count`，无重复计数风险。
 - 与本次迭代的联动：`collector.isAllZeroUsage` 已对 `status='error'` 放行全零（失败零 token 可观测），`storage.toUsageRecordRow` 已对 `errorMessage` 截断 500，v9 清游标是该放行的存量入口。
+
+## v10 小时物化 + 筛选索引迁移（已实现，幂等，2026-08-27）
+
+- 新增表 `usage_hourly_rollups`（DDL 见下方「小时聚合物化表结构」）：为前端「按小时下钻 / 实时筛选」提供聚合结果缓存，避免每次小时查询对 `usage_records` 全表聚合；桶字段与日聚合镜像口径一致。
+- 一次性回填：迁移以 `strftime('%Y-%m-%d'/'%H', created_at/1000, 'unixepoch', 'localtime')` 对 `usage_records` 按 `(date, hour, app_type, model)` GROUP BY 聚合，经 JS 循环复用 `microUsdToCostString`（微美元→字符串，与 storage/usageQuery 口径一致）写入；在 `db.transaction` 单事务内完成，仅一次 `fsync`。
+- 幂等：`CREATE TABLE/INDEX IF NOT EXISTS` + `INSERT OR REPLACE` 保证 `user_version` 回拨重放得相同聚合值、不会翻倍；与 v3/v4/v5 的数据级幂等一致。
+- 三单列索引（服务于状态与归属维度筛选）：`idx_usage_records_status ON usage_records(status)`、`idx_usage_records_project ON usage_records(project)`、`idx_usage_records_session_id ON usage_records(session_id)`；配合 v10 小时表的 `idx_usage_hourly_rollups_date(date, app_type)`。
+- 保留策略不受影响：同日/小时聚合镜像，`usage_hourly_rollups` **永不清理**，明细到期删除后历史趋势因镜像完整保留，聚合查询不受清理影响（与 `usage_daily_rollups` 一致）。
+
+## 小时聚合物化表结构（usage_hourly_rollups，v10 新增）
+
+```sql
+CREATE TABLE usage_hourly_rollups (
+  date                  TEXT    NOT NULL,
+  hour                  INTEGER NOT NULL,
+  app_type              TEXT    NOT NULL,  -- 插件 id：claude/codex/opencode/gemini/grok/pi/zcode/dsh
+  model                 TEXT    NOT NULL,
+  request_count         INTEGER NOT NULL DEFAULT 0,
+  success_count         INTEGER NOT NULL DEFAULT 0,
+  error_count           INTEGER NOT NULL DEFAULT 0,
+  input_tokens          INTEGER NOT NULL DEFAULT 0,
+  output_tokens         INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd              TEXT    NOT NULL DEFAULT '0',
+  latency_ms_total      INTEGER NOT NULL DEFAULT 0,
+  updated_at            INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, hour, app_type, model)
+);
+CREATE INDEX idx_usage_hourly_rollups_date ON usage_hourly_rollups (date, app_type);
+```
 
 ## 明细表结构（usage_records，已实现，v8 起含失败列）
 

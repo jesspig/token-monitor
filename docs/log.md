@@ -2,6 +2,10 @@
 
 > 仅保留最近 7 天。详细按小时记录见 [changelog/](changelog/)。
 
+## 2026-08-27
+
+- **第七轮迭代（小时物化 + worker 线程 offload + 系统托盘常驻）**：db 新增 v10 迁移建 `usage_hourly_rollups` 小时聚合物化表（主键 date,hour,app_type,model，与日聚合镜像同事务增量维护，小时查询无筛选维度读该表、带 status/project/sessionId/keyword 回退明细全扫，含一次性回填与三单列索引 idx_usage_records_status/project/session_id；createDatabase 启用 WAL）；统计查询 offload 到只读 worker 线程（`workers/query-worker.ts` 只读 better-sqlite3 连接读已提交快照 + `worker/queryClient.ts` 主线程 RPC 客户端，in-flight 去重收敛 usage-updated 失效风暴，`:memory:` 回退直查）；系统托盘后台常驻（`tray.ts` createTray，关窗隐藏不退出、单实例锁、`closeToTray` 默认 true、设置页开关、`before-quit` 清理）。typecheck / 单测 / build 见各概念页与 changelog。
+
 ## 2026-08-26
 
 - **「每步操作未响应」根治第二轮**：外部 SQLite 只读连接 busy 短超时（opencode/zcode `EXTERNAL_DB_BUSY_TIMEOUT_MS=250`，撞锁弃轮下轮重试，替代默认 5000ms 主线程冻结）；零成本回填/存量重算分批执行（rowid 游标 500 行/批、事务外计算单事务提交、批间 setImmediate 让出）并命中 v7 部分索引（idx_usage_records_zero_cost / idx_usage_records_cached_input，稳态扫描 O(全表) → O(候选数)）；dsh 解压下沉 worker_threads 单例（10s 超时销毁重建 + 异常环境恒主线程回退，构建产物 out/main/zstd-worker.js）+ 坏帧切割尝试上限 MAX_CUT_ATTEMPTS=8；collector.getPluginStatus 5s TTL 缓存（plugins:set-enabled 后主动失效）；pi/dsh detect 存在性短路递归；grok 映射 summary.json path:mtime 签名缓存；调度 schedule 支持 initialDelayMs 错相首触（retention sweep 半周期点火、启动延迟 30s→45s 错开 30s 处的存量费用重算）；渲染端移除全局 refetchInterval、仅用量类查询 8 处显式轮询（「统计自动刷新间隔」收窄为仅控制用量图表），usage-updated 失效 1000ms 节流 → 1500ms 防抖，日志搜索 300ms 防抖 + keepPreviousData 不闪空，设置页仅首载回填。typecheck 双段通过 / 29 文件 394 用例 / build 通过。
@@ -32,7 +36,3 @@
 ## 2026-08-21
 
 - **代码-文档一致性审计**：重读全部核心源码核对概念页，修订 7 页（监控插件/插件体系/总体架构/数据流/同步去重/数据模型/定价），清除已消解的 `[!todo]`，删除与实现不符的描述；typecheck / 156 项单测复验通过。
-
-## 2026-08-20
-
-- **第一阶段开发完成**：插件化监控宿主 + 5 个内置监控插件（claude/codex/opencode/gemini/grok）端到端实现；typecheck / 156 项单测 / 构建 / electron-builder 打包全部通过。概念页状态更新为「已实现」，AGENTS.md 同步。
