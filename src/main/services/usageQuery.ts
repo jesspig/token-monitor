@@ -404,27 +404,73 @@ function queryAppRows(db: SqliteDatabase, filters: LogFilters): AppRow[] {
     .all(...params) as AppRow[]
 }
 
-/** 按小时趋势行：rollup 表无小时粒度，恒走明细表按本地时区 (day_key, hour) 双维归桶（跨天窗口不合并同钟点） */
+/** 按小时趋势行：无筛选维度走已物化 usage_hourly_rollups 小表，带 status/project/sessionId/keyword 时回退明细表全扫 */
 function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
-  const { sql, params } = buildWhere(filters)
-  return prepareCached(
+  const startTime = filters.startTime ?? startOfTodayMs()
+  const endTime = filters.endTime ?? Date.now()
+  const startDay = toDateKey(startTime)
+  const endDay = toDateKey(endTime)
+
+  // 带 status/project/sessionId/keyword 时 rollup 无这些维度，回退明细表全扫（保留原行为）
+  if (!canUseRollups(filters)) {
+    const { sql, params } = buildWhere(filters)
+    return prepareCached(
+      db,
+      `SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS day_key,
+              strftime('%H', created_at / 1000, 'unixepoch', 'localtime') AS hour,
+              COUNT(*) AS request_count,
+              ${SUM_SUCCESS} AS success_count,
+              ${SUM_ERROR} AS error_count,
+              ${SUM_TOKENS.input} AS input_tokens,
+              ${SUM_TOKENS.output} AS output_tokens,
+              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
+              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
+              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
+       FROM usage_records
+       ${sql}
+       GROUP BY day_key, hour
+       ORDER BY day_key ASC, hour ASC`
+    )
+      .all(...params) as HourlyRow[]
+  }
+
+  // 无筛选维度：读已物化的小时桶，按 day_key/hour 聚合后做精确时间窗裁剪（与原全扫结果一致）
+  const extra: string[] = []
+  const params: unknown[] = [startDay, endDay]
+  if (filters.appTypes && filters.appTypes.length > 0) {
+    extra.push(`app_type IN (${filters.appTypes.map(() => '?').join(', ')})`)
+    params.push(...filters.appTypes)
+  }
+  if (filters.models && filters.models.length > 0) {
+    extra.push(`model IN (${filters.models.map(() => '?').join(', ')})`)
+    params.push(...filters.models)
+  }
+  const where = `WHERE date BETWEEN ? AND ?${extra.length ? ' AND ' + extra.join(' AND ') : ''}`
+  const rows = prepareCached(
     db,
-    `SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS day_key,
-            strftime('%H', created_at / 1000, 'unixepoch', 'localtime') AS hour,
-            COUNT(*) AS request_count,
-            ${SUM_SUCCESS} AS success_count,
-            ${SUM_ERROR} AS error_count,
-            ${SUM_TOKENS.input} AS input_tokens,
-            ${SUM_TOKENS.output} AS output_tokens,
-            ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-            ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-            COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-     FROM usage_records
-     ${sql}
+    `SELECT date AS day_key,
+            printf('%02d', hour) AS hour,
+            SUM(request_count) AS request_count,
+            SUM(success_count) AS success_count,
+            SUM(error_count) AS error_count,
+            SUM(input_tokens) AS input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            SUM(cache_read_tokens) AS cache_read_tokens,
+            SUM(cache_creation_tokens) AS cache_creation_tokens,
+            COALESCE(SUM(CAST(ROUND(COALESCE(cost_usd, '0') * 1000000) AS INTEGER)), 0) AS cost_micro_usd
+     FROM usage_hourly_rollups
+     ${where}
      GROUP BY day_key, hour
      ORDER BY day_key ASC, hour ASC`
-  )
-    .all(...params) as HourlyRow[]
+  ).all(...params) as HourlyRow[]
+
+  // 重叠裁剪：桶时间窗 [bucketMs, bucketEnd] 与查询窗 [startTime, endTime] 有交集即保留，
+  // 与原 usage_records 全扫（按记录 created_at 在 [start,end] 归桶）语义一致；避免边界小时桶被误删
+  return rows.filter((r) => {
+    const bucketMs = new Date(`${r.day_key}T${r.hour}:00`).getTime()
+    const bucketEnd = bucketMs + 3_600_000 - 1
+    return bucketEnd >= startTime && bucketMs <= endTime
+  })
 }
 
 /**

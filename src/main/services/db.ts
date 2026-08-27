@@ -17,7 +17,13 @@ export function createDatabase(location: ':memory:' | string): SqliteDatabase {
     return new Database(':memory:')
   }
   mkdirSync(location, { recursive: true })
-  return new Database(join(location, DB_FILENAME))
+  const db = new Database(join(location, DB_FILENAME))
+  // 文件模式启用 WAL，支持后续只读 worker 并发读；:memory: 无意义但无害，统一跳过。
+  if (location !== ':memory:') {
+    db.pragma('journal_mode = WAL')
+    db.pragma('busy_timeout = 5000')
+  }
+  return db
 }
 
 /** 单条迁移：version 单调递增，up 由调用方以事务包裹执行 */
@@ -331,6 +337,88 @@ const MIGRATIONS: Migration[] = [
       // - 单事务：由 migrate() 外层 db.transaction 包裹 m.up + PRAGMA user_version，仅一次 fsync；
       // - 性能：稳态重析一轮后游标即按 parsed.nextLine 重建，后续增量仍走 mtime 短路，开销仅首轮一次全量解析。
       db.prepare('DELETE FROM sync_cursors').run()
+    }
+  },
+  {
+    version: 10,
+    up(db) {
+      // 小时粒度物化表：为前端「按小时下钻 / 实时筛选」提供聚合结果缓存，
+      // 避免每次查询对 usage_records 全表聚合。仅新增表、索引与一次性回填，
+      // 不改既有表结构与写入路径；CREATE TABLE/INDEX IF NOT EXISTS + INSERT OR REPLACE
+      // 保证 user_version 回拨重放幂等（重复执行得相同聚合值，不会翻倍）。
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS usage_hourly_rollups (
+          date                TEXT    NOT NULL,
+          hour                INTEGER NOT NULL,
+          app_type            TEXT    NOT NULL,
+          model               TEXT    NOT NULL,
+          request_count       INTEGER NOT NULL DEFAULT 0,
+          success_count       INTEGER NOT NULL DEFAULT 0,
+          error_count         INTEGER NOT NULL DEFAULT 0,
+          input_tokens        INTEGER NOT NULL DEFAULT 0,
+          output_tokens       INTEGER NOT NULL DEFAULT 0,
+          cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+          cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+          cost_usd            TEXT    NOT NULL DEFAULT '0',
+          latency_ms_total    INTEGER NOT NULL DEFAULT 0,
+          updated_at          INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (date, hour, app_type, model)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_usage_hourly_rollups_date
+          ON usage_hourly_rollups(date, app_type);
+        CREATE INDEX IF NOT EXISTS idx_usage_records_status ON usage_records(status);
+        CREATE INDEX IF NOT EXISTS idx_usage_records_project ON usage_records(project);
+        CREATE INDEX IF NOT EXISTS idx_usage_records_session_id ON usage_records(session_id);
+      `)
+
+      // 一次性回填：从 usage_records 按 (date, hour, app_type, model) 聚合进小时桶。
+      // 用 JS 循环以便复用 microUsdToCostString（微美元→字符串，与 storage/usageQuery 口径一致）。
+      const rows = db.prepare(`
+        SELECT
+          strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS date,
+          CAST(strftime('%H', created_at / 1000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+          app_type, model,
+          COUNT(*) AS request_count,
+          SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
+          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
+          SUM(input_tokens) AS input_tokens,
+          SUM(output_tokens) AS output_tokens,
+          SUM(cache_read_tokens) AS cache_read_tokens,
+          SUM(cache_creation_tokens) AS cache_creation_tokens,
+          SUM(CAST(ROUND(COALESCE(cost_usd, '0') * 1000000) AS INTEGER)) AS cost_micro,
+          SUM(COALESCE(latency_ms, 0)) AS latency_ms_total
+        FROM usage_records
+        GROUP BY date, hour, app_type, model
+      `).all() as Array<{
+        date: string; hour: number; app_type: string; model: string
+        request_count: number; success_count: number; error_count: number
+        input_tokens: number; output_tokens: number; cache_read_tokens: number
+        cache_creation_tokens: number; cost_micro: number | null; latency_ms_total: number | null
+      }>
+
+      const ins = db.prepare(`
+        INSERT OR REPLACE INTO usage_hourly_rollups
+          (date, hour, app_type, model, request_count, success_count, error_count,
+           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, latency_ms_total, updated_at)
+        VALUES
+          (@date, @hour, @app_type, @model, @request_count, @success_count, @error_count,
+           @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens, @cost_usd, @latency_ms_total, @updated_at)
+      `)
+
+      const tx = db.transaction(() => {
+        for (const r of rows) {
+          ins.run({
+            date: r.date, hour: r.hour, app_type: r.app_type, model: r.model,
+            request_count: r.request_count, success_count: r.success_count, error_count: r.error_count,
+            input_tokens: r.input_tokens, output_tokens: r.output_tokens,
+            cache_read_tokens: r.cache_read_tokens, cache_creation_tokens: r.cache_creation_tokens,
+            cost_usd: microUsdToCostString(r.cost_micro ?? 0),
+            latency_ms_total: r.latency_ms_total ?? 0, updated_at: 0
+          })
+        }
+      })
+      tx()
     }
   }
 ]

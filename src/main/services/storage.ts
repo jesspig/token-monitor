@@ -61,6 +61,23 @@ interface RollupBucket {
   updatedAt: number
 }
 
+interface HourlyRollupBucket {
+  date: string
+  hour: number
+  appType: string
+  model: string
+  requestCount: number
+  successCount: number
+  errorCount: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  costMicroUsd: number
+  latencyMsTotal: number
+  updatedAt: number
+}
+
 /**
  * UsageRecord(dto) → usage_records 行；errorMessage 按 shared/failure.ts 500 约束截断
  * 性能：http_status / error_message 为简单列直写（INTEGER/TEXT），无计算/正则/派生开销；
@@ -115,6 +132,8 @@ export class SqliteStorage implements StorageService {
   private readonly insertDedupStmt: Database.Statement
   private readonly getRollupStmt: Database.Statement
   private readonly upsertRollupStmt: Database.Statement
+  private readonly getHourlyRollupStmt: Database.Statement
+  private readonly upsertHourlyRollupStmt: Database.Statement
   private readonly getCursorStmt: Database.Statement
   private readonly getCursorRowStmt: Database.Statement
   private readonly upsertCursorStmt: Database.Statement
@@ -173,6 +192,25 @@ export class SqliteStorage implements StorageService {
         latency_ms_total      = excluded.latency_ms_total,
         updated_at            = excluded.updated_at
     `)
+
+    this.getHourlyRollupStmt = db.prepare(
+      `SELECT request_count, success_count, error_count, input_tokens, output_tokens,
+              cache_read_tokens, cache_creation_tokens, cost_usd, latency_ms_total
+       FROM usage_hourly_rollups
+       WHERE date = ? AND hour = ? AND app_type = ? AND model = ?`
+    )
+    this.upsertHourlyRollupStmt = db.prepare(
+      `INSERT INTO usage_hourly_rollups
+         (date, hour, app_type, model, request_count, success_count, error_count,
+          input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, latency_ms_total, updated_at)
+       VALUES (@date, @hour, @app_type, @model, @request_count, @success_count, @error_count,
+          @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens, @cost_usd, @latency_ms_total, @updated_at)
+       ON CONFLICT(date, hour, app_type, model) DO UPDATE SET
+         request_count = @request_count, success_count = @success_count, error_count = @error_count,
+         input_tokens = @input_tokens, output_tokens = @output_tokens,
+         cache_read_tokens = @cache_read_tokens, cache_creation_tokens = @cache_creation_tokens,
+         cost_usd = @cost_usd, latency_ms_total = @latency_ms_total, updated_at = @updated_at`
+    )
 
     this.getCursorStmt = db.prepare(`
       SELECT line_offset FROM sync_cursors WHERE file_path = ?
@@ -234,6 +272,7 @@ export class SqliteStorage implements StorageService {
   recordUsage(records: UsageRecord[]): Promise<number> {
     const runTx = this.db.transaction((items: UsageRecord[]): number => {
       const buckets = new Map<string, RollupBucket>()
+      const hourlyBuckets = new Map<string, HourlyRollupBucket>()
       const now = Date.now()
       let added = 0
 
@@ -259,6 +298,7 @@ export class SqliteStorage implements StorageService {
 
         added++
         const date = toDateKey(r.createdAt)
+        const hour = new Date(r.createdAt).getHours()
         const key = `${r.appType}\u0000${date}\u0000${r.model}`
         let b = buckets.get(key)
         if (!b) {
@@ -288,6 +328,28 @@ export class SqliteStorage implements StorageService {
         b.cacheCreationTokens += r.cacheCreationTokens
         b.costMicroUsd += toMicroUsd(r.costUsd)
         b.latencyMsTotal += r.latencyMs ?? 0
+
+        // 小时粒度聚合：与日桶口径一致，按 (appType, date, hour, model) 累桶
+        const hKey = `${r.appType}\u0000${date}\u0000${hour}\u0000${r.model}`
+        let hb = hourlyBuckets.get(hKey)
+        if (!hb) {
+          hb = {
+            date, hour, appType: r.appType, model: r.model,
+            requestCount: 0, successCount: 0, errorCount: 0,
+            inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+            cacheCreationTokens: 0, costMicroUsd: 0, latencyMsTotal: 0, updatedAt: now
+          }
+          hourlyBuckets.set(hKey, hb)
+        }
+        hb.requestCount++
+        if (r.status === 'error') hb.errorCount++
+        else hb.successCount++
+        hb.inputTokens += r.inputTokens
+        hb.outputTokens += r.outputTokens
+        hb.cacheReadTokens += r.cacheReadTokens
+        hb.cacheCreationTokens += r.cacheCreationTokens
+        hb.costMicroUsd += toMicroUsd(r.costUsd)
+        hb.latencyMsTotal += r.latencyMs ?? 0
       }
 
       for (const b of buckets.values()) {
@@ -319,6 +381,36 @@ export class SqliteStorage implements StorageService {
           cost_usd: fromMicroUsd(b.costMicroUsd + toMicroUsd(existing?.cost_usd)),
           latency_ms_total: b.latencyMsTotal + (existing?.latency_ms_total ?? 0),
           updated_at: b.updatedAt
+        })
+      }
+
+      for (const hb of hourlyBuckets.values()) {
+        const existing = this.getHourlyRollupStmt.get(hb.date, hb.hour, hb.appType, hb.model) as
+          | Pick<
+              UsageDailyRollupRow,
+              | 'cost_usd'
+              | 'request_count'
+              | 'success_count'
+              | 'error_count'
+              | 'input_tokens'
+              | 'output_tokens'
+              | 'cache_read_tokens'
+              | 'cache_creation_tokens'
+              | 'latency_ms_total'
+            >
+          | undefined
+        this.upsertHourlyRollupStmt.run({
+          date: hb.date, hour: hb.hour, app_type: hb.appType, model: hb.model,
+          request_count: hb.requestCount + (existing?.request_count ?? 0),
+          success_count: hb.successCount + (existing?.success_count ?? 0),
+          error_count: hb.errorCount + (existing?.error_count ?? 0),
+          input_tokens: hb.inputTokens + (existing?.input_tokens ?? 0),
+          output_tokens: hb.outputTokens + (existing?.output_tokens ?? 0),
+          cache_read_tokens: hb.cacheReadTokens + (existing?.cache_read_tokens ?? 0),
+          cache_creation_tokens: hb.cacheCreationTokens + (existing?.cache_creation_tokens ?? 0),
+          cost_usd: fromMicroUsd(hb.costMicroUsd + toMicroUsd(existing?.cost_usd)),
+          latency_ms_total: hb.latencyMsTotal + (existing?.latency_ms_total ?? 0),
+          updated_at: hb.updatedAt
         })
       }
 
