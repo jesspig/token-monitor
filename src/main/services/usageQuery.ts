@@ -537,6 +537,11 @@ function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
 }
 
 function queryDailyModelRows(db: SqliteDatabase, filters: LogFilters): DailyModelRow[] {
+  if (canUseRollups(filters)) {
+    const { sql, params } = buildRollupWhere(filters)
+    const sqlText = `SELECT date, model, COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0) AS tokens, COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro, ${SUM_ROLLUP_REQUESTS} AS request_count FROM usage_daily_rollups ${sql} GROUP BY date, model ORDER BY date ASC, tokens DESC`
+    return prepareCached(db, sqlText).all(...params) as DailyModelRow[]
+  }
   const { sql, params } = buildWhere(filters)
   const dateExpr = `strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime')`
   const sqlText = `SELECT ${dateExpr} AS date, model, COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0) AS tokens, COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro, COUNT(*) AS request_count FROM usage_records ${sql} GROUP BY date, model ORDER BY date ASC, tokens DESC`

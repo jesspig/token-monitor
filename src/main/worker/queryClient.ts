@@ -14,7 +14,8 @@ const HEAVY_METHODS = new Set<string>([
   'getStatsBySession',
   'getStatsByStatus',
   'getRequestLogs',
-  'getUsageSummary'
+  'getUsageSummary',
+  'getDailyModelBreakdown'
 ])
 
 interface PendingEntry {
