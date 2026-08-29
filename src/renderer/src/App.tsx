@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import type { ComponentType, LazyExoticComponent, ReactElement } from 'react'
 import clsx from 'clsx'
 import {
@@ -15,6 +15,8 @@ import { isMock } from './api'
 import { useSettings } from './hooks/useSettings'
 import { useUsageEvents } from './hooks/useUsageEvents'
 import { setCachedSettings } from './lib/settings-cache'
+import { FilterProvider } from './context/FilterContext'
+import { NavProvider, useNav, type PageKey } from './context/NavContext'
 const DashboardPage = lazy(() => import('./pages/DashboardPage'))
 const TrendsPage = lazy(() => import('./pages/TrendsPage'))
 const RequestLogsPage = lazy(() => import('./pages/RequestLogsPage'))
@@ -22,8 +24,6 @@ const StatsPage = lazy(() => import('./pages/StatsPage'))
 const PricingPage = lazy(() => import('./pages/PricingPage'))
 const SourcesPage = lazy(() => import('./pages/SourcesPage'))
 const SettingsPage = lazy(() => import('./pages/SettingsPage'))
-
-type PageKey = 'dashboard' | 'trends' | 'logs' | 'stats' | 'pricing' | 'sources' | 'settings'
 
 const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: typeof LayoutDashboard }> = [
   { key: 'dashboard', label: '仪表盘', icon: LayoutDashboard },
@@ -46,17 +46,25 @@ const PAGES: Record<PageKey, LazyExoticComponent<ComponentType>> = {
 }
 
 function App(): ReactElement {
+  return (
+    <NavProvider>
+      <AppShell />
+    </NavProvider>
+  )
+}
+
+function AppShell(): ReactElement {
   useUsageEvents()
   const { data: settings } = useSettings()
   useEffect(() => {
     if (settings) setCachedSettings(settings)
   }, [settings])
-  const [page, setPage] = useState<PageKey>('dashboard')
+  const { page, setPage } = useNav()
   const ActivePage = PAGES[page]
 
   return (
-    <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
-      {}
+    <FilterProvider>
+      <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
       <aside className="hidden w-56 shrink-0 flex-col border-r border-neutral-800 bg-neutral-900/40 lg:flex">
         <div className="flex items-center gap-2.5 border-b border-neutral-800 px-4 py-4">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-400">
@@ -91,10 +99,7 @@ function App(): ReactElement {
           </div>
         )}
       </aside>
-
-      {}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {}
         <header className="border-b border-neutral-800 px-4 pt-3 lg:hidden">
           <div className="mb-2 flex items-center gap-2">
             <div className="flex h-6 w-6 items-center justify-center rounded-md bg-emerald-500/15 text-emerald-400">
@@ -139,7 +144,8 @@ function App(): ReactElement {
           </Suspense>
         </main>
       </div>
-    </div>
+      </div>
+    </FilterProvider>
   )
 }
 

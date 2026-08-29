@@ -6,6 +6,8 @@ import { ChevronDown, ChevronLeft, ChevronRight, Search, X } from 'lucide-react'
 import type { AppType, RequestStatus } from '../../../../shared/app'
 import type { LogFilters, RequestLogDetail } from '../../../../shared/query'
 import { api } from '../api'
+import { useFilter } from '../context/FilterContext'
+import { useNav } from '../context/NavContext'
 import { EmptyState } from '../components/EmptyState'
 import { PageHeader } from '../components/PageHeader'
 import { RangeSelector } from '../components/RangeSelector'
@@ -44,6 +46,7 @@ function truncateError(msg: string, len = ERROR_PREVIEW_LEN): string {
 const KEYWORD_DEBOUNCE_MS = 300
 
 export default function RequestLogsPage(): ReactElement {
+  const sharedFilter = useFilter()
   const [range, setRange] = useState<RangeKey>('30d')
   const [customRange, setCustomRange] = useState<CustomRange | null>(null)
   const [appTypes, setAppTypes] = useState<AppType[]>([])
@@ -58,6 +61,12 @@ export default function RequestLogsPage(): ReactElement {
   useEffect(() => {
     setPage(1)
   }, [debouncedKeyword])
+
+  useEffect(() => {
+    if (sharedFilter.filter.appTypes) setAppTypes(sharedFilter.filter.appTypes)
+    if (sharedFilter.filter.models) setModels(sharedFilter.filter.models)
+    if (sharedFilter.filter.project) setProject(sharedFilter.filter.project)
+  }, [sharedFilter.filter.appTypes, sharedFilter.filter.models, sharedFilter.filter.project])
 
   const { data: filterOptions } = useQuery({
     queryKey: ['filter-options'],
@@ -504,6 +513,16 @@ function StatusBadge({
 }
 
 function DetailDrawer({ record: r, onClose }: { record: RequestLogDetail; onClose: () => void }): ReactElement {
+  const filter = useFilter()
+  const nav = useNav()
+
+  const viewInTrends = (): void => {
+    filter.setAppTypes([r.appType])
+    filter.setModels([r.model])
+    nav.navigate('trends')
+    onClose()
+  }
+
   return (
     <div className="fixed inset-0 z-40" role="dialog" aria-modal="true">
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
@@ -604,6 +623,18 @@ function DetailDrawer({ record: r, onClose }: { record: RequestLogDetail; onClos
             </DetailRow>
           </DetailSection>
         </div>
+
+        <footer className="border-t border-neutral-800 px-5 py-3">
+          {r.model ? (
+            <button
+              type="button"
+              onClick={viewInTrends}
+              className="w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300 transition-colors hover:bg-emerald-500/20"
+            >
+              在趋势中查看此模型 / 应用
+            </button>
+          ) : null}
+        </footer>
       </aside>
     </div>
   )

@@ -70,7 +70,7 @@ function deriveBudgetBanner(b: BudgetStatus | undefined): BudgetBanner {
 }
 
 export default function DashboardPage(): ReactElement {
-  const [range, setRange] = useState<RangeKey>('today')
+  const [range, setRange] = useState<RangeKey>('7d')
   const [customRange, setCustomRange] = useState<CustomRange | null>(null)
   const filters = useMemo(() => {
     if (range === 'custom' && customRange) {
