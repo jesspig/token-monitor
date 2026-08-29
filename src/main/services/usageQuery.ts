@@ -2,13 +2,17 @@ import type Database from 'better-sqlite3'
 import type { AppType, RequestStatus } from '../../../shared/app'
 import type {
   AppStats,
+  DailyModelBreakdown,
   DailyStats,
   FilterOptions,
   HourlyStats,
   LogFilters,
   ModelStats,
   PaginatedLogs,
+  ProjectStats,
   RequestLogDetail,
+  SessionStats,
+  StatusStats,
   UsageSummary
 } from '../../../shared/query'
 import type { UsageRecordRow } from '../../../shared/tables'
@@ -114,6 +118,14 @@ interface HourlyRow {
   cost_micro_usd: number
 }
 
+interface DailyModelRow {
+  date: string
+  model: string
+  tokens: number
+  cost_micro: number
+  request_count: number
+}
+
 function buildWhere(filters: LogFilters): { sql: string; params: unknown[] } {
   const clauses: string[] = []
   const params: unknown[] = []
@@ -199,164 +211,268 @@ function buildRollupWhere(filters: LogFilters): { sql: string; params: unknown[]
   return { sql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '', params }
 }
 
-function querySummaryRow(db: SqliteDatabase, filters: LogFilters): SummaryRow {
-  if (canUseRollups(filters)) {
-    const { sql, params } = buildRollupWhere(filters)
-    return prepareCached(
-      db,
-      `SELECT ${SUM_ROLLUP_REQUESTS} AS total_requests,
-              ${SUM_ROLLUP_SUCCESS} AS success_count,
-              ${SUM_ROLLUP_ERROR} AS error_count,
-              ${SUM_TOKENS.input} AS input_tokens,
-              ${SUM_TOKENS.output} AS output_tokens,
-              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-       FROM usage_daily_rollups
-       ${sql}`
-    )
-      .get(...params) as SummaryRow
+interface PathSpec {
+  table: string
+  where: { sql: string; params: unknown[] }
+  groupSelect: string
+  groupBy: string
+  requestExpr: string
+  successExpr: string
+  errorExpr: string | null
+  requestAlias: string
+  leadingExtra: string[]
+  trailingExtra: string[]
+  postFilter?: (rows: any[]) => any[]
+}
+
+interface GroupBySpec {
+  detail: PathSpec
+  rollup?: PathSpec
+  orderBy: string
+}
+
+const MODEL_AVG_LATENCY_ROLLUP = `CASE WHEN COALESCE(SUM(request_count), 0) > 0
+         THEN SUM(latency_ms_total) * 1.0 / SUM(request_count)
+         ELSE NULL END AS avg_latency_ms`
+const MODEL_AVG_LATENCY_DETAIL = `AVG(latency_ms) AS avg_latency_ms`
+
+function buildMetricsExpr(path: PathSpec): string {
+  const parts: string[] = [
+    `${path.requestExpr} AS ${path.requestAlias}`,
+    `${path.successExpr} AS success_count`
+  ]
+  if (path.errorExpr != null) {
+    parts.push(`${path.errorExpr} AS error_count`)
   }
-  const { sql, params } = buildWhere(filters)
-  return prepareCached(
-    db,
-    `SELECT COUNT(*) AS total_requests,
-            ${SUM_SUCCESS} AS success_count,
-            ${SUM_ERROR} AS error_count,
-            ${SUM_TOKENS.input} AS input_tokens,
-            ${SUM_TOKENS.output} AS output_tokens,
-            ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-            ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-            COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-     FROM usage_records
-     ${sql}`
+  parts.push(
+    `${SUM_TOKENS.input} AS input_tokens`,
+    `${SUM_TOKENS.output} AS output_tokens`,
+    `${SUM_TOKENS.cacheRead} AS cache_read_tokens`,
+    `${SUM_TOKENS.cacheCreation} AS cache_creation_tokens`,
+    `COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd`
   )
-    .get(...params) as SummaryRow
+  return parts.join(',\n              ')
+}
+
+function queryGroupBy<T>(db: SqliteDatabase, filters: LogFilters, spec: GroupBySpec): T[] {
+  const useRollup = spec.rollup != null && canUseRollups(filters)
+  const path = useRollup ? spec.rollup! : spec.detail
+  const selectParts: string[] = []
+  if (path.groupSelect) selectParts.push(path.groupSelect)
+  selectParts.push(...path.leadingExtra)
+  selectParts.push(buildMetricsExpr(path))
+  selectParts.push(...path.trailingExtra)
+
+  const clauses = [`SELECT ${selectParts.join(',\n              ')}`, `FROM ${path.table}`]
+  if (path.where.sql) clauses.push(path.where.sql)
+  if (path.groupBy) clauses.push(`GROUP BY ${path.groupBy}`)
+  if (spec.orderBy) clauses.push(`ORDER BY ${spec.orderBy}`)
+  const sql = clauses.join('\n       ')
+
+  let rows = prepareCached(db, sql).all(...path.where.params) as T[]
+  if (useRollup && path.postFilter != null) {
+    rows = path.postFilter(rows) as T[]
+  }
+  return rows
+}
+
+function querySummaryRow(db: SqliteDatabase, filters: LogFilters): SummaryRow {
+  return queryGroupBy<SummaryRow>(db, filters, {
+    orderBy: '',
+    detail: {
+      table: 'usage_records',
+      where: buildWhere(filters),
+      groupSelect: '',
+      groupBy: '',
+      requestExpr: 'COUNT(*)',
+      successExpr: SUM_SUCCESS,
+      errorExpr: SUM_ERROR,
+      requestAlias: 'total_requests',
+      leadingExtra: [],
+      trailingExtra: []
+    },
+    rollup: {
+      table: 'usage_daily_rollups',
+      where: buildRollupWhere(filters),
+      groupSelect: '',
+      groupBy: '',
+      requestExpr: SUM_ROLLUP_REQUESTS,
+      successExpr: SUM_ROLLUP_SUCCESS,
+      errorExpr: SUM_ROLLUP_ERROR,
+      requestAlias: 'total_requests',
+      leadingExtra: [],
+      trailingExtra: []
+    }
+  })[0]
 }
 
 function queryDailyRows(db: SqliteDatabase, filters: LogFilters): DailyRow[] {
-  if (canUseRollups(filters)) {
-    const { sql, params } = buildRollupWhere(filters)
-    return prepareCached(
-      db,
-      `SELECT date,
-              ${SUM_ROLLUP_REQUESTS} AS request_count,
-              ${SUM_ROLLUP_SUCCESS} AS success_count,
-              ${SUM_ROLLUP_ERROR} AS error_count,
-              ${SUM_TOKENS.input} AS input_tokens,
-              ${SUM_TOKENS.output} AS output_tokens,
-              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-       FROM usage_daily_rollups
-       ${sql}
-       GROUP BY date
-       ORDER BY date ASC`
-    )
-      .all(...params) as DailyRow[]
-  }
-  const { sql, params } = buildWhere(filters)
-  return prepareCached(
-    db,
-    `SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS date,
-            COUNT(*) AS request_count,
-            ${SUM_SUCCESS} AS success_count,
-            ${SUM_ERROR} AS error_count,
-            ${SUM_TOKENS.input} AS input_tokens,
-            ${SUM_TOKENS.output} AS output_tokens,
-            ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-            ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-            COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-     FROM usage_records
-     ${sql}
-     GROUP BY date
-     ORDER BY date ASC`
-  )
-    .all(...params) as DailyRow[]
+  const dateExpr = `strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime')`
+  return queryGroupBy<DailyRow>(db, filters, {
+    orderBy: 'date ASC',
+    detail: {
+      table: 'usage_records',
+      where: buildWhere(filters),
+      groupSelect: `${dateExpr} AS date`,
+      groupBy: 'date',
+      requestExpr: 'COUNT(*)',
+      successExpr: SUM_SUCCESS,
+      errorExpr: SUM_ERROR,
+      requestAlias: 'request_count',
+      leadingExtra: [],
+      trailingExtra: []
+    },
+    rollup: {
+      table: 'usage_daily_rollups',
+      where: buildRollupWhere(filters),
+      groupSelect: 'date',
+      groupBy: 'date',
+      requestExpr: SUM_ROLLUP_REQUESTS,
+      successExpr: SUM_ROLLUP_SUCCESS,
+      errorExpr: SUM_ROLLUP_ERROR,
+      requestAlias: 'request_count',
+      leadingExtra: [],
+      trailingExtra: []
+    }
+  })
 }
 
 function queryModelRows(db: SqliteDatabase, filters: LogFilters): ModelRow[] {
-  if (canUseRollups(filters)) {
-    const { sql, params } = buildRollupWhere(filters)
-    return prepareCached(
-      db,
-      `SELECT model,
-              MIN(app_type) AS app_type,
-              ${SUM_ROLLUP_REQUESTS} AS request_count,
-              ${SUM_ROLLUP_SUCCESS} AS success_count,
-              ${SUM_TOKENS.input} AS input_tokens,
-              ${SUM_TOKENS.output} AS output_tokens,
-              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd,
-              CASE WHEN COALESCE(SUM(request_count), 0) > 0
-                   THEN SUM(latency_ms_total) * 1.0 / SUM(request_count)
-                   ELSE NULL END AS avg_latency_ms
-       FROM usage_daily_rollups
-       ${sql}
-       GROUP BY model
-       ORDER BY request_count DESC, model ASC`
-    )
-      .all(...params) as ModelRow[]
-  }
-  const { sql, params } = buildWhere(filters)
-  return prepareCached(
-    db,
-    `SELECT model,
-            MIN(app_type) AS app_type,
-            COUNT(*) AS request_count,
-            ${SUM_SUCCESS} AS success_count,
-            ${SUM_TOKENS.input} AS input_tokens,
-            ${SUM_TOKENS.output} AS output_tokens,
-            ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-            ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-            COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd,
-            AVG(latency_ms) AS avg_latency_ms
-     FROM usage_records
-     ${sql}
-     GROUP BY model
-     ORDER BY request_count DESC, model ASC`
-  )
-    .all(...params) as ModelRow[]
+  return queryGroupBy<ModelRow>(db, filters, {
+    orderBy: 'request_count DESC, model ASC',
+    detail: {
+      table: 'usage_records',
+      where: buildWhere(filters),
+      groupSelect: 'model',
+      groupBy: 'model',
+      requestExpr: 'COUNT(*)',
+      successExpr: SUM_SUCCESS,
+      errorExpr: null,
+      requestAlias: 'request_count',
+      leadingExtra: ['MIN(app_type) AS app_type'],
+      trailingExtra: [MODEL_AVG_LATENCY_DETAIL]
+    },
+    rollup: {
+      table: 'usage_daily_rollups',
+      where: buildRollupWhere(filters),
+      groupSelect: 'model',
+      groupBy: 'model',
+      requestExpr: SUM_ROLLUP_REQUESTS,
+      successExpr: SUM_ROLLUP_SUCCESS,
+      errorExpr: null,
+      requestAlias: 'request_count',
+      leadingExtra: ['MIN(app_type) AS app_type'],
+      trailingExtra: [MODEL_AVG_LATENCY_ROLLUP]
+    }
+  })
 }
 
 function queryAppRows(db: SqliteDatabase, filters: LogFilters): AppRow[] {
-  if (canUseRollups(filters)) {
-    const { sql, params } = buildRollupWhere(filters)
-    return prepareCached(
-      db,
-      `SELECT app_type,
-              ${SUM_ROLLUP_REQUESTS} AS request_count,
-              ${SUM_ROLLUP_SUCCESS} AS success_count,
-              ${SUM_TOKENS.input} AS input_tokens,
-              ${SUM_TOKENS.output} AS output_tokens,
-              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-       FROM usage_daily_rollups
-       ${sql}
-       GROUP BY app_type
-       ORDER BY request_count DESC, app_type ASC`
-    )
-      .all(...params) as AppRow[]
+  return queryGroupBy<AppRow>(db, filters, {
+    orderBy: 'request_count DESC, app_type ASC',
+    detail: {
+      table: 'usage_records',
+      where: buildWhere(filters),
+      groupSelect: 'app_type',
+      groupBy: 'app_type',
+      requestExpr: 'COUNT(*)',
+      successExpr: SUM_SUCCESS,
+      errorExpr: null,
+      requestAlias: 'request_count',
+      leadingExtra: [],
+      trailingExtra: []
+    },
+    rollup: {
+      table: 'usage_daily_rollups',
+      where: buildRollupWhere(filters),
+      groupSelect: 'app_type',
+      groupBy: 'app_type',
+      requestExpr: SUM_ROLLUP_REQUESTS,
+      successExpr: SUM_ROLLUP_SUCCESS,
+      errorExpr: null,
+      requestAlias: 'request_count',
+      leadingExtra: [],
+      trailingExtra: []
+    }
+  })
+}
+
+interface ProjectRow extends GroupRow {
+  project: string
+}
+
+interface SessionRow extends GroupRow {
+  session_id: string
+}
+
+interface StatusRow extends GroupRow {
+  status: string
+}
+
+function detailWhereExcludingNull(
+  filters: LogFilters,
+  column: string
+): { sql: string; params: unknown[] } {
+  const base = buildWhere(filters)
+  const filter = `${column} IS NOT NULL AND ${column} <> ''`
+  if (base.sql) {
+    return { sql: `${base.sql} AND ${filter}`, params: base.params }
   }
-  const { sql, params } = buildWhere(filters)
-  return prepareCached(
-    db,
-    `SELECT app_type,
-            COUNT(*) AS request_count,
-            ${SUM_SUCCESS} AS success_count,
-            ${SUM_TOKENS.input} AS input_tokens,
-            ${SUM_TOKENS.output} AS output_tokens,
-            ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-            ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-            COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-     FROM usage_records
-     ${sql}
-     GROUP BY app_type
-     ORDER BY request_count DESC, app_type ASC`
-  )
-    .all(...params) as AppRow[]
+  return { sql: `WHERE ${filter}`, params: [] }
+}
+
+function queryProjectRows(db: SqliteDatabase, filters: LogFilters): ProjectRow[] {
+  return queryGroupBy<ProjectRow>(db, filters, {
+    orderBy: 'request_count DESC',
+    detail: {
+      table: 'usage_records',
+      where: detailWhereExcludingNull(filters, 'project'),
+      groupSelect: 'project',
+      groupBy: 'project',
+      requestExpr: 'COUNT(*)',
+      successExpr: SUM_SUCCESS,
+      errorExpr: null,
+      requestAlias: 'request_count',
+      leadingExtra: [],
+      trailingExtra: []
+    }
+  })
+}
+
+function querySessionRows(db: SqliteDatabase, filters: LogFilters): SessionRow[] {
+  return queryGroupBy<SessionRow>(db, filters, {
+    orderBy: 'request_count DESC',
+    detail: {
+      table: 'usage_records',
+      where: detailWhereExcludingNull(filters, 'session_id'),
+      groupSelect: 'session_id',
+      groupBy: 'session_id',
+      requestExpr: 'COUNT(*)',
+      successExpr: SUM_SUCCESS,
+      errorExpr: null,
+      requestAlias: 'request_count',
+      leadingExtra: [],
+      trailingExtra: []
+    }
+  })
+}
+
+function queryStatusRows(db: SqliteDatabase, filters: LogFilters): StatusRow[] {
+  return queryGroupBy<StatusRow>(db, filters, {
+    orderBy: 'request_count DESC',
+    detail: {
+      table: 'usage_records',
+      where: detailWhereExcludingNull(filters, 'status'),
+      groupSelect: 'status',
+      groupBy: 'status',
+      requestExpr: 'COUNT(*)',
+      successExpr: SUM_SUCCESS,
+      errorExpr: null,
+      requestAlias: 'request_count',
+      leadingExtra: [],
+      trailingExtra: []
+    }
+  })
 }
 
 function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
@@ -365,26 +481,19 @@ function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
   const startDay = toDateKey(startTime)
   const endDay = toDateKey(endTime)
 
-  if (!canUseRollups(filters)) {
-    const { sql, params } = buildWhere(filters)
-    return prepareCached(
-      db,
-      `SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS day_key,
-              strftime('%H', created_at / 1000, 'unixepoch', 'localtime') AS hour,
-              COUNT(*) AS request_count,
-              ${SUM_SUCCESS} AS success_count,
-              ${SUM_ERROR} AS error_count,
-              ${SUM_TOKENS.input} AS input_tokens,
-              ${SUM_TOKENS.output} AS output_tokens,
-              ${SUM_TOKENS.cacheRead} AS cache_read_tokens,
-              ${SUM_TOKENS.cacheCreation} AS cache_creation_tokens,
-              COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro_usd
-       FROM usage_records
-       ${sql}
-       GROUP BY day_key, hour
-       ORDER BY day_key ASC, hour ASC`
-    )
-      .all(...params) as HourlyRow[]
+  const dayKeyExpr = `strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime')`
+  const hourExpr = `strftime('%H', created_at / 1000, 'unixepoch', 'localtime')`
+  const detail: PathSpec = {
+    table: 'usage_records',
+    where: buildWhere(filters),
+    groupSelect: `${dayKeyExpr} AS day_key,\n              ${hourExpr} AS hour`,
+    groupBy: 'day_key, hour',
+    requestExpr: 'COUNT(*)',
+    successExpr: SUM_SUCCESS,
+    errorExpr: SUM_ERROR,
+    requestAlias: 'request_count',
+    leadingExtra: [],
+    trailingExtra: []
   }
 
   const extra: string[] = []
@@ -397,30 +506,41 @@ function queryHourlyRows(db: SqliteDatabase, filters: LogFilters): HourlyRow[] {
     extra.push(`model IN (${filters.models.map(() => '?').join(', ')})`)
     params.push(...filters.models)
   }
-  const where = `WHERE date BETWEEN ? AND ?${extra.length ? ' AND ' + extra.join(' AND ') : ''}`
-  const rows = prepareCached(
-    db,
-    `SELECT date AS day_key,
-            printf('%02d', hour) AS hour,
-            SUM(request_count) AS request_count,
-            SUM(success_count) AS success_count,
-            SUM(error_count) AS error_count,
-            SUM(input_tokens) AS input_tokens,
-            SUM(output_tokens) AS output_tokens,
-            SUM(cache_read_tokens) AS cache_read_tokens,
-            SUM(cache_creation_tokens) AS cache_creation_tokens,
-            COALESCE(SUM(CAST(ROUND(COALESCE(cost_usd, '0') * 1000000) AS INTEGER)), 0) AS cost_micro_usd
-     FROM usage_hourly_rollups
-     ${where}
-     GROUP BY day_key, hour
-     ORDER BY day_key ASC, hour ASC`
-  ).all(...params) as HourlyRow[]
+  const rollupWhere = {
+    sql: `WHERE date BETWEEN ? AND ?${extra.length ? ' AND ' + extra.join(' AND ') : ''}`,
+    params
+  }
+  const rollup: PathSpec = {
+    table: 'usage_hourly_rollups',
+    where: rollupWhere,
+    groupSelect: `date AS day_key,\n              printf('%02d', hour) AS hour`,
+    groupBy: 'day_key, hour',
+    requestExpr: 'SUM(request_count)',
+    successExpr: 'SUM(success_count)',
+    errorExpr: 'SUM(error_count)',
+    requestAlias: 'request_count',
+    leadingExtra: [],
+    trailingExtra: [],
+    postFilter: (rows) =>
+      rows.filter((r) => {
+        const bucketMs = new Date(`${r.day_key}T${r.hour}:00`).getTime()
+        const bucketEnd = bucketMs + 3_600_000 - 1
+        return bucketEnd >= startTime && bucketMs <= endTime
+      })
+  }
 
-  return rows.filter((r) => {
-    const bucketMs = new Date(`${r.day_key}T${r.hour}:00`).getTime()
-    const bucketEnd = bucketMs + 3_600_000 - 1
-    return bucketEnd >= startTime && bucketMs <= endTime
+  return queryGroupBy<HourlyRow>(db, filters, {
+    orderBy: 'day_key ASC, hour ASC',
+    detail,
+    rollup
   })
+}
+
+function queryDailyModelRows(db: SqliteDatabase, filters: LogFilters): DailyModelRow[] {
+  const { sql, params } = buildWhere(filters)
+  const dateExpr = `strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime')`
+  const sqlText = `SELECT ${dateExpr} AS date, model, COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0) AS tokens, COALESCE(${SUM_COST_MICRO}, 0) AS cost_micro, COUNT(*) AS request_count FROM usage_records ${sql} GROUP BY date, model ORDER BY date ASC, tokens DESC`
+  return prepareCached(db, sqlText).all(...params) as DailyModelRow[]
 }
 
 function toDetail(row: UsageRecordRow): RequestLogDetail {
@@ -454,9 +574,13 @@ export interface UsageQueryService {
   getHourlyTrends(filters: LogFilters): Promise<HourlyStats[]>
   getModelStats(filters: LogFilters): Promise<ModelStats[]>
   getAppStats(filters: LogFilters): Promise<AppStats[]>
+  getStatsByProject(filters: LogFilters): Promise<ProjectStats[]>
+  getStatsBySession(filters: LogFilters): Promise<SessionStats[]>
+  getStatsByStatus(filters: LogFilters): Promise<StatusStats[]>
   getRequestLogs(filters: LogFilters): Promise<PaginatedLogs>
   getRequestLogDetail(id: string): Promise<RequestLogDetail | null>
   getFilterOptions(): Promise<FilterOptions>
+  getDailyModelBreakdown(filters: LogFilters): Promise<DailyModelBreakdown[]>
 }
 
 export const FILTER_OPTIONS_LIMIT = 500
@@ -578,6 +702,63 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
       )
     },
 
+    getStatsByProject(filters): Promise<ProjectStats[]> {
+      const rows = queryProjectRows(db, filters)
+
+      return Promise.resolve(
+        rows
+          .map((r) => ({
+            project: r.project,
+            requestCount: r.request_count,
+            inputTokens: r.input_tokens,
+            outputTokens: r.output_tokens,
+            cacheReadTokens: r.cache_read_tokens,
+            cacheCreationTokens: r.cache_creation_tokens,
+            costUsd: fromMicroUsd(r.cost_micro_usd),
+            successRate: r.request_count > 0 ? r.success_count / r.request_count : 0
+          }))
+          .slice(0, 200)
+      )
+    },
+
+    getStatsBySession(filters): Promise<SessionStats[]> {
+      const rows = querySessionRows(db, filters)
+
+      return Promise.resolve(
+        rows
+          .map((r) => ({
+            sessionId: r.session_id,
+            requestCount: r.request_count,
+            inputTokens: r.input_tokens,
+            outputTokens: r.output_tokens,
+            cacheReadTokens: r.cache_read_tokens,
+            cacheCreationTokens: r.cache_creation_tokens,
+            costUsd: fromMicroUsd(r.cost_micro_usd),
+            successRate: r.request_count > 0 ? r.success_count / r.request_count : 0
+          }))
+          .slice(0, 200)
+      )
+    },
+
+    getStatsByStatus(filters): Promise<StatusStats[]> {
+      const rows = queryStatusRows(db, filters)
+
+      return Promise.resolve(
+        rows
+          .map((r) => ({
+            status: r.status,
+            requestCount: r.request_count,
+            inputTokens: r.input_tokens,
+            outputTokens: r.output_tokens,
+            cacheReadTokens: r.cache_read_tokens,
+            cacheCreationTokens: r.cache_creation_tokens,
+            costUsd: fromMicroUsd(r.cost_micro_usd),
+            successRate: r.request_count > 0 ? r.success_count / r.request_count : 0
+          }))
+          .slice(0, 200)
+      )
+    },
+
     getRequestLogs(filters): Promise<PaginatedLogs> {
       const { sql, params } = buildWhere(filters)
       const page = Math.max(1, filters.page ?? 1)
@@ -615,6 +796,19 @@ export function createUsageQuery(db: SqliteDatabase): UsageQueryService {
         models: queryDistinctColumn(db, 'model'),
         projects: queryDistinctColumn(db, 'project')
       })
+    },
+
+    getDailyModelBreakdown(filters): Promise<DailyModelBreakdown[]> {
+      const rows = queryDailyModelRows(db, filters)
+      return Promise.resolve(
+        rows.map((r) => ({
+          date: r.date,
+          model: r.model,
+          tokens: r.tokens,
+          cost: fromMicroUsd(r.cost_micro),
+          requestCount: r.request_count
+        }))
+      )
     }
   }
 }

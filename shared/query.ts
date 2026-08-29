@@ -41,6 +41,14 @@ export interface DailyStats {
   errorCount: number
 }
 
+export interface DailyModelBreakdown {
+  date: string
+  model: string
+  tokens: number
+  cost: string
+  requestCount: number
+}
+
 export interface HourlyStats {
   hour: number
   dayKey?: string
@@ -158,6 +166,39 @@ export interface ModelsDevSyncResult {
   fetched: number
   imported: number
   skipped: number
+}
+
+export interface ProjectStats {
+  project: string
+  requestCount: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  costUsd: string
+  successRate: number
+}
+
+export interface SessionStats {
+  sessionId: string
+  requestCount: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  costUsd: string
+  successRate: number
+}
+
+export interface StatusStats {
+  status: string
+  requestCount: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  costUsd: string
+  successRate: number
 }
 
 export interface FilterOptions {

@@ -35,6 +35,9 @@ export const api: RendererApi = bridge ?? {
   getFilterOptions: () => loadMock().then((m) => m.getFilterOptions()),
   getStatsByModel: (filters) => loadMock().then((m) => m.getStatsByModel(filters)),
   getStatsByApp: (filters) => loadMock().then((m) => m.getStatsByApp(filters)),
+  getStatsByProject: (filters) => loadMock().then((m) => m.getStatsByProject(filters)),
+  getStatsBySession: (filters) => loadMock().then((m) => m.getStatsBySession(filters)),
+  getStatsByStatus: (filters) => loadMock().then((m) => m.getStatsByStatus(filters)),
   getModelPricing: () => loadMock().then((m) => m.getModelPricing()),
   syncModelsDevPricing: () => loadMock().then((m) => m.syncModelsDevPricing()),
   listPlugins: () => loadMock().then((m) => m.listPlugins()),
@@ -42,6 +45,7 @@ export const api: RendererApi = bridge ?? {
   getSettings: () => loadMock().then((m) => m.getSettings()),
   updateSettings: (patch) => loadMock().then((m) => m.updateSettings(patch)),
   getBudgetStatus: () => loadMock().then((m) => m.getBudgetStatus()),
+  getDailyModelBreakdown: (filters) => loadMock().then((m) => m.getDailyModelBreakdown(filters)),
   onUsageUpdated: (callback) => {
     let disposed = false
     let dispose: (() => void) | undefined

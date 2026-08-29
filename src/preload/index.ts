@@ -14,7 +14,12 @@ const api: RendererApi = {
   getRequestLogDetail: (id: string) => ipcRenderer.invoke('usage:request-log-detail', id),
   getStatsByModel: (filters: LogFilters) => ipcRenderer.invoke('usage:stats-by-model', filters),
   getStatsByApp: (filters: LogFilters) => ipcRenderer.invoke('usage:stats-by-app', filters),
+  getStatsByProject: (filters: LogFilters) => ipcRenderer.invoke('usage:stats-by-project', filters),
+  getStatsBySession: (filters: LogFilters) => ipcRenderer.invoke('usage:stats-by-session', filters),
+  getStatsByStatus: (filters: LogFilters) => ipcRenderer.invoke('usage:stats-by-status', filters),
   getFilterOptions: () => ipcRenderer.invoke('usage:filter-options'),
+  getDailyModelBreakdown: (filters: LogFilters) =>
+    ipcRenderer.invoke('usage:daily-model-breakdown', filters),
 
   getModelPricing: () => ipcRenderer.invoke('pricing:list'),
   syncModelsDevPricing: () => ipcRenderer.invoke('pricing:modelsdev-sync'),
