@@ -28,10 +28,19 @@ function safeReaddir(dir: string): fs.Dirent[] {
   }
 }
 
-function toEntry(p: string): FileEntry {
+async function safeReaddirAsync(dir: string): Promise<fs.Dirent[]> {
+  try {
+    return await fs.promises.readdir(dir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+}
+
+async function toEntryAsync(p: string): Promise<FileEntry> {
   let mtime = 0
   try {
-    mtime = Math.round(fs.statSync(p).mtimeMs)
+    const st = await fs.promises.stat(p)
+    mtime = Math.round(st.mtimeMs)
   } catch {
     mtime = 0
   }
@@ -42,13 +51,13 @@ function isSessionFile(name: string): boolean {
   return name === 'session.jsonl' || name === 'session.jsonl.zstd'
 }
 
-function collectSubtree(dir: string, out: FileEntry[]): void {
-  for (const ent of safeReaddir(dir)) {
+async function collectSubtree(dir: string, out: FileEntry[]): Promise<void> {
+  for (const ent of await safeReaddirAsync(dir)) {
     const p = path.join(dir, ent.name)
     if (ent.isDirectory()) {
-      collectSubtree(p, out)
+      await collectSubtree(p, out)
     } else if (ent.isFile() && isSessionFile(ent.name)) {
-      out.push(toEntry(p))
+      out.push(await toEntryAsync(p))
     }
   }
 }
@@ -65,9 +74,9 @@ function hasSessionFile(dir: string): boolean {
   return false
 }
 
-export function listFilesFromRoot(root: string): FileEntry[] {
+export async function listFilesFromRoot(root: string): Promise<FileEntry[]> {
   const out: FileEntry[] = []
-  collectSubtree(root, out)
+  await collectSubtree(root, out)
   return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 }
 

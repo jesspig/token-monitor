@@ -45,6 +45,8 @@ export interface SyncResult {
 
 const STATUS_CACHE_TTL_MS = 5_000
 
+const SYNC_CONCURRENCY = 4
+
 export interface Collector {
   syncAll(): Promise<SyncResult>
   syncPlugin(id: AppType): Promise<SyncResult>
@@ -154,11 +156,15 @@ export function createCollector(
     let errors = 0
     let addedRecords = 0
 
-    for (const plugin of plugins) {
-      const r = await syncOne(plugin)
-      imported += r.imported
-      errors += r.errors
-      addedRecords += r.addedRecords
+    const queue = plugins.slice()
+    while (queue.length > 0) {
+      const batch = queue.splice(0, SYNC_CONCURRENCY)
+      const results = await Promise.all(batch.map((plugin) => syncOne(plugin)))
+      for (const r of results) {
+        imported += r.imported
+        errors += r.errors
+        addedRecords += r.addedRecords
+      }
     }
 
     if (addedRecords > 0) {
