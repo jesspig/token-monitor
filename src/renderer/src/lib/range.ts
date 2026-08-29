@@ -28,19 +28,19 @@ export function startOfToday(): number {
 }
 
 export function rangeToFilters(range: RangeKey, extra: Partial<LogFilters> = {}): LogFilters {
-  const now = Date.now()
+  const now = Math.floor(Date.now() / 60_000) * 60_000
   const startTime =
     range === 'today'
       ? startOfToday()
       : range === '24h'
-        ? now - DAY_MS
+        ? Math.floor((now - DAY_MS) / 60_000) * 60_000
         : range === '7d'
-          ? now - 7 * DAY_MS
+          ? Math.floor((now - 7 * DAY_MS) / 60_000) * 60_000
           : range === '14d'
-            ? now - 14 * DAY_MS
+            ? Math.floor((now - 14 * DAY_MS) / 60_000) * 60_000
             : range === '30d'
-              ? now - 30 * DAY_MS
-              : (extra.startTime ?? now - 7 * DAY_MS)
+              ? Math.floor((now - 30 * DAY_MS) / 60_000) * 60_000
+              : (extra.startTime ?? Math.floor((now - 7 * DAY_MS) / 60_000) * 60_000)
   return { startTime, endTime: now, ...extra }
 }
 
