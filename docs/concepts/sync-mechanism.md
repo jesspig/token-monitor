@@ -1,16 +1,16 @@
 ---
 type: sync-design
 title: 同步与去重
-description: 增量游标 + mtime 短路 + chokidar 定向监听 + 定时兜底扫描；主键幂等去重 + fork/rewrite 语义去重账本；失败零 token 放行与存量回溯 v9 全量清游标幂等重放；清理前预回填。
-tags: [sync, dedup, cursor, mtime-shortcut, chokidar, watcher, failure-observability]
+description: 增量游标 + mtime 短路 + chokidar 定向监听 + 定时兜底扫描；插件级有界并发 + dsh 异步列举；主键幂等去重 + fork/rewrite 语义去重账本；失败零 token 放行与存量回溯 v9 全量清游标幂等重放；清理前预回填。
+tags: [sync, dedup, cursor, mtime-shortcut, chokidar, watcher, failure-observability, concurrency]
 resource: src/main/services/storage.ts
-timestamp: 2026-08-28T02:27:00+08:00
+timestamp: 2026-08-28T22:45:24+08:00
 ---
 
 # 同步与去重
 
 > [!note] 当前状态
-> **已实现**（2026-08-20）。游标/去重落地于 `storage.ts`，调度与监听于 `scheduler.ts`/`watcher.ts`，采集编排于 `collector.ts`；语义去重账本接入、opencode WAL mtime 感知与清理前预回填于 2026-08-23 落地；mtime 短路与 watcher 定向同步、启动错峰于 2026-08-24 落地（主进程事件循环防阻塞性能优化）；**dsh zstd 字节游标（v6）与 truncate 判定收紧、首轮采集延迟 1500ms 于 2026-08-26 落地**；**同日防阻塞第二轮——外部 SQLite 只读连接 busy 短超时、调度 initialDelayMs 错相（retention sweep 45s 启动）、getPluginStatus 5s TTL 缓存、渲染端轮询收窄与失效改 1.5s 防抖**；**2026-08-27 失败可观测性——失败零 token 放行（isAllZeroUsage 对 status=error 豁免）与存量回溯 v9 全量清游标幂等重放（DELETE FROM sync_cursors，见下方）**。
+> **已实现**（2026-08-20）。游标/去重落地于 `storage.ts`，调度与监听于 `scheduler.ts`/`watcher.ts`，采集编排于 `collector.ts`；语义去重账本接入、opencode WAL mtime 感知与清理前预回填于 2026-08-23 落地；mtime 短路与 watcher 定向同步、启动错峰于 2026-08-24 落地（主进程事件循环防阻塞性能优化）；**dsh zstd 字节游标（v6）与 truncate 判定收紧、首轮采集延迟 1500ms 于 2026-08-26 落地**；**同日防阻塞第二轮——外部 SQLite 只读连接 busy 短超时、调度 initialDelayMs 错相（retention sweep 45s 启动）、getPluginStatus 5s TTL 缓存、渲染端轮询收窄与失效改 1.5s 防抖**；**2026-08-27 失败可观测性——失败零 token 放行（isAllZeroUsage 对 status=error 豁免）与存量回溯 v9 全量清游标幂等重放（DELETE FROM sync_cursors，见下方）**。**2026-08-28 并发与异步化**：`collector.syncAll` 改插件级有界并发（`SYNC_CONCURRENCY=4`，分批 `Promise.all`，文件级仍串行保事务），`dsh.listFiles` 目录列举改 `fs.promises.readdir/stat` 异步，`detect` 探测链路保留同步；`queryClient` 池化见 [总体架构](architecture.md)。
 
 ## 同步策略（已实现）
 

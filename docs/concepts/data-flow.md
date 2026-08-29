@@ -1,16 +1,16 @@
 ---
 type: architecture
 title: 数据流
-description: 会话日志经插件增量解析、失败零 token 放行、双层去重、按输入语义计费后写入明细与日聚合（error_count），再供前端查询与错误可观测展示。
-tags: [data-flow, pipeline, usage, sqlite, plugin, failure-observability]
+description: 会话日志经插件增量解析、失败零 token 放行、双层去重、按输入语义计费后写入明细与日/小时聚合，再供五维查询与跨页下钻展示。
+tags: [data-flow, pipeline, usage, sqlite, plugin, failure-observability, dimension-table]
 resource: src/main/collector.ts
-timestamp: 2026-08-28T02:27:00+08:00
+timestamp: 2026-08-28T22:45:24+08:00
 ---
 
 # 数据流
 
 > [!note] 当前状态
-> **已实现**（2026-08-20）。数据链路落地于 `src/main`：collector.ts 采集 → storage.ts 入库/rollup → usageQuery.ts 查询 → EventBus 推送。语义去重与计费语义修复于 2026-08-23 接入；**2026-08-26：计费循环改批量（calcCostBatch）、查询侧语句预编译缓存、dsh zstd 帧级增量解压**；**2026-08-27：失败可观测性全链路——8 插件失败判定产出 status=error + http_status/error_message → collector 零 token 放行 → storage 持久化 + rollup error_count 增量 → usageQuery 筛选回退明细表 → 前端错误列与抽屉展示（存量由 v9 全量清游标回溯）**；**同日：小时聚合物化（v10，`usage_hourly_rollups` 与日聚合镜像同事务增量维护，小时查询无筛选维度读该表、带维度回退明细全扫）、统计查询 offload 到只读 worker 线程（WAL 共享同一 DB，主线程不再被 better-sqlite3 阻塞）、系统托盘后台常驻（关窗隐藏不退出，见 [总体架构](architecture.md)）**。
+> **已实现**（2026-08-20）。数据链路落地于 `src/main`：collector.ts 采集 → storage.ts 入库/rollup → usageQuery.ts 查询 → EventBus 推送。语义去重与计费语义修复于 2026-08-23 接入；**2026-08-26：计费循环改批量（calcCostBatch）、查询侧语句预编译缓存、dsh zstd 帧级增量解压**；**2026-08-27：失败可观测性全链路——8 插件失败判定产出 status=error + http_status/error_message → collector 零 token 放行 → storage 持久化 + rollup error_count 增量 → usageQuery 筛选回退明细表 → 前端错误列与抽屉展示（存量由 v9 全量清游标回溯）**；**同日：小时聚合物化（v10，`usage_hourly_rollups` 与日聚合镜像同事务增量维护，小时查询无筛选维度读该表、带维度回退明细全扫）、统计查询 offload 到只读 worker 线程（WAL 共享同一 DB，主线程不再被 better-sqlite3 阻塞）、系统托盘后台常驻（关窗隐藏不退出，见 [总体架构](architecture.md)）**。**2026-08-28：统计查询通用化为 queryGroupBy（5 聚合函数复用，新增 getStatsByProject/Session/Status 走 usage_records detail 路径 LIMIT 200，前端 useDimensionStats 按 DimensionKey 映射；rollups 仍按 (date,app,model)/(date,hour,app,model) 物化）；查询执行层 pool 化为 2 worker（重聚合→pool[0]/轻查询→pool[1]，in-flight 跨池去重）；采集层插件级并发（SYNC_CONCURRENCY=4，dsh 异步列举），渲染层跨页筛选经 FilterContext 同步、下钻通过 NavContext 导航**。
 
 ## 端到端链路
 
