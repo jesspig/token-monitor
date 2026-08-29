@@ -75,6 +75,7 @@ export const TrendChart = memo(function TrendChart({
           stroke="#34d399"
           strokeWidth={2}
           fill="url(#trend-requests)"
+          isAnimationActive={false}
         />
         <Area
           yAxisId="tokens"
@@ -84,6 +85,7 @@ export const TrendChart = memo(function TrendChart({
           stroke="#60a5fa"
           strokeWidth={2}
           fill="url(#trend-tokens)"
+          isAnimationActive={false}
         />
       </AreaChart>
     </ResponsiveContainer>

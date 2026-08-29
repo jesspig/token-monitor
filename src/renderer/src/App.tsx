@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef } from 'react'
 import type { ComponentType, LazyExoticComponent, ReactElement } from 'react'
 import clsx from 'clsx'
 import {
@@ -8,26 +8,23 @@ import {
   Radio,
   ScrollText,
   Settings,
-  Tags,
-  TrendingUp
+  Tags
 } from 'lucide-react'
 import { isMock } from './api'
 import { useSettings } from './hooks/useSettings'
 import { useUsageEvents } from './hooks/useUsageEvents'
 import { setCachedSettings } from './lib/settings-cache'
+import { FilterProvider } from './context/FilterContext'
+import { NavProvider, useNav, type PageKey } from './context/NavContext'
 const DashboardPage = lazy(() => import('./pages/DashboardPage'))
-const TrendsPage = lazy(() => import('./pages/TrendsPage'))
 const RequestLogsPage = lazy(() => import('./pages/RequestLogsPage'))
 const StatsPage = lazy(() => import('./pages/StatsPage'))
 const PricingPage = lazy(() => import('./pages/PricingPage'))
 const SourcesPage = lazy(() => import('./pages/SourcesPage'))
 const SettingsPage = lazy(() => import('./pages/SettingsPage'))
 
-type PageKey = 'dashboard' | 'trends' | 'logs' | 'stats' | 'pricing' | 'sources' | 'settings'
-
 const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: typeof LayoutDashboard }> = [
   { key: 'dashboard', label: '仪表盘', icon: LayoutDashboard },
-  { key: 'trends', label: '趋势', icon: TrendingUp },
   { key: 'logs', label: '请求日志', icon: ScrollText },
   { key: 'stats', label: '统计', icon: BarChart3 },
   { key: 'pricing', label: '定价', icon: Tags },
@@ -37,7 +34,6 @@ const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: typeof LayoutDashboa
 
 const PAGES: Record<PageKey, LazyExoticComponent<ComponentType>> = {
   dashboard: DashboardPage,
-  trends: TrendsPage,
   logs: RequestLogsPage,
   stats: StatsPage,
   pricing: PricingPage,
@@ -46,17 +42,26 @@ const PAGES: Record<PageKey, LazyExoticComponent<ComponentType>> = {
 }
 
 function App(): ReactElement {
+  return (
+    <NavProvider>
+      <AppShell />
+    </NavProvider>
+  )
+}
+
+function AppShell(): ReactElement {
   useUsageEvents()
   const { data: settings } = useSettings()
   useEffect(() => {
     if (settings) setCachedSettings(settings)
   }, [settings])
-  const [page, setPage] = useState<PageKey>('dashboard')
-  const ActivePage = PAGES[page]
+  const { page, setPage } = useNav()
+  const visitedRef = useRef<Set<PageKey>>(new Set([page]))
+  visitedRef.current.add(page)
 
   return (
-    <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
-      {}
+    <FilterProvider>
+      <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
       <aside className="hidden w-56 shrink-0 flex-col border-r border-neutral-800 bg-neutral-900/40 lg:flex">
         <div className="flex items-center gap-2.5 border-b border-neutral-800 px-4 py-4">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-400">
@@ -91,10 +96,7 @@ function App(): ReactElement {
           </div>
         )}
       </aside>
-
-      {}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {}
         <header className="border-b border-neutral-800 px-4 pt-3 lg:hidden">
           <div className="mb-2 flex items-center gap-2">
             <div className="flex h-6 w-6 items-center justify-center rounded-md bg-emerald-500/15 text-emerald-400">
@@ -128,18 +130,26 @@ function App(): ReactElement {
         </header>
 
         <main className="w-full mx-auto max-w-6xl flex-1 overflow-y-auto p-6">
-          <Suspense
-            fallback={
-              <div className="flex w-full items-center justify-center py-24">
-                <div className="h-32 w-full max-w-lg animate-pulse rounded-xl bg-neutral-800/70" />
+          {(Object.entries(PAGES) as Array<[PageKey, (typeof PAGES)[PageKey]]>).map(([key, Page]) => {
+            if (!visitedRef.current.has(key)) return null
+            return (
+              <div key={key} style={{ display: page === key ? 'block' : 'none' }}>
+                <Suspense
+                  fallback={
+                    <div className="flex w-full items-center justify-center py-24">
+                      <div className="h-32 w-full max-w-lg animate-pulse rounded-xl bg-neutral-800/70" />
+                    </div>
+                  }
+                >
+                  <Page />
+                </Suspense>
               </div>
-            }
-          >
-            <ActivePage />
-          </Suspense>
+            )
+          })}
         </main>
       </div>
-    </div>
+      </div>
+    </FilterProvider>
   )
 }
 

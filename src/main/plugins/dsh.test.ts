@@ -225,7 +225,7 @@ describe('detectFromRoot 探测逻辑', () => {
 })
 
 describe('listFilesFromRoot 收集范围', () => {
-  it('递归收集 --cwd--/<id>/ 下固定名 session.jsonl 与 session.jsonl.zstd，排除其他命名；目录缺失返回空数组', () => {
+  it('递归收集 --cwd--/<id>/ 下固定名 session.jsonl 与 session.jsonl.zstd，排除其他命名；目录缺失返回空数组', async () => {
     const root = path.join(tmpDir, 'sessions')
     const encodedDir = path.join(root, '--home-alice-demo--')
     const idDirA = path.join(encodedDir, 'abc12345')
@@ -242,13 +242,13 @@ describe('listFilesFromRoot 收集范围', () => {
     writeJsonl(path.join(idDirA, 'session.jsonl~'), ['x'])
     writeJsonl(path.join(idDirA, 'sessions.db'), ['x'])
 
-    const entries = listFilesFromRoot(root)
+    const entries = await listFilesFromRoot(root)
     expect(entries.map((e) => path.basename(e.path)).sort()).toEqual(['session.jsonl', 'session.jsonl.zstd'])
     for (const e of entries) {
       expect(e.mtime).toBeGreaterThan(0)
     }
 
-    expect(listFilesFromRoot(path.join(tmpDir, 'missing'))).toEqual([])
+    expect(await listFilesFromRoot(path.join(tmpDir, 'missing'))).toEqual([])
   })
 })
 

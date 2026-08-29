@@ -602,7 +602,7 @@ describe('getHourlyTrends', () => {
     const startOfToday = new Date()
     startOfToday.setHours(0, 0, 0, 0)
     const startTime = startOfToday.getTime()
-    const endTime = Date.now()
+    const endTime = startOfToday.getTime() + DAY_MS - 1
     const atHour = (h: number, o: Partial<UsageRecord> = {}): UsageRecord =>
       makeRecord({ createdAt: startOfToday.getTime() + h * 3_600_000 + 30 * 60_000, ...o })
 
@@ -659,7 +659,7 @@ describe('getHourlyTrends', () => {
     const startOfToday = new Date()
     startOfToday.setHours(0, 0, 0, 0)
     const startTime = startOfToday.getTime()
-    const endTime = Date.now()
+    const endTime = startOfToday.getTime() + DAY_MS - 1
     const atHour = (h: number, o: Partial<UsageRecord> = {}): UsageRecord =>
       makeRecord({ createdAt: startOfToday.getTime() + h * 3_600_000 + 30 * 60_000, ...o })
 

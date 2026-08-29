@@ -342,6 +342,14 @@ const MIGRATIONS: Migration[] = [
       })
       tx()
     }
+  },
+  {
+    version: 11,
+    up(db) {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_usage_records_model_created ON usage_records(model, created_at);
+      `)
+    }
   }
 ]
 

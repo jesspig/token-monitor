@@ -23,6 +23,9 @@ export const IPC_CHANNELS = {
   requestLogDetail: 'usage:request-log-detail',
   statsByModel: 'usage:stats-by-model',
   statsByApp: 'usage:stats-by-app',
+  statsByProject: 'usage:stats-by-project',
+  statsBySession: 'usage:stats-by-session',
+  statsByStatus: 'usage:stats-by-status',
   filterOptions: 'usage:filter-options',
   pricingList: 'pricing:list',
   pricingModelsdevSync: 'pricing:modelsdev-sync',
@@ -31,6 +34,7 @@ export const IPC_CHANNELS = {
   settingsGet: 'settings:get',
   settingsUpdate: 'settings:update',
   budgetStatus: 'budget:status',
+  dailyModelBreakdown: 'usage:daily-model-breakdown',
   usageUpdated: 'usage-updated'
 } as const
 
@@ -68,7 +72,20 @@ export function registerIpcHandlers(
   on(IPC_CHANNELS.statsByApp, (_e: unknown, filters: LogFilters) =>
     host.usageQuery.getAppStats(filters)
   )
+  on(IPC_CHANNELS.statsByProject, (_e: unknown, filters: LogFilters) =>
+    host.usageQuery.getStatsByProject(filters)
+  )
+  on(IPC_CHANNELS.statsBySession, (_e: unknown, filters: LogFilters) =>
+    host.usageQuery.getStatsBySession(filters)
+  )
+  on(IPC_CHANNELS.statsByStatus, (_e: unknown, filters: LogFilters) =>
+    host.usageQuery.getStatsByStatus(filters)
+  )
   on(IPC_CHANNELS.filterOptions, () => host.usageQuery.getFilterOptions())
+
+  on(IPC_CHANNELS.dailyModelBreakdown, (_e: unknown, filters: LogFilters) =>
+    host.usageQuery.getDailyModelBreakdown(filters)
+  )
 
   on(IPC_CHANNELS.pricingList, () => host.storage.getModelPricing())
   on(IPC_CHANNELS.pricingModelsdevSync, () => host.syncModelsDevPricing())

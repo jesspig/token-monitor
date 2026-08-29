@@ -42,13 +42,14 @@ describe('schema 迁移', () => {
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(10)
+      expect(db.pragma('user_version', { simple: true })).toBe(11)
       expect(columnsOf(db, 'sync_cursors')).toContain('byte_offset')
       const indexes = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_usage_records_%'")
         .all() as { name: string }[]
       expect(indexes.map((r) => r.name)).toContain('idx_usage_records_zero_cost')
       expect(indexes.map((r) => r.name)).toContain('idx_usage_records_cached_input')
+      expect(indexes.map((r) => r.name)).toContain('idx_usage_records_model_created')
     } finally {
       db.close()
     }
@@ -66,7 +67,7 @@ describe('schema 迁移', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(10)
+      expect(db.pragma('user_version', { simple: true })).toBe(11)
       const row = db.prepare('SELECT * FROM sync_cursors').get() as
         | {
             file_path: string
@@ -84,6 +85,7 @@ describe('schema 迁移', () => {
       expect(indexNames).toContain('idx_usage_records_status')
       expect(indexNames).toContain('idx_usage_records_project')
       expect(indexNames).toContain('idx_usage_records_session_id')
+      expect(indexNames).toContain('idx_usage_records_model_created')
       const hourlyIndexes = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_hourly_rollups'")

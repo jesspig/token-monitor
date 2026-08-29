@@ -2,8 +2,15 @@
 
 > 仅保留最近 7 天。详细按小时记录见 [changelog/](changelog/)。
 
+## 2026-08-29
+
+- **趋势合并与查询性能收敛**：仪表盘接入趋势双图（请求 Line + Token 四桶/成本堆叠 Area），独立趋势页退役（6 页导航，常驻渲染 visitedRef，`rangeToFilters` 分钟对齐，`keepPreviousData` 全量收敛，`isAnimationActive=false` 去动画），`getDailyModelBreakdown` 走日预聚合快路径，`idx_usage_records_model_created` 索引 v11 落地，统计页堆叠改 `Map` 一次遍历。详见 [changelog/2026-08-29-14](changelog/2026-08-29-14.md)。
+
 ## 2026-08-28
 
+- **统计六项精修**：使用量 Top 10（过滤全 0）、每日 Token 消耗量堆叠修复并更名、详细表过滤全 0、费用 Top 5 单条堆叠（参考市场份额）、新增缓存命中率排行、绘画成本排行与每百万 Token 堆叠；趋势回退至可用双卡并确保 `||0` 兜底。详见 [changelog/2026-08-28-23](changelog/2026-08-28-23.md)。
+- **统计与趋势二次打磨（对标 OpenCode 四图，上下排布）**：修复趋势白屏并拆分三卡、统计页四图上下排布。详见 [changelog/2026-08-28-22](changelog/2026-08-28-22.md)。
+- **多维与性能迭代（feature/multidim-ui-perf）**：Dashboard/Trends 改用 DimensionChart 通用组件、统计页重写为五维维度表、日志详情一键过滤与统计下钻经 FilterContext/NavContext 跨页联动、后端新增 getStatsByProject/Session/Status（detail 路径 LIMIT 200）与 queryGroupBy 通用化、IPC 20 方法与 preload 同步、worker/queryClient 池化为 2 worker（重/轻分流）、采集层插件级有界并发（SYNC_CONCURRENCY=4）+ dsh 异步列举；期间修复 App 标签不平衡、queryClient 缺方法与 status 类型等中间编译报错，typecheck / 463 单测 / 0 失败。详见 [changelog/2026-08-28-21](changelog/2026-08-28-21.md)。
 - **代码注释全量移除 + 知识库一致性对齐**：移除全部源码注释（`docs/` 成为唯一事实来源）；增量修订 10 个概念页——过时「5→8 插件」表述、SSOT 锚点由代码注释改为代码符号（`isIgnoredFailureReason` / `IGNORED_FAILURE_STATUSES` / `buildWhere` 等）、`data-flow.md` 机制编号纠错（1–10 连续）、`pricing.md` 术语统一为 8 源、`ui-pages.md` 补 `closeToTray` 开关、`roadmap.md` 补当前状态；同步 `AGENTS.md`（插件数/单测数/计费语义/新增「项目知识库」章节）与 `index.md` 目录；各页 `timestamp` 刷新至 2026-08-28。详见 [changelog/2026-08-28-02](changelog/2026-08-28-02.md)。
 
 ## 2026-08-27

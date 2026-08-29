@@ -1,16 +1,16 @@
 ---
 type: architecture
 title: 总体架构
-description: 插件宿主（Electron 主进程）承担全部数据逻辑，渲染进程经 preload contextBridge 白名单通信。
-tags: [architecture, electron, main-process, renderer, ipc, plugin-host]
+description: 插件宿主（Electron 主进程）承担全部数据逻辑，渲染进程经 preload contextBridge 白名单通信；统计查询经只读 worker 池 offload，采集插件级并发；仪表盘双图与 6 页导航常驻渲染。
+tags: [architecture, electron, main-process, renderer, ipc, plugin-host, worker-pool]
 resource: src/main/
-timestamp: 2026-08-28T02:27:00+08:00
+timestamp: 2026-08-29T14:40:04+08:00
 ---
 
 # 总体架构
 
 > [!note] 当前状态
-> **第一阶段已实现**（2026-08-20）。分层结构落地于 `src/main`（core/、plugins/、services/、ipc/、worker/、workers/、tray.ts）+ `src/preload` + `src/renderer`，与仓库实际代码一致。2026-08-22：IPC 收窄至 17 方法（定价只读化），新增 CLI 版本探测服务，schema 升级至 v3。**2026-08-26：启动拆两阶段（bootstrapHost 快速段 + startServices 阶段二），窗口创建不再被插件装载阻塞；全部 IPC handler 经 `host.ready` 门控；首轮采集错峰延迟触发**。**2026-08-27：统计查询 offload 到只读 worker 线程（`worker/queryClient.ts` + `workers/query-worker.ts`，WAL 共享 DB）；新增系统托盘后台常驻（`tray.ts`，关窗隐藏不退出、单实例锁、closeToTray 设置）；schema 升级至 v10（`usage_hourly_rollups` + 三筛选索引）**。
+> **第一阶段已实现**（2026-08-20）。分层结构落地于 `src/main`（core/、plugins/、services/、ipc/、worker/、workers/、tray.ts）+ `src/preload` + `src/renderer`，与仓库实际代码一致。2026-08-22：IPC 收窄至 17 方法（定价只读化），新增 CLI 版本探测服务，schema 升级至 v3。**2026-08-26：启动拆两阶段（bootstrapHost 快速段 + startServices 阶段二），窗口创建不再被插件装载阻塞；全部 IPC handler 经 `host.ready` 门控；首轮采集错峰延迟触发**。**2026-08-27：统计查询 offload 到只读 worker 线程（`worker/queryClient.ts` + `workers/query-worker.ts`，WAL 共享 DB）；新增系统托盘后台常驻（`tray.ts`，关窗隐藏不退出、单实例锁、closeToTray 设置）；schema 升级至 v10（`usage_hourly_rollups` + 三筛选索引）**。**2026-08-28：IPC 维持 20 方法（当前契约见 `shared/ipc.ts:RendererApi`），统计查询通用化为 queryGroupBy；渲染层跨页状态抽为 FilterContext + NavContext；worker/queryClient 池化为 2 worker（重聚合/轻查询分流，in-flight 跨池去重，统一 pending/terminate），采集层插件级有界并发（SYNC_CONCURRENCY=4）+ dsh 目录列举异步化**。**2026-08-29：仪表盘接入趋势双图（请求趋势 Line + Token 四桶/成本堆叠 Area），独立趋势页退役，导航由 7 页缩至 6 页（`NavContext:PageKey` 移除 `trends`）；`App.tsx` 切页改为 `visitedRef` 常驻渲染+`display:none` 切换，查询缓存与渲染优化见 [数据流](data-flow.md)；schema 升级至 v11（`idx_usage_records_model_created`）**。
 
 ## 分层结构
 
@@ -35,15 +35,15 @@ Electron 主进程（插件宿主）
 │   ├── db.ts          建库与迁移（v1 建表 → v10 小时物化+筛选索引；启用 WAL）+ 只读连接工厂
 │   └── retention.ts   明细保留清理
 ├── worker/        主线程侧 worker 客户端
-│   └── queryClient.ts 统计查询 RPC 客户端（offload 到 worker 线程；in-flight 去重；:memory: 回退直查）
+│   └── queryClient.ts 统计查询 RPC 客户端（2 worker 池：重聚合→pool[0]/轻查询→pool[1]；in-flight 跨池去重；统一 nextId/pending/terminate；:memory: 回退直查）
 ├── workers/       独立线程入口
-│   └── query-worker.ts 只读 better-sqlite3 连接 + createUsageQuery（WAL 下读已提交快照）
+│   └── query-worker.ts 只读 better-sqlite3 连接 + createUsageQuery（WAL 下读已提交快照，多 worker 各自独立只读连接）
 ├── tray.ts        系统托盘（后台常驻入口：createTray）
-└── ipc/            IPC handler（17 方法）+ 事件推送
-        │
-        │ contextBridge (preload 白名单 API)
-        ▼
-Renderer (React)：Dashboard(预算横幅) / 趋势 / 日志表 / 统计 / 定价(只读列表+全量同步) / 监控源(CLI 版本) / 设置
+└── ipc/            IPC handler（20 方法）+ 事件推送
+          │
+          │ contextBridge (preload 白名单 API，RendererApi 20 方法，见 shared/ipc.ts)
+          ▼
+ Renderer (React)：Dashboard(汇总卡+双趋势图：请求 Line + Token 四桶/成本堆叠 Area) / 日志表(跨页下钻至仪表盘) / 统计(五维 DimensionTable+ShareChart) / 定价(只读列表+全量同步) / 监控源(CLI 版本) / 设置；跨页状态 FilterContext + NavContext（6 页，PageKey 无 trends，App 根 Provider，常驻渲染+display 切换）
 ```
 
 宿主编排分两阶段（2026-08-26，秒开优化）：**阶段一 `bootstrapHost`**（快速同步段）——建库迁移 → seed 定价（99 条主流模型，仅作离线兜底）→ 组装 ctx → 创建 settings store 与 collector，毫秒级完成；随后即注册 IPC 并 `createWindow`（`backgroundColor: '#0a0a0a'` 消除白闪），窗口不被插件装载阻塞。**阶段二 `host.startServices()`** 异步推进——registry 注册 8 个内置插件 → 8 插件 `Promise.all` **并行 mount**（装载时把各插件会话目录注册进 watcher，500ms 防抖触发同步）→ 注册启动钩子：延迟 30s 执行一次保留清理并经 scheduler 按 `syncIntervalMs` 同间隔周期清理（设置变更联动重启）、models.dev 首次全量定价同步延迟 10s 并按 `pricingSyncIntervalMs` 周期自动同步（无启停开关，默认 5 分钟，设置变更联动重启）、零成本回填（20s）/存量重算（30s）错峰定时器；阶段完成/失败经 `Host.ready` Promise 暴露。首轮采集在「窗口 show 且宿主就绪」后延迟 1500ms 触发（生产入口 `index.ts` 常量 `STARTUP_SYNC_DELAY_MS`）；启动失败经 `dialog.showErrorBox` 弹窗兜底。采集链路编排在 `collector.ts`。
@@ -58,11 +58,11 @@ Renderer (React)：Dashboard(预算横幅) / 趋势 / 日志表 / 统计 / 定�
 | `core/event-bus.ts` | 类型化事件；数据更新经 `usage-updated`（200ms 防抖合并）推送 |
 | `plugins/` | 监控插件：实现 `MonitorPlugin`（见 [监控插件](monitor-plugins.md)） |
 | `services/` | 核心服务：存储(含日/小时聚合)/定价(含零成本回填、批量计费 calcCostBatch)/调度/监听/查询(语句预编译缓存)/models.dev 同步/预算/CLI 版本探测/迁移(WAL+筛选索引)/保留清理 |
-| `worker/queryClient.ts` | 统计查询 RPC 客户端：`createQueryClient(dataDir, db)`；文件库模式把查询 offload 到 worker 线程，相同 `(method+args)` 并发请求 in-flight 去重收敛失效风暴；`:memory:`/启动失败回退主进程直查；`terminate()` 退出时终止 worker |
-| `workers/query-worker.ts` | worker 线程入口：以 `{ readonly: true, fileMustExist: true }` 打开同一 DB 文件只读连接（WAL 下读已提交快照，不阻塞主线程写者），经 `createUsageQuery` 承载查询并按消息 RPC 回传 |
+| `worker/queryClient.ts` | 统计查询 RPC 客户端：`createQueryClient(dataDir, db)`；文件库模式把查询 offload 到 **2 worker 池**（重聚合 `getStatsByProject/Session/Status` + `getRequestLogs`/`getUsageSummary`/`getDailyModelBreakdown` → pool[0]，其余轻查询 → pool[1]，v11 起 `getDailyModelBreakdown` 纳入重池以错开轻查询），相同 `(method+args)` 跨池 in-flight 去重收敛失效风暴；各 worker 独立只读连接（WAL 多读）；`:memory:`/启动失败回退主进程直查；`terminate()` 终止池内全部 worker |
+| `workers/query-worker.ts` | worker 线程入口：以 `{ readonly: true, fileMustExist: true }` 打开同一 DB 文件只读连接（WAL 下读已提交快照，不阻塞主线程写者），经 `createUsageQuery` 承载查询并按消息 RPC 回传（动态派发 req.method，无需为新增维度方法加分支） |
 | `tray.ts` | 系统托盘：`createTray(iconPath, {showWindow, quitApp})` 返回 `TrayHandle{destroy()}`；右键「显示/退出」、左键恢复窗口；无法创建时回退无托盘模式不抛错 |
-| `collector.ts` | 采集编排：探测 → 列文件 → 增量解析 → 全零过滤 → 批量计费（calcCostBatch 按位回填）→ 入库（同事务维护日+小时聚合）→ 推游标 → 发事件；首轮同步支持 initialSyncDelayMs 错峰；getPluginStatus 并行探测各 CLI 版本 |
-| `ipc/register.ts` | IPC handler（17 方法：ping + 8 查询(含 hourly-trends/filter-options) + 2 定价(pricing:list / modelsdev-sync) + 2 插件 + 2 设置 + 1 预算 + 1 事件推送）；全部 handler 统一包装 `await host.ready` 门控，宿主未就绪时调用挂起等待 |
+| `collector.ts` | 采集编排：插件级有界并发（`SYNC_CONCURRENCY=4`，`syncAll` 分批 `Promise.all`）→ 单插件内文件仍串行（保游标/去重事务）；dsh 目录列举已异步化（`safeReaddirAsync` / `toEntryAsync` 用 `fs.promises`）；其余：探测 → 列文件 → 增量解析 → 全零过滤 → 批量计费（calcCostBatch 按位回填）→ 入库（同事务维护日+小时聚合）→ 推游标 → 发事件；首轮同步支持 initialSyncDelayMs 错峰；getPluginStatus 并行探测各 CLI 版本 |
+| `ipc/register.ts` | IPC handler（20 方法：ping + 11 查询(含 hourly-trends/filter-options + 新增 stats-by-project/session/status) + 2 定价 + 2 插件 + 2 设置 + 1 预算 + 1 事件推送）；全部 handler 统一包装 `await host.ready` 门控 |
 | `index.ts` | 应用入口：单实例锁、窗口关→隐藏（closeToTray）、window-all-closed 常驻不退出、second-instance 聚焦、before-quit 清理（tray.destroy + host.dispose + usageQuery.terminate） |
 
 ## 关键约束

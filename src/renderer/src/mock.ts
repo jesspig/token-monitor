@@ -4,6 +4,7 @@ import type {
   AppSettings,
   AppStats,
   BudgetStatus,
+  DailyModelBreakdown,
   DailyStats,
   HourlyStats,
   LogFilters,
@@ -11,7 +12,10 @@ import type {
   ModelsDevCatalogEntry,
   PaginatedLogs,
   PluginStatus,
+  ProjectStats,
   RequestLogDetail,
+  SessionStats,
+  StatusStats,
   UsageSummary
 } from '../../../shared/query'
 import type { ModelPricingRow } from '../../../shared/tables'
@@ -161,9 +165,31 @@ function buildRecords(): RequestLogDetail[] {
 
 const ALL_RECORDS = buildRecords()
 
-function buildDaily(): DailyStats[] {
+function filterRecords(filters: LogFilters): RequestLogDetail[] {
+  const { startTime, endTime, appTypes, models, status, keyword, project, sessionId } = filters
+  const httpStatus = filters.httpStatus ?? filters.statusCode
+  return ALL_RECORDS.filter((r) => {
+    if (startTime != null && r.createdAt < startTime) return false
+    if (endTime != null && r.createdAt > endTime) return false
+    if (appTypes && appTypes.length > 0 && !appTypes.includes(r.appType)) return false
+    if (models && models.length > 0 && !models.includes(r.model)) return false
+    if (status && r.status !== status) return false
+    if (httpStatus != null && r.httpStatus !== httpStatus) return false
+    if (project && r.project !== project) return false
+    if (sessionId && r.sessionId !== sessionId) return false
+    if (keyword) {
+      const kw = keyword.toLowerCase()
+      const hay = `${r.model} ${r.sessionId} ${r.project ?? ''} ${r.appType} ${r.errorMessage ?? ''} ${r.httpStatus ?? ''}`.toLowerCase()
+      if (!hay.includes(kw)) return false
+    }
+    return true
+  })
+}
+
+function filterDaily(filters: LogFilters): DailyStats[] {
+  const records = filterRecords(filters)
   const map = new Map<string, DailyStats>()
-  for (const r of ALL_RECORDS) {
+  for (const r of records) {
     const key = toDateStr(r.createdAt)
     let d = map.get(key)
     if (!d) {
@@ -192,39 +218,6 @@ function buildDaily(): DailyStats[] {
     else d.errorCount += 1
   }
   return [...map.values()].sort((a, b) => a.date.localeCompare(b.date))
-}
-
-const DAILY = buildDaily()
-
-function filterRecords(filters: LogFilters): RequestLogDetail[] {
-  const { startTime, endTime, appTypes, models, status, keyword, project, sessionId } = filters
-  const httpStatus = filters.httpStatus ?? filters.statusCode
-  return ALL_RECORDS.filter((r) => {
-    if (startTime != null && r.createdAt < startTime) return false
-    if (endTime != null && r.createdAt > endTime) return false
-    if (appTypes && appTypes.length > 0 && !appTypes.includes(r.appType)) return false
-    if (models && models.length > 0 && !models.includes(r.model)) return false
-    if (status && r.status !== status) return false
-    if (httpStatus != null && r.httpStatus !== httpStatus) return false
-    if (project && r.project !== project) return false
-    if (sessionId && r.sessionId !== sessionId) return false
-    if (keyword) {
-      const kw = keyword.toLowerCase()
-      const hay = `${r.model} ${r.sessionId} ${r.project ?? ''} ${r.appType} ${r.errorMessage ?? ''} ${r.httpStatus ?? ''}`.toLowerCase()
-      if (!hay.includes(kw)) return false
-    }
-    return true
-  })
-}
-
-function filterDaily(filters: LogFilters): DailyStats[] {
-  const start = filters.startTime != null ? toDateStr(filters.startTime) : null
-  const end = filters.endTime != null ? toDateStr(filters.endTime) : null
-  return DAILY.filter((d) => {
-    if (start && d.date < start) return false
-    if (end && d.date > end) return false
-    return true
-  })
 }
 
 function aggregateHourly(records: RequestLogDetail[]): HourlyStats[] {
@@ -578,6 +571,114 @@ export function createMockApi(): RendererApi {
         .sort((a, b) => b.requestCount - a.requestCount)
     },
 
+    getStatsByProject: async (filters): Promise<ProjectStats[]> => {
+      const map = new Map<string, ProjectStats>()
+      for (const r of filterRecords(filters)) {
+        const project = r.project ?? '(unknown)'
+        let s = map.get(project)
+        if (!s) {
+          s = {
+            project,
+            requestCount: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            costUsd: '0',
+            successRate: 0
+          }
+          map.set(project, s)
+        }
+        s.requestCount += 1
+        s.inputTokens += r.inputTokens
+        s.outputTokens += r.outputTokens
+        s.cacheReadTokens += r.cacheReadTokens
+        s.cacheCreationTokens += r.cacheCreationTokens
+        if (r.costUsd) {
+          s.costUsd = (Number.parseFloat(s.costUsd) + Number.parseFloat(r.costUsd)).toFixed(6)
+        }
+        if (r.status === 'success') s.successRate += 1
+      }
+      return [...map.values()]
+        .map((s) => ({
+          ...s,
+          successRate: s.requestCount > 0 ? s.successRate / s.requestCount : 0
+        }))
+        .sort((a, b) => b.requestCount - a.requestCount)
+    },
+
+    getStatsBySession: async (filters): Promise<SessionStats[]> => {
+      const map = new Map<string, SessionStats>()
+      for (const r of filterRecords(filters)) {
+        const sessionId = r.sessionId ?? '(unknown)'
+        let s = map.get(sessionId)
+        if (!s) {
+          s = {
+            sessionId,
+            requestCount: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            costUsd: '0',
+            successRate: 0
+          }
+          map.set(sessionId, s)
+        }
+        s.requestCount += 1
+        s.inputTokens += r.inputTokens
+        s.outputTokens += r.outputTokens
+        s.cacheReadTokens += r.cacheReadTokens
+        s.cacheCreationTokens += r.cacheCreationTokens
+        if (r.costUsd) {
+          s.costUsd = (Number.parseFloat(s.costUsd) + Number.parseFloat(r.costUsd)).toFixed(6)
+        }
+        if (r.status === 'success') s.successRate += 1
+      }
+      return [...map.values()]
+        .map((s) => ({
+          ...s,
+          successRate: s.requestCount > 0 ? s.successRate / s.requestCount : 0
+        }))
+        .sort((a, b) => b.requestCount - a.requestCount)
+    },
+
+    getStatsByStatus: async (filters): Promise<StatusStats[]> => {
+      const map = new Map<string, StatusStats>()
+      for (const r of filterRecords(filters)) {
+        const status = r.status
+        let s = map.get(status)
+        if (!s) {
+          s = {
+            status,
+            requestCount: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            costUsd: '0',
+            successRate: 0
+          }
+          map.set(status, s)
+        }
+        s.requestCount += 1
+        s.inputTokens += r.inputTokens
+        s.outputTokens += r.outputTokens
+        s.cacheReadTokens += r.cacheReadTokens
+        s.cacheCreationTokens += r.cacheCreationTokens
+        if (r.costUsd) {
+          s.costUsd = (Number.parseFloat(s.costUsd) + Number.parseFloat(r.costUsd)).toFixed(6)
+        }
+        if (r.status === 'success') s.successRate += 1
+      }
+      return [...map.values()]
+        .map((s) => ({
+          ...s,
+          successRate: s.requestCount > 0 ? s.successRate / s.requestCount : 0
+        }))
+        .sort((a, b) => b.requestCount - a.requestCount)
+    },
+
     getFilterOptions: async () => {
       const models = new Set<string>()
       const projects = new Set<string>()
@@ -608,6 +709,31 @@ export function createMockApi(): RendererApi {
 
     updateSettings: async (patch) => {
       SETTINGS = { ...SETTINGS, ...patch }
+    },
+
+    getDailyModelBreakdown: async (filters): Promise<DailyModelBreakdown[]> => {
+      const map = new Map<string, DailyModelBreakdown & { costMicro: number }>()
+      for (const r of filterRecords(filters)) {
+        const date = toDateStr(r.createdAt)
+        const key = `${date}\u0000${r.model}`
+        let entry = map.get(key)
+        if (!entry) {
+          entry = { date, model: r.model, tokens: 0, cost: '0', costMicro: 0, requestCount: 0 }
+          map.set(key, entry)
+        }
+        entry.tokens += r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheCreationTokens
+        entry.costMicro += r.costUsd ? Math.round(Number.parseFloat(r.costUsd) * 1_000_000) : 0
+        entry.requestCount += 1
+      }
+      const out: DailyModelBreakdown[] = [...map.values()].map((e) => ({
+        date: e.date,
+        model: e.model,
+        tokens: e.tokens,
+        cost: (e.costMicro / 1_000_000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0',
+        requestCount: e.requestCount
+      }))
+      out.sort((a, b) => a.date.localeCompare(b.date) || b.tokens - a.tokens)
+      return out
     },
 
     getBudgetStatus: async () => buildBudgetStatus(),

@@ -4,12 +4,16 @@ import type {
   AppSettings,
   AppStats,
   BudgetStatus,
+  DailyModelBreakdown,
   DailyStats,
   FilterOptions,
   HourlyStats,
   LogFilters,
   ModelStats,
   ModelsDevSyncResult,
+  ProjectStats,
+  SessionStats,
+  StatusStats,
   PaginatedLogs,
   PluginStatus,
   RequestLogDetail,
@@ -36,6 +40,12 @@ export interface RendererApi {
 
   getStatsByApp(filters: LogFilters): Promise<AppStats[]>
 
+  getStatsByProject(filters: LogFilters): Promise<ProjectStats[]>
+
+  getStatsBySession(filters: LogFilters): Promise<SessionStats[]>
+
+  getStatsByStatus(filters: LogFilters): Promise<StatusStats[]>
+
   getModelPricing(): Promise<ModelPricingRow[]>
 
   syncModelsDevPricing(): Promise<ModelsDevSyncResult>
@@ -49,6 +59,8 @@ export interface RendererApi {
   updateSettings(patch: Partial<AppSettings>): Promise<void>
 
   getBudgetStatus(): Promise<BudgetStatus>
+
+  getDailyModelBreakdown(filters: LogFilters): Promise<DailyModelBreakdown[]>
 
   onUsageUpdated(callback: (payload: UsageUpdatedEvent) => void): () => void
 }
