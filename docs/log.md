@@ -2,6 +2,10 @@
 
 > 仅保留最近 7 天。详细按小时记录见 [changelog/](changelog/)。
 
+## 2026-08-29
+
+- **趋势合并与查询性能收敛**：仪表盘接入趋势双图（请求 Line + Token 四桶/成本堆叠 Area），独立趋势页退役（6 页导航，常驻渲染 visitedRef，`rangeToFilters` 分钟对齐，`keepPreviousData` 全量收敛，`isAnimationActive=false` 去动画），`getDailyModelBreakdown` 走日预聚合快路径，`idx_usage_records_model_created` 索引 v11 落地，统计页堆叠改 `Map` 一次遍历。详见 [changelog/2026-08-29-14](changelog/2026-08-29-14.md)。
+
 ## 2026-08-28
 
 - **统计六项精修**：使用量 Top 10（过滤全 0）、每日 Token 消耗量堆叠修复并更名、详细表过滤全 0、费用 Top 5 单条堆叠（参考市场份额）、新增缓存命中率排行、绘画成本排行与每百万 Token 堆叠；趋势回退至可用双卡并确保 `||0` 兜底。详见 [changelog/2026-08-28-23](changelog/2026-08-28-23.md)。
