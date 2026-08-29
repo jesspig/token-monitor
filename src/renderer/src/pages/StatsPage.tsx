@@ -55,15 +55,24 @@ export default function StatsPage(): ReactElement {
     const top = sorted.slice(0, 5).map(([k]) => k)
     const hasOthers = sorted.length > 5
     const topSet = new Set(top)
-    const dates = [...new Set(data.map((d) => d.date))].sort()
+    const grouped = new Map<string, Map<string, number>>()
+    for (const e of data) {
+      let byModel = grouped.get(e.date)
+      if (!byModel) {
+        byModel = new Map<string, number>()
+        grouped.set(e.date, byModel)
+      }
+      const key = topSet.has(e.model) ? e.model : hasOthers ? 'Others' : null
+      if (key === null) continue
+      byModel.set(key, (byModel.get(key) ?? 0) + e.tokens)
+    }
+    const dates = [...grouped.keys()].sort()
     const chartData = dates.map((date) => {
       const row: Record<string, any> = { label: date.slice(5) }
       for (const m of top) row[m] = 0
       if (hasOthers) row['Others'] = 0
-      for (const e of data.filter((d) => d.date === date)) {
-        if (topSet.has(e.model)) row[e.model] = (row[e.model] ?? 0) + e.tokens
-        else if (hasOthers) row['Others'] = (row['Others'] ?? 0) + e.tokens
-      }
+      const byModel = grouped.get(date)
+      if (byModel) for (const [k, v] of byModel) row[k] = v
       return row
     })
     const orderedModels = hasOthers ? [...top, 'Others'] : top
@@ -79,16 +88,25 @@ export default function StatsPage(): ReactElement {
     const top = sorted.slice(0, 5).map(([k]) => k)
     const hasOthers = sorted.length > 5
     const topSet = new Set(top)
-    const dates = [...new Set(data.map((d) => d.date))].sort()
+    const grouped = new Map<string, Map<string, number>>()
+    for (const e of data) {
+      let byModel = grouped.get(e.date)
+      if (!byModel) {
+        byModel = new Map<string, number>()
+        grouped.set(e.date, byModel)
+      }
+      const v = Number(e.cost) || 0
+      const key = topSet.has(e.model) ? e.model : hasOthers ? 'Others' : null
+      if (key === null) continue
+      byModel.set(key, (byModel.get(key) ?? 0) + v)
+    }
+    const dates = [...grouped.keys()].sort()
     const dailyData = dates.map((date) => {
       const row: Record<string, any> = { label: date.slice(5) }
       for (const m of top) row[m] = 0
       if (hasOthers) row['Others'] = 0
-      for (const e of data.filter((d) => d.date === date)) {
-        const v = Number(e.cost) || 0
-        if (topSet.has(e.model)) row[e.model] = (row[e.model] ?? 0) + v
-        else if (hasOthers) row['Others'] = (row['Others'] ?? 0) + v
-      }
+      const byModel = grouped.get(date)
+      if (byModel) for (const [k, v] of byModel) row[k] = v
       return row
     })
     const pieData: Array<{ name: string; value: number }> = top.map((m) => ({ name: m, value: totals.get(m) ?? 0 }))
@@ -176,7 +194,7 @@ export default function StatsPage(): ReactElement {
                   />
                   <Legend wrapperStyle={{ fontSize: 11, color: '#d4d4d4' }} />
                   {tokenStack.models.map((m, i) => (
-                    <Bar key={m} dataKey={m} stackId="tokens" fill={PALETTE[i % PALETTE.length]} radius={i === tokenStack.models.length - 1 ? [4, 4, 0, 0] : undefined} />
+                    <Bar key={m} dataKey={m} stackId="tokens" fill={PALETTE[i % PALETTE.length]} radius={i === tokenStack.models.length - 1 ? [4, 4, 0, 0] : undefined} isAnimationActive={false} />
                   ))}
                 </BarChart>
               </ResponsiveContainer>
@@ -244,7 +262,7 @@ export default function StatsPage(): ReactElement {
                   />
                   <Legend wrapperStyle={{ fontSize: 11, color: '#d4d4d4' }} />
                   {costStack.models.map((m, i) => (
-                    <Bar key={m} dataKey={m} stackId="cost" fill={PALETTE[i % PALETTE.length]} radius={i === costStack.models.length - 1 ? [4, 4, 0, 0] : undefined} />
+                    <Bar key={m} dataKey={m} stackId="cost" fill={PALETTE[i % PALETTE.length]} radius={i === costStack.models.length - 1 ? [4, 4, 0, 0] : undefined} isAnimationActive={false} />
                   ))}
                 </BarChart>
               </ResponsiveContainer>

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { ReactElement } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   Area,
   AreaChart,
@@ -93,6 +93,9 @@ export default function TrendsPage(): ReactElement {
     queryKey: ['daily-trends', 'hourly', filters],
     queryFn: () => api.getHourlyTrends(filters),
     enabled: range === 'today' || range === '24h',
+    staleTime: 2 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    placeholderData: keepPreviousData,
     refetchInterval: getStatsRefreshInterval
   })
 
@@ -159,6 +162,7 @@ export default function TrendsPage(): ReactElement {
                   stroke="#34d399"
                   strokeWidth={2}
                   dot={false}
+                  isAnimationActive={false}
                 />
               </LineChart>
             </ResponsiveContainer>
@@ -218,6 +222,7 @@ export default function TrendsPage(): ReactElement {
                   stackId="tokens"
                   stroke="#60a5fa"
                   fill="url(#trend-input)"
+                  isAnimationActive={false}
                 />
                 <Area
                   yAxisId="tokens"
@@ -227,6 +232,7 @@ export default function TrendsPage(): ReactElement {
                   stackId="tokens"
                   stroke="#34d399"
                   fill="url(#trend-output)"
+                  isAnimationActive={false}
                 />
                 <Area
                   yAxisId="tokens"
@@ -236,6 +242,7 @@ export default function TrendsPage(): ReactElement {
                   stackId="tokens"
                   stroke="#fbbf24"
                   fill="url(#trend-cache-create)"
+                  isAnimationActive={false}
                 />
                 <Area
                   yAxisId="tokens"
@@ -245,6 +252,7 @@ export default function TrendsPage(): ReactElement {
                   stackId="tokens"
                   stroke="#a78bfa"
                   fill="url(#trend-cache-read)"
+                  isAnimationActive={false}
                 />
                 <Line
                   yAxisId="cost"
@@ -255,6 +263,7 @@ export default function TrendsPage(): ReactElement {
                   strokeWidth={2}
                   strokeDasharray="4 4"
                   dot={false}
+                  isAnimationActive={false}
                 />
               </AreaChart>
             </ResponsiveContainer>
