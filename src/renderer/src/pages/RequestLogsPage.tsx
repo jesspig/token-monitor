@@ -519,7 +519,7 @@ function DetailDrawer({ record: r, onClose }: { record: RequestLogDetail; onClos
   const viewInTrends = (): void => {
     filter.setAppTypes([r.appType])
     filter.setModels([r.model])
-    nav.navigate('trends')
+    nav.navigate('dashboard')
     onClose()
   }
 
@@ -631,7 +631,7 @@ function DetailDrawer({ record: r, onClose }: { record: RequestLogDetail; onClos
               onClick={viewInTrends}
               className="w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300 transition-colors hover:bg-emerald-500/20"
             >
-              在趋势中查看此模型 / 应用
+              在仪表盘查看此模型 / 应用
             </button>
           ) : null}
         </footer>

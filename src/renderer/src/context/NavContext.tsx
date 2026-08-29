@@ -1,7 +1,7 @@
 import { createContext, useContext, useMemo, useState } from 'react'
 import type { ReactElement, ReactNode } from 'react'
 
-export type PageKey = 'dashboard' | 'trends' | 'logs' | 'stats' | 'pricing' | 'sources' | 'settings'
+export type PageKey = 'dashboard' | 'logs' | 'stats' | 'pricing' | 'sources' | 'settings'
 
 interface NavContextValue {
   page: PageKey

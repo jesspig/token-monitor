@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect } from 'react'
+import { lazy, Suspense, useEffect, useRef } from 'react'
 import type { ComponentType, LazyExoticComponent, ReactElement } from 'react'
 import clsx from 'clsx'
 import {
@@ -8,8 +8,7 @@ import {
   Radio,
   ScrollText,
   Settings,
-  Tags,
-  TrendingUp
+  Tags
 } from 'lucide-react'
 import { isMock } from './api'
 import { useSettings } from './hooks/useSettings'
@@ -18,7 +17,6 @@ import { setCachedSettings } from './lib/settings-cache'
 import { FilterProvider } from './context/FilterContext'
 import { NavProvider, useNav, type PageKey } from './context/NavContext'
 const DashboardPage = lazy(() => import('./pages/DashboardPage'))
-const TrendsPage = lazy(() => import('./pages/TrendsPage'))
 const RequestLogsPage = lazy(() => import('./pages/RequestLogsPage'))
 const StatsPage = lazy(() => import('./pages/StatsPage'))
 const PricingPage = lazy(() => import('./pages/PricingPage'))
@@ -27,7 +25,6 @@ const SettingsPage = lazy(() => import('./pages/SettingsPage'))
 
 const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: typeof LayoutDashboard }> = [
   { key: 'dashboard', label: '仪表盘', icon: LayoutDashboard },
-  { key: 'trends', label: '趋势', icon: TrendingUp },
   { key: 'logs', label: '请求日志', icon: ScrollText },
   { key: 'stats', label: '统计', icon: BarChart3 },
   { key: 'pricing', label: '定价', icon: Tags },
@@ -37,7 +34,6 @@ const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: typeof LayoutDashboa
 
 const PAGES: Record<PageKey, LazyExoticComponent<ComponentType>> = {
   dashboard: DashboardPage,
-  trends: TrendsPage,
   logs: RequestLogsPage,
   stats: StatsPage,
   pricing: PricingPage,
@@ -60,7 +56,8 @@ function AppShell(): ReactElement {
     if (settings) setCachedSettings(settings)
   }, [settings])
   const { page, setPage } = useNav()
-  const ActivePage = PAGES[page]
+  const visitedRef = useRef<Set<PageKey>>(new Set([page]))
+  visitedRef.current.add(page)
 
   return (
     <FilterProvider>
@@ -133,15 +130,22 @@ function AppShell(): ReactElement {
         </header>
 
         <main className="w-full mx-auto max-w-6xl flex-1 overflow-y-auto p-6">
-          <Suspense
-            fallback={
-              <div className="flex w-full items-center justify-center py-24">
-                <div className="h-32 w-full max-w-lg animate-pulse rounded-xl bg-neutral-800/70" />
+          {(Object.entries(PAGES) as Array<[PageKey, (typeof PAGES)[PageKey]]>).map(([key, Page]) => {
+            if (!visitedRef.current.has(key)) return null
+            return (
+              <div key={key} style={{ display: page === key ? 'block' : 'none' }}>
+                <Suspense
+                  fallback={
+                    <div className="flex w-full items-center justify-center py-24">
+                      <div className="h-32 w-full max-w-lg animate-pulse rounded-xl bg-neutral-800/70" />
+                    </div>
+                  }
+                >
+                  <Page />
+                </Suspense>
               </div>
-            }
-          >
-            <ActivePage />
-          </Suspense>
+            )
+          })}
         </main>
       </div>
       </div>
