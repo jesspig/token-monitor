@@ -35,6 +35,15 @@ export function formatPercent(rate: number): string {
   return `${(rate * 100).toFixed(1)}%`
 }
 
+export function formatCompact(n: number): string {
+  if (!Number.isFinite(n)) return '—'
+  const abs = Math.abs(n)
+  if (abs >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(0)}k`
+  return String(n)
+}
+
 export function formatDateTime(ms: number): string {
   const d = new Date(ms)
   const pad = (v: number): string => String(v).padStart(2, '0')

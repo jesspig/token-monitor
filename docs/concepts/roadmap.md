@@ -1,9 +1,9 @@
 ---
 type: roadmap
 title: 里程碑与风险
-description: M1–M7 实施路线图与待研究点；插件框架先行，再铺开内置监控插件；2026-08-29 仪表盘合并与查询性能收敛。
+description: M1–M7 实施路线图与待研究点；插件框架先行，再铺开内置监控插件；2026-09-10 图表层 ECharts 迁移与 UI/UX 系统化。
 tags: [roadmap, milestone, risk, planning, plugin]
-timestamp: 2026-08-29T14:40:04+08:00
+timestamp: 2026-09-10T01:51:04+08:00
 ---
 
 # 里程碑与风险
@@ -11,8 +11,8 @@ timestamp: 2026-08-29T14:40:04+08:00
 > [!note] 当前状态
 > **第一阶段 M1–M6 已完成**（2026-08-20）：脚手架、插件框架内核与数据层、5 个监控插件、可视化、设置与健壮性、electron-builder 打包均已落地并通过编译/测试。M7（扩展更多监控插件 / 代理拦截 / 云账单 / 导出）待后续迭代。
 
-> [!note] 截至 2026-08-29
-> 已交付 8 个内置监控插件、统计查询卸载到只读 worker 线程、系统托盘后台常驻、仪表盘双图合并与趋势页退役、查询预聚合与联合索引；全部代码注释已于 2026-08-28 移除，`docs/` 为唯一事实来源。具体路线图与各概念实现见 [总体架构](architecture.md) / [插件体系](plugin-architecture.md) / [监控插件](monitor-plugins.md) / [数据流](data-flow.md) 等各概念页。
+> [!note] 截至 2026-09-10
+> 已交付 8 个内置监控插件、统计查询卸载到只读 worker 线程、系统托盘后台常驻、仪表盘双图合并与趋势页退役、查询预聚合与联合索引；图表层已由 Recharts 整体迁移至 ECharts 6.1（Recharts 及 d3 分组卸载，相关死代码清理），渲染层 UI/UX 系统化（QueryState 四态边界、Toast、Toggle、useDismissable、tailwind 语义设计 token、时间范围 FilterContext 全局化）；全部代码注释已于 2026-08-28 移除，`docs/` 为唯一事实来源。具体路线图与各概念实现见 [总体架构](architecture.md) / [插件体系](plugin-architecture.md) / [监控插件](monitor-plugins.md) / [数据流](data-flow.md) 等各概念页。
 
 ## 实施路线图
 

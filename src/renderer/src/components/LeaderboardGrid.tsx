@@ -23,12 +23,12 @@ function RankCard({ rank, model, large }: { rank: number; model: ModelStats; lar
         large && 'p-4'
       )}
     >
-      <div className="absolute right-2 top-2 select-none font-mono text-6xl font-bold leading-none text-neutral-800/40">
+      <div className="absolute right-2 top-2 select-none tabular-nums text-6xl font-bold leading-none text-neutral-800/40">
         {rankStr}
       </div>
       <div className="relative">
         <div className="mb-1 flex items-center gap-1.5 text-[11px] text-neutral-500">
-          <span className="font-mono">{rankStr}</span>
+          <span className="tabular-nums">{rankStr}</span>
           <span className="inline-flex h-4 w-4 items-center justify-center rounded bg-neutral-800 text-[10px]">{model.appType.slice(0, 1).toUpperCase()}</span>
         </div>
         <div className={clsx('truncate font-mono font-medium text-white', large ? 'text-sm' : 'text-xs')} title={model.model}>
@@ -37,7 +37,7 @@ function RankCard({ rank, model, large }: { rank: number; model: ModelStats; lar
         <div className="truncate text-[11px] text-neutral-500">{model.appType}</div>
         <div className="mt-2 flex items-end justify-between">
           <div>
-            <div className={clsx('font-mono font-semibold text-white', large ? 'text-base' : 'text-sm')}>{formatTokens(total)}</div>
+            <div className={clsx('tabular-nums font-semibold text-white', large ? 'text-base' : 'text-sm')}>{formatTokens(total)}</div>
             <div className="text-[11px] text-neutral-500">{model.requestCount.toLocaleString()} 请求 · {formatUsd(model.costUsd)}</div>
           </div>
           <div className={clsx('rounded px-1.5 py-0.5 text-[11px] font-medium', model.successRate >= 0.95 ? 'bg-emerald-500/15 text-emerald-300' : model.successRate >= 0.8 ? 'bg-amber-500/15 text-amber-300' : 'bg-red-500/15 text-red-300')}>

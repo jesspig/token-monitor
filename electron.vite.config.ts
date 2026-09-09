@@ -31,7 +31,7 @@ export default defineConfig({
           manualChunks(id) {
             const p = id.replace(/\\/g, '/')
             if (!p.includes('/node_modules/')) return undefined
-            if (/recharts|d3-|victory-vendor/.test(p)) return 'charts'
+            if (/\/node_modules\/(echarts|zrender)\//.test(p)) return 'echarts'
             if (p.includes('@tanstack')) return 'query'
             if (/\/(react|react-dom|scheduler)\//.test(p)) return 'vendor'
             return undefined

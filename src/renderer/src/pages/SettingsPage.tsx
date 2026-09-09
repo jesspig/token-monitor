@@ -3,13 +3,15 @@ import type { ReactElement } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 import { Card } from '../components/Card'
-import { EmptyState } from '../components/EmptyState'
+import { QueryState } from '../components/QueryState'
+import { Toggle } from '../components/Toggle'
 import { PageHeader } from '../components/PageHeader'
+import { useToast } from '../context/ToastContext'
 import { useSettings } from '../hooks/useSettings'
 import { setCachedSettings } from '../lib/settings-cache'
 
 const INPUT_CLS =
-  'w-full rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-neutral-600 focus:outline-none'
+  'w-full rounded-lg border border-line bg-surface-card px-3 py-2 text-sm text-content-secondary placeholder:text-neutral-600 focus:border-neutral-600 focus:outline-none'
 const LABEL_CLS = 'mb-1 block text-xs font-medium text-neutral-400'
 
 function parseBudgetInput(raw: string): { value: number | null; error: string | null } {
@@ -21,7 +23,8 @@ function parseBudgetInput(raw: string): { value: number | null; error: string | 
 }
 
 export default function SettingsPage(): ReactElement {
-  const { data, isLoading } = useSettings()
+  const { data, isPending, isFetching, error, refetch } = useSettings()
+  const toast = useToast()
   const qc = useQueryClient()
 
   const [syncMin, setSyncMin] = useState('')
@@ -33,6 +36,7 @@ export default function SettingsPage(): ReactElement {
   const [monthlyBudget, setMonthlyBudget] = useState('')
   const [budgetError, setBudgetError] = useState('')
   const [closeToTray, setCloseToTray] = useState(false)
+  const [saving, setSaving] = useState(false)
 
   const hydratedRef = useRef(false)
   useEffect(() => {
@@ -51,9 +55,9 @@ export default function SettingsPage(): ReactElement {
   async function handleSave(): Promise<void> {
     const daily = parseBudgetInput(dailyBudget)
     const monthly = parseBudgetInput(monthlyBudget)
-    const error = daily.error ?? monthly.error
-    if (error) {
-      setBudgetError(`预算上限${error}`)
+    const budgetIssue = daily.error ?? monthly.error
+    if (budgetIssue) {
+      setBudgetError(`预算上限${budgetIssue}`)
       return
     }
     setBudgetError('')
@@ -67,18 +71,47 @@ export default function SettingsPage(): ReactElement {
       monthlyBudgetUsd: monthly.value,
       closeToTray
     }
-    await api.updateSettings(payload)
-    setCachedSettings(payload)
-    await qc.invalidateQueries({ queryKey: ['settings'] })
+    setSaving(true)
+    try {
+      await api.updateSettings(payload)
+      setCachedSettings(payload)
+      await qc.invalidateQueries({ queryKey: ['settings'] })
+      toast.success('设置已保存')
+    } catch {
+      toast.error('保存失败，请重试')
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
     <div className="space-y-6">
       <PageHeader title="设置" description="同步间隔、数据保留策略、数据目录与预算上限" />
 
-      {isLoading && !data ? (
-        <EmptyState title="加载中…" description="正在读取设置。" />
-      ) : (
+      <QueryState
+        isPending={isPending}
+        error={error}
+        refetch={refetch}
+        hasData={data != null}
+        isFetching={isFetching}
+        loadingFallback={
+          <Card title="常规设置">
+            <div className="animate-pulse">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div className="h-14 rounded-lg bg-line" />
+                <div className="h-14 rounded-lg bg-line" />
+                <div className="h-14 rounded-lg bg-line" />
+                <div className="h-14 rounded-lg bg-line" />
+                <div className="h-14 rounded-lg bg-line" />
+                <div className="h-14 rounded-lg bg-line" />
+              </div>
+              <div className="mt-4 flex justify-end">
+                <div className="h-9 w-24 rounded-lg bg-line" />
+              </div>
+            </div>
+          </Card>
+        }
+      >
         <Card title="常规设置">
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <div>
@@ -133,7 +166,7 @@ export default function SettingsPage(): ReactElement {
                 className={INPUT_CLS}
               />
             </div>
-            <div className="md:col-span-2">
+            <div>
               <label className={LABEL_CLS} htmlFor="data-dir">
                 数据目录
               </label>
@@ -145,17 +178,13 @@ export default function SettingsPage(): ReactElement {
                 className={INPUT_CLS}
               />
             </div>
-            <div className="md:col-span-2 flex items-center gap-2">
-              <input
+            <div className="md:col-span-2 flex items-center">
+              <Toggle
                 id="close-to-tray"
-                type="checkbox"
                 checked={closeToTray}
-                onChange={(e) => setCloseToTray(e.target.checked)}
-                className="h-4 w-4 rounded border-neutral-700 bg-neutral-900"
+                onChange={setCloseToTray}
+                label="关闭窗口时最小化到系统托盘（后台常驻）"
               />
-              <label className={LABEL_CLS} htmlFor="close-to-tray">
-                关闭窗口时最小化到系统托盘（后台常驻）
-              </label>
             </div>
             <div>
               <label className={LABEL_CLS} htmlFor="daily-budget">
@@ -198,14 +227,15 @@ export default function SettingsPage(): ReactElement {
             {budgetError && <p className="text-sm text-red-400">{budgetError}</p>}
             <button
               type="button"
+              disabled={saving}
               onClick={() => void handleSave()}
-              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500"
+              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-success-bright disabled:cursor-not-allowed disabled:opacity-60"
             >
-              保存设置
+              {saving ? '保存中…' : '保存设置'}
             </button>
           </div>
         </Card>
-      )}
+      </QueryState>
     </div>
   )
 }

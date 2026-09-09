@@ -4,7 +4,7 @@ title: 定价与费用
 description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填与存量缓存口径重算；费用 = fresh_input × input 价 + 其余 token × 各自价格，input 按 semantics 三态扣减。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-08-28T02:27:00+08:00
+timestamp: 2026-09-10T01:51:04+08:00
 ---
 
 # 定价与费用
@@ -79,7 +79,7 @@ timestamp: 2026-08-28T02:27:00+08:00
 
 - 启动序列 seed 定价后**延迟 10 秒**执行一次全量同步（2026-08-24 启动错峰，避免与首轮采集同帧争抢 IO）；
 - 此后经 scheduler 按 `pricingSyncIntervalMs` 周期执行（默认 `300000` = 5 分钟），设置变更时即时重启调度；无启停开关，UI 仅在设置页暴露间隔输入（分钟）；
-- PricingPage 仅保留「立即全量同步」按钮，手动触发同一宿主入口。
+- PricingPage 为只读列表（客户端搜索框过滤 + 15/页分页 `PRICING_PAGE_SIZE`），仅保留「立即全量同步」按钮，手动触发同一宿主入口，同步结果经 toast 反馈。
 
 IPC 仅两通道：`pricing:list`（只读列表）/ `pricing:modelsdev-sync`（手动全量同步）。`pricing:update` / `pricing:delete` / 目录浏览与勾选导入通道已删除，定价表对 UI **只读**；user 档保护规则不变，历史手动价仍不会被 seed/sync 覆盖。
 

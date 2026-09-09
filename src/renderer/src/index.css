@@ -28,3 +28,34 @@
 ::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+:focus-visible {
+  outline: 2px solid rgb(52 211 153 / 0.7);
+  outline-offset: 2px;
+}
+
+@keyframes sk-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.sk-shimmer {
+  background-image: linear-gradient(90deg, rgb(38 38 38 / 1) 0%, rgb(64 64 64 / 1) 50%, rgb(38 38 38 / 1) 100%);
+  background-size: 200% 100%;
+  animation: sk-shimmer 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
