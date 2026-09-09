@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactElement, ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import clsx from 'clsx'
@@ -10,8 +10,10 @@ import { useFilter } from '../context/FilterContext'
 import { useNav } from '../context/NavContext'
 import { EmptyState } from '../components/EmptyState'
 import { PageHeader } from '../components/PageHeader'
+import { QueryState } from '../components/QueryState'
 import { RangeSelector } from '../components/RangeSelector'
 import { useDebouncedValue } from '../hooks/useDebouncedValue'
+import { useDismissable } from '../hooks/useDismissable'
 import { useRequestLogs } from '../hooks/useRequestLogs'
 import {
   APP_META,
@@ -33,7 +35,10 @@ const INPUT_SEMANTICS_LABEL: Record<number, string> = {
 }
 
 const TH = 'px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-neutral-500'
+const TH_NUMERIC =
+  'px-3 py-2 text-right text-xs font-medium uppercase tracking-wide text-neutral-500'
 const TD = 'px-3 py-2 text-sm text-neutral-300'
+const TD_NUMERIC = 'px-3 py-2 text-right text-sm tabular-nums text-neutral-300'
 
 const MODEL_FILTER_RENDER_LIMIT = 200
 
@@ -47,8 +52,10 @@ const KEYWORD_DEBOUNCE_MS = 300
 
 export default function RequestLogsPage(): ReactElement {
   const sharedFilter = useFilter()
-  const [range, setRange] = useState<RangeKey>('30d')
-  const [customRange, setCustomRange] = useState<CustomRange | null>(null)
+  const range = sharedFilter.filter.range
+  const customRange = sharedFilter.filter.customRange
+  const setRange = sharedFilter.setRange
+  const setCustomRange = sharedFilter.setCustomRange
   const [appTypes, setAppTypes] = useState<AppType[]>([])
   const [models, setModels] = useState<string[]>([])
   const [project, setProject] = useState('')
@@ -92,7 +99,13 @@ export default function RequestLogsPage(): ReactElement {
     [range, customRange, appTypes, models, status, debouncedKeyword, knownProject, page]
   )
 
-  const { data, isLoading } = useRequestLogs(filters)
+  const {
+    data,
+    isPending,
+    isFetching,
+    error,
+    refetch: refetchLogs
+  } = useRequestLogs(filters)
   const totalPages = Math.max(1, data?.totalPages ?? 1)
   const expanded = data?.items.find((r) => r.id === expandedId) ?? null
 
@@ -136,20 +149,34 @@ export default function RequestLogsPage(): ReactElement {
     setPage(1)
   }
 
+  const resetFilters = (): void => {
+    setRange('7d')
+    setCustomRange(null)
+    setAppTypes([])
+    setModels([])
+    setProject('')
+    setStatus('all')
+    setKeyword('')
+    setPage(1)
+  }
+
   return (
     <div className="space-y-6">
-      <PageHeader title="请求日志" description="按应用 / 模型 / 项目 / 时间 / 状态筛选的用量明细" />
+      <PageHeader
+        title="请求日志"
+        description="按应用 / 模型 / 项目 / 时间 / 状态筛选的用量明细"
+        action={
+          <RangeSelector
+            value={range}
+            onChange={changeRange}
+            options={RANGE_OPTIONS}
+            customRange={customRange}
+            onCustomRangeChange={changeCustomRange}
+          />
+        }
+      />
 
-      {}
       <div className="flex flex-wrap items-center gap-2">
-        <RangeSelector
-          value={range}
-          onChange={changeRange}
-          options={RANGE_OPTIONS}
-          customRange={customRange}
-          onCustomRangeChange={changeCustomRange}
-        />
-
         <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
@@ -226,14 +253,31 @@ export default function RequestLogsPage(): ReactElement {
         </select>
       </div>
 
-      {isLoading && !data ? (
-        <EmptyState title="加载中…" description="正在获取请求日志。" />
-      ) : data && data.items.length === 0 ? (
-        <EmptyState
-          title="等待真实数据"
-          description="当前筛选条件下暂无日志，接入真实 IPC 后端后展示明细。"
-        />
-      ) : (
+      <QueryState
+        isPending={isPending}
+        error={error}
+        refetch={refetchLogs}
+        hasData={data != null}
+        isEmpty={data != null && data.items.length === 0}
+        isFetching={isFetching}
+        skeletonVariant="table"
+        dimWhenRefreshing
+        empty={
+          <EmptyState
+            title="无匹配记录"
+            description="当前筛选条件下没有请求日志，请调整时间范围或筛选条件。"
+            action={
+              <button
+                type="button"
+                onClick={resetFilters}
+                className="rounded-md border border-neutral-700 bg-neutral-800 px-3 py-1.5 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-700"
+              >
+                清除筛选
+              </button>
+            }
+          />
+        }
+      >
         <div className="overflow-x-auto rounded-xl border border-neutral-800 bg-neutral-900/60">
           <table className="w-full min-w-[1100px] border-collapse">
             <thead>
@@ -241,12 +285,12 @@ export default function RequestLogsPage(): ReactElement {
                 <th className={TH}>时间</th>
                 <th className={TH}>应用</th>
                 <th className={TH}>模型</th>
-                <th className={TH}>输入</th>
-                <th className={TH}>输出</th>
-                <th className={TH}>缓存读</th>
-                <th className={TH}>缓存写</th>
-                <th className={TH}>费用</th>
-                <th className={TH}>耗时</th>
+                <th className={TH_NUMERIC}>输入</th>
+                <th className={TH_NUMERIC}>输出</th>
+                <th className={TH_NUMERIC}>缓存读</th>
+                <th className={TH_NUMERIC}>缓存写</th>
+                <th className={TH_NUMERIC}>费用</th>
+                <th className={TH_NUMERIC}>耗时</th>
                 <th className={TH}>状态</th>
                 <th className={TH}>错误</th>
               </tr>
@@ -263,7 +307,7 @@ export default function RequestLogsPage(): ReactElement {
             </tbody>
           </table>
         </div>
-      )}
+      </QueryState>
 
       {expanded && <DetailDrawer record={expanded} onClose={() => setExpandedId(null)} />}
 
@@ -331,6 +375,8 @@ function ModelFilter({
 }): ReactElement {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
+  const panelRef = useRef<HTMLDivElement | null>(null)
+  useDismissable({ open, onClose: () => setOpen(false), containerRef: panelRef })
   const keyword = query.trim().toLowerCase()
   const filtered = keyword === '' ? options : options.filter((m) => m.toLowerCase().includes(keyword))
   const visible = filtered.slice(0, MODEL_FILTER_RENDER_LIMIT)
@@ -359,7 +405,11 @@ function ModelFilter({
       {open && (
         <>
           <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
-          <div className="absolute left-0 top-full z-40 mt-1 w-64 rounded-lg border border-neutral-800 bg-neutral-950 shadow-xl">
+          <div
+            ref={panelRef}
+            tabIndex={-1}
+            className="absolute left-0 top-full z-40 mt-1 w-64 rounded-lg border border-neutral-800 bg-neutral-950 shadow-xl focus:outline-none"
+          >
             <header className="flex items-center justify-between border-b border-neutral-800 px-3 py-2">
               <span className="text-[11px] uppercase tracking-wide text-neutral-500">
                 模型筛选
@@ -443,13 +493,17 @@ function Row({
       <td className={TD}>
         <AppBadge app={r.appType} />
       </td>
-      <td className={`${TD} font-mono text-xs`}>{r.model}</td>
-      <td className={`${TD} tabular-nums`}>{formatTokens(r.inputTokens)}</td>
-      <td className={`${TD} tabular-nums`}>{formatTokens(r.outputTokens)}</td>
-      <td className={`${TD} tabular-nums`}>{formatTokens(r.cacheReadTokens)}</td>
-      <td className={`${TD} tabular-nums`}>{formatTokens(r.cacheCreationTokens)}</td>
-      <td className={`${TD} tabular-nums`}>{formatUsd(r.costUsd)}</td>
-      <td className={`${TD} tabular-nums`}>{formatDuration(r.latencyMs)}</td>
+      <td className={TD}>
+        <span className="block max-w-[180px] truncate font-mono text-xs" title={r.model}>
+          {r.model}
+        </span>
+      </td>
+      <td className={TD_NUMERIC}>{formatTokens(r.inputTokens)}</td>
+      <td className={TD_NUMERIC}>{formatTokens(r.outputTokens)}</td>
+      <td className={TD_NUMERIC}>{formatTokens(r.cacheReadTokens)}</td>
+      <td className={TD_NUMERIC}>{formatTokens(r.cacheCreationTokens)}</td>
+      <td className={TD_NUMERIC}>{formatUsd(r.costUsd)}</td>
+      <td className={TD_NUMERIC}>{formatDuration(r.latencyMs)}</td>
       <td className={TD}>
         <StatusBadge status={r.status} httpStatus={r.httpStatus} />
       </td>
@@ -515,6 +569,16 @@ function StatusBadge({
 function DetailDrawer({ record: r, onClose }: { record: RequestLogDetail; onClose: () => void }): ReactElement {
   const filter = useFilter()
   const nav = useNav()
+  const panelRef = useRef<HTMLElement | null>(null)
+  useDismissable({ open: true, onClose, containerRef: panelRef })
+
+  useEffect(() => {
+    const previous = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = previous
+    }
+  }, [])
 
   const viewInTrends = (): void => {
     filter.setAppTypes([r.appType])
@@ -526,7 +590,11 @@ function DetailDrawer({ record: r, onClose }: { record: RequestLogDetail; onClos
   return (
     <div className="fixed inset-0 z-40" role="dialog" aria-modal="true">
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
-      <aside className="absolute inset-y-0 right-0 flex w-full max-w-md flex-col border-l border-neutral-800 bg-neutral-950 shadow-2xl">
+      <aside
+        ref={panelRef}
+        tabIndex={-1}
+        className="absolute inset-y-0 right-0 flex w-full max-w-md flex-col border-l border-neutral-800 bg-neutral-950 shadow-2xl focus:outline-none"
+      >
         <header className="flex items-center justify-between gap-3 border-b border-neutral-800 px-5 py-4">
           <div className="min-w-0">
             <p className="text-sm font-medium text-neutral-200">请求详情</p>
