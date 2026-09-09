@@ -1,14 +1,18 @@
-import { memo, useMemo, useState, useTransition } from 'react'
+import { memo, useMemo, useState } from 'react'
 import type { ReactElement } from 'react'
 import clsx from 'clsx'
 import { EmptyState } from './EmptyState'
+import { QueryState } from './QueryState'
 import { useDimensionStats, type DimensionKey, type DimensionStats } from '../hooks/useDimensionStats'
 import { APP_META, formatDuration, formatPercent, formatTokens, formatUsd } from '../lib/format'
 import { rangeToFilters, type RangeKey } from '../lib/range'
 import type { LogFilters } from '../../../../shared/query'
 
-const TH = 'px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-neutral-500'
-const TD = 'px-3 py-2 text-sm text-neutral-300'
+const TH_TEXT = 'px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-neutral-500'
+const TH_NUM = 'text-xs font-medium uppercase tracking-wide text-neutral-500'
+const TD_TEXT = 'px-3 py-2 text-sm text-neutral-300'
+const TD_NUM = 'px-3 py-2 text-right text-sm tabular-nums text-neutral-300'
+const ROW_LIMIT = 50
 
 type SortKey =
   | 'requestCount'
@@ -63,6 +67,11 @@ function numericValue(row: DimensionStats, key: SortKey): number {
   return row[key as Exclude<SortKey, 'costUsd' | 'avgLatencyMs' | 'totalTokens'>] as number
 }
 
+function ariaSortOf(key: SortKey, sortKey: SortKey, sortDir: 'asc' | 'desc'): 'ascending' | 'descending' | 'none' {
+  if (key !== sortKey) return 'none'
+  return sortDir === 'asc' ? 'ascending' : 'descending'
+}
+
 function visibleColumns(metricView: MetricView, dimension: DimensionKey): Array<{ key: SortKey; label: string }> {
   if (metricView === 'overview') {
     const cols: Array<{ key: SortKey; label: string }> = [
@@ -104,7 +113,7 @@ function DimensionTableImpl({ range, filters, onRowClick }: DimensionTableProps)
   const [metricView, setMetricView] = useState<MetricView>('overview')
   const [sortKey, setSortKey] = useState<SortKey>('requestCount')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
-  const [isPending, startTransition] = useTransition()
+  const [expanded, setExpanded] = useState(false)
 
   const effectiveFilters = useMemo<LogFilters>(
     () => filters ?? rangeToFilters(range),
@@ -168,33 +177,33 @@ function DimensionTableImpl({ range, filters, onRowClick }: DimensionTableProps)
       setSortKey(key)
       setSortDir('desc')
     }
+    setExpanded(false)
+  }
+
+  const selectDimension = (key: DimensionKey): void => {
+    setDimension(key)
+    setExpanded(false)
+  }
+
+  const selectMetricView = (key: MetricView): void => {
+    setMetricView(key)
+    setExpanded(false)
   }
 
   const dimColLabel = DIMENSION_TABS.find((d) => d.key === dimension)?.colLabel ?? '维度'
   const columns = visibleColumns(metricView, dimension)
-
-  if (query.isLoading && !query.data) {
-    return <EmptyState title="加载中…" description="正在获取统计数据。" />
-  }
-
-  if (data.length === 0) {
-    return (
-      <EmptyState
-        title="等待真实数据"
-        description="当前时间范围内暂无统计数据，接入真实 IPC 后端后展示。"
-      />
-    )
-  }
+  const visibleRows = expanded ? sorted : sorted.slice(0, ROW_LIMIT)
+  const isTruncated = !expanded && sorted.length > ROW_LIMIT
 
   return (
-    <div className={`space-y-6 ${isPending ? 'opacity-60' : ''}`}>
+    <div className="space-y-6">
       <div className="flex flex-wrap items-center gap-3">
         <div className="inline-flex rounded-lg border border-neutral-800 bg-neutral-900 p-0.5">
           {DIMENSION_TABS.map((t) => (
             <button
               key={t.key}
               type="button"
-              onClick={() => startTransition(() => setDimension(t.key))}
+              onClick={() => selectDimension(t.key)}
               className={clsx(
                 'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
                 dimension === t.key
@@ -211,7 +220,7 @@ function DimensionTableImpl({ range, filters, onRowClick }: DimensionTableProps)
             <button
               key={t.key}
               type="button"
-              onClick={() => startTransition(() => setMetricView(t.key))}
+              onClick={() => selectMetricView(t.key)}
               className={clsx(
                 'rounded-md px-3 py-1 text-xs font-medium transition-colors',
                 metricView === t.key
@@ -225,52 +234,87 @@ function DimensionTableImpl({ range, filters, onRowClick }: DimensionTableProps)
         </div>
       </div>
 
-      <div className="space-y-6">
+      <QueryState
+        isPending={query.isPending}
+        error={query.error}
+        refetch={query.refetch}
+        hasData={data.length > 0}
+        isEmpty={data.length === 0}
+        skeletonVariant="table"
+        dimWhenRefreshing
+        empty={
+          <EmptyState title="暂无数据" description="当前时间范围与筛选条件下没有统计数据。" />
+        }
+      >
         <div className="overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60">
           <div className="overflow-x-auto">
             <table className="w-full min-w-[640px] border-collapse">
               <thead>
                 <tr className="border-b border-neutral-800 bg-neutral-900">
-                  <th className={TH}>{dimColLabel}</th>
+                  <th scope="col" className={TH_TEXT}>
+                    {dimColLabel}
+                  </th>
                   {columns.map((c) => (
                     <th
                       key={c.key}
-                      className={clsx(TH, 'cursor-pointer select-none hover:text-neutral-300')}
-                      onClick={() => toggleSort(c.key)}
+                      scope="col"
+                      aria-sort={ariaSortOf(c.key, sortKey, sortDir)}
+                      className={TH_NUM}
                     >
-                      <span className="inline-flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => toggleSort(c.key)}
+                        className="flex w-full cursor-pointer select-none items-center justify-end gap-1 px-3 py-2 transition-colors hover:text-neutral-300"
+                      >
                         {c.label}
                         {sortKey === c.key && (
-                          <span className="text-neutral-400">{sortDir === 'asc' ? '▲' : '▼'}</span>
+                          <span aria-hidden="true" className="text-neutral-400">
+                            {sortDir === 'asc' ? '▲' : '▼'}
+                          </span>
                         )}
-                      </span>
+                        {sortKey === c.key && (
+                          <span className="sr-only">{sortDir === 'asc' ? '（升序）' : '（降序）'}</span>
+                        )}
+                      </button>
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {sorted.map((r, i) => (
+                {visibleRows.map((r, i) => (
                   <tr
                     key={`${dimensionValue(r, dimension)}-${i}`}
                     className={clsx(
                       'border-b border-neutral-800/70 hover:bg-neutral-800/40',
-                      onRowClick && 'cursor-pointer'
+                      onRowClick &&
+                        'cursor-pointer focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-neutral-500'
                     )}
                     onClick={onRowClick ? () => onRowClick(r, dimension) : undefined}
+                    tabIndex={onRowClick ? 0 : undefined}
+                    onKeyDown={
+                      onRowClick
+                        ? (e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault()
+                              onRowClick(r, dimension)
+                            }
+                          }
+                        : undefined
+                    }
                   >
-                    <td className={clsx(TD, dimension === 'model' && 'font-mono text-xs')}>
+                    <td className={clsx(TD_TEXT, dimension === 'model' && 'font-mono text-xs')}>
                       {dimensionValue(r, dimension)}
                     </td>
                     {columns.map((c) => {
-                      if (c.key === 'requestCount') return <td key={c.key} className={`${TD} tabular-nums`}>{r.requestCount}</td>
-                      if (c.key === 'inputTokens') return <td key={c.key} className={`${TD} tabular-nums`}>{formatTokens(r.inputTokens)}</td>
-                      if (c.key === 'outputTokens') return <td key={c.key} className={`${TD} tabular-nums`}>{formatTokens(r.outputTokens)}</td>
-                      if (c.key === 'cacheReadTokens') return <td key={c.key} className={`${TD} tabular-nums`}>{formatTokens(r.cacheReadTokens)}</td>
-                      if (c.key === 'cacheCreationTokens') return <td key={c.key} className={`${TD} tabular-nums`}>{formatTokens(r.cacheCreationTokens)}</td>
-                      if (c.key === 'costUsd') return <td key={c.key} className={`${TD} tabular-nums`}>{formatUsd(r.costUsd)}</td>
-                      if (c.key === 'successRate') return <td key={c.key} className={`${TD} tabular-nums`}>{formatPercent(r.successRate)}</td>
-                      if (c.key === 'avgLatencyMs') return <td key={c.key} className={`${TD} tabular-nums`}>{formatDuration((r as { avgLatencyMs?: number | null }).avgLatencyMs)}</td>
-                      if (c.key === 'totalTokens') return <td key={c.key} className={`${TD} tabular-nums`}>{formatTokens(totalTokensOf(r))}</td>
+                      if (c.key === 'requestCount') return <td key={c.key} className={TD_NUM}>{r.requestCount}</td>
+                      if (c.key === 'inputTokens') return <td key={c.key} className={TD_NUM}>{formatTokens(r.inputTokens)}</td>
+                      if (c.key === 'outputTokens') return <td key={c.key} className={TD_NUM}>{formatTokens(r.outputTokens)}</td>
+                      if (c.key === 'cacheReadTokens') return <td key={c.key} className={TD_NUM}>{formatTokens(r.cacheReadTokens)}</td>
+                      if (c.key === 'cacheCreationTokens') return <td key={c.key} className={TD_NUM}>{formatTokens(r.cacheCreationTokens)}</td>
+                      if (c.key === 'costUsd') return <td key={c.key} className={TD_NUM}>{formatUsd(r.costUsd)}</td>
+                      if (c.key === 'successRate') return <td key={c.key} className={TD_NUM}>{formatPercent(r.successRate)}</td>
+                      if (c.key === 'avgLatencyMs') return <td key={c.key} className={TD_NUM}>{formatDuration((r as { avgLatencyMs?: number | null }).avgLatencyMs)}</td>
+                      if (c.key === 'totalTokens') return <td key={c.key} className={TD_NUM}>{formatTokens(totalTokensOf(r))}</td>
                       return null
                     })}
                   </tr>
@@ -278,26 +322,36 @@ function DimensionTableImpl({ range, filters, onRowClick }: DimensionTableProps)
               </tbody>
               <tfoot>
                 <tr className="border-t border-neutral-800 bg-neutral-900 font-medium">
-                  <td className={clsx(TD, 'text-neutral-200')}>合计</td>
+                  <td className={clsx(TD_TEXT, 'text-neutral-200')}>合计</td>
                   {columns.map((c) => {
-                    if (c.key === 'requestCount') return <td key={c.key} className={`${TD} tabular-nums text-neutral-200`}>{totals.requestCount}</td>
-                    if (c.key === 'inputTokens') return <td key={c.key} className={`${TD} tabular-nums text-neutral-200`}>{formatTokens(totals.inputTokens)}</td>
-                    if (c.key === 'outputTokens') return <td key={c.key} className={`${TD} tabular-nums text-neutral-200`}>{formatTokens(totals.outputTokens)}</td>
-                    if (c.key === 'cacheReadTokens') return <td key={c.key} className={`${TD} tabular-nums text-neutral-200`}>{formatTokens(totals.cacheReadTokens)}</td>
-                    if (c.key === 'cacheCreationTokens') return <td key={c.key} className={`${TD} tabular-nums text-neutral-200`}>{formatTokens(totals.cacheCreationTokens)}</td>
-                    if (c.key === 'costUsd') return <td key={c.key} className={`${TD} tabular-nums text-neutral-200`}>{formatUsd(totals.costNum)}</td>
-                    if (c.key === 'successRate') return <td key={c.key} className={`${TD} tabular-nums text-neutral-200`}>{formatPercent(totals.successRate)}</td>
-                    if (c.key === 'avgLatencyMs') return <td key={c.key} className={`${TD} tabular-nums text-neutral-200`}>{formatDuration(totals.avgLatencyMs)}</td>
-                    if (c.key === 'totalTokens') return <td key={c.key} className={`${TD} tabular-nums text-neutral-200`}>{formatTokens(totals.totalTokens)}</td>
+                    if (c.key === 'requestCount') return <td key={c.key} className={clsx(TD_NUM, 'text-neutral-200')}>{totals.requestCount}</td>
+                    if (c.key === 'inputTokens') return <td key={c.key} className={clsx(TD_NUM, 'text-neutral-200')}>{formatTokens(totals.inputTokens)}</td>
+                    if (c.key === 'outputTokens') return <td key={c.key} className={clsx(TD_NUM, 'text-neutral-200')}>{formatTokens(totals.outputTokens)}</td>
+                    if (c.key === 'cacheReadTokens') return <td key={c.key} className={clsx(TD_NUM, 'text-neutral-200')}>{formatTokens(totals.cacheReadTokens)}</td>
+                    if (c.key === 'cacheCreationTokens') return <td key={c.key} className={clsx(TD_NUM, 'text-neutral-200')}>{formatTokens(totals.cacheCreationTokens)}</td>
+                    if (c.key === 'costUsd') return <td key={c.key} className={clsx(TD_NUM, 'text-neutral-200')}>{formatUsd(totals.costNum)}</td>
+                    if (c.key === 'successRate') return <td key={c.key} className={clsx(TD_NUM, 'text-neutral-200')}>{formatPercent(totals.successRate)}</td>
+                    if (c.key === 'avgLatencyMs') return <td key={c.key} className={clsx(TD_NUM, 'text-neutral-200')}>{formatDuration(totals.avgLatencyMs)}</td>
+                    if (c.key === 'totalTokens') return <td key={c.key} className={clsx(TD_NUM, 'text-neutral-200')}>{formatTokens(totals.totalTokens)}</td>
                     return null
                   })}
                 </tr>
               </tfoot>
             </table>
           </div>
+          {isTruncated && (
+            <div className="border-t border-neutral-800 px-3 py-2">
+              <button
+                type="button"
+                onClick={() => setExpanded(true)}
+                className="w-full cursor-pointer rounded-md px-3 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:bg-neutral-800/60 hover:text-neutral-200"
+              >
+                显示全部 {sorted.length} 行
+              </button>
+            </div>
+          )}
         </div>
-
-      </div>
+      </QueryState>
     </div>
   )
 }

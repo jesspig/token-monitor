@@ -51,9 +51,9 @@
     "better-sqlite3": "^11.7.0",
     "chokidar": "^4.0.0",
     "clsx": "^2.1.1",
+    "echarts": "^6.1.0",
     "fzstd": "^0.1.1",
-    "lucide-react": "^0.460.0",
-    "recharts": "^2.15.0"
+    "lucide-react": "^0.460.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
