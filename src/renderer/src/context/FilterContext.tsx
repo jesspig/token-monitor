@@ -1,10 +1,11 @@
 import { createContext, useContext, useMemo, useState } from 'react'
 import type { ReactElement, ReactNode } from 'react'
 import type { AppType, RequestStatus } from '../../../../shared/app'
-import type { RangeKey } from '../lib/range'
+import type { CustomRange, RangeKey } from '../lib/range'
 
 export interface FilterState {
   range: RangeKey
+  customRange: CustomRange | null
   appTypes?: AppType[]
   models?: string[]
   project?: string
@@ -14,6 +15,7 @@ export interface FilterState {
 export interface FilterContextValue {
   filter: FilterState
   setRange: (range: RangeKey) => void
+  setCustomRange: (customRange: CustomRange | null) => void
   setAppTypes: (appTypes?: AppType[]) => void
   setModels: (models?: string[]) => void
   setProject: (project?: string) => void
@@ -22,7 +24,8 @@ export interface FilterContextValue {
 }
 
 const DEFAULT_FILTER: FilterState = {
-  range: '7d'
+  range: '7d',
+  customRange: null
 }
 
 const FilterContext = createContext<FilterContextValue | null>(null)
@@ -34,6 +37,7 @@ export function FilterProvider({ children }: { children: ReactNode }): ReactElem
     () => ({
       filter,
       setRange: (range) => setFilter((prev) => ({ ...prev, range })),
+      setCustomRange: (customRange) => setFilter((prev) => ({ ...prev, customRange })),
       setAppTypes: (appTypes) => setFilter((prev) => ({ ...prev, appTypes })),
       setModels: (models) => setFilter((prev) => ({ ...prev, models })),
       setProject: (project) => setFilter((prev) => ({ ...prev, project })),

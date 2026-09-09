@@ -92,7 +92,7 @@ function AppShell(): ReactElement {
         </nav>
         {isMock && (
           <div className="m-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
-            Mock 模式 · 等待真实数据
+            演示数据模式
           </div>
         )}
       </aside>
@@ -105,7 +105,7 @@ function AppShell(): ReactElement {
             <p className="text-sm font-semibold">Token Monitor</p>
             {isMock && (
               <span className="ml-auto rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-300">
-                Mock
+                演示
               </span>
             )}
           </div>
@@ -129,23 +129,25 @@ function AppShell(): ReactElement {
           </nav>
         </header>
 
-        <main className="w-full mx-auto max-w-6xl flex-1 overflow-y-auto p-6">
-          {(Object.entries(PAGES) as Array<[PageKey, (typeof PAGES)[PageKey]]>).map(([key, Page]) => {
-            if (!visitedRef.current.has(key)) return null
-            return (
-              <div key={key} style={{ display: page === key ? 'block' : 'none' }}>
-                <Suspense
-                  fallback={
-                    <div className="flex w-full items-center justify-center py-24">
-                      <div className="h-32 w-full max-w-lg animate-pulse rounded-xl bg-neutral-800/70" />
-                    </div>
-                  }
-                >
-                  <Page />
-                </Suspense>
-              </div>
-            )
-          })}
+        <main className="min-h-0 flex-1 overflow-y-auto">
+          <div className="mx-auto max-w-6xl p-6">
+            {(Object.entries(PAGES) as Array<[PageKey, (typeof PAGES)[PageKey]]>).map(([key, Page]) => {
+              if (!visitedRef.current.has(key)) return null
+              return (
+                <div key={key} style={{ display: page === key ? 'block' : 'none' }}>
+                  <Suspense
+                    fallback={
+                      <div className="flex w-full items-center justify-center py-24">
+                        <div className="h-32 w-full max-w-lg animate-pulse rounded-xl bg-neutral-800/70" />
+                      </div>
+                    }
+                  >
+                    <Page />
+                  </Suspense>
+                </div>
+              )
+            })}
+          </div>
         </main>
       </div>
       </div>
