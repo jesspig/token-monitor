@@ -2,6 +2,12 @@
 
 > 仅保留最近 7 天。详细按小时记录见 [changelog/](changelog/)。
 
+## 2026-09-10
+
+- **图表层 ECharts 迁移与 UI/UX 系统化**：图表库由 Recharts 整体迁移至 ECharts 6.1（按需注册，`useECharts` + `chart-theme` 统一承载，分包改 `echarts|zrender → 'echarts'` chunk，recharts 卸载）；新增 QueryState 四态边界 / Toast / Toggle / useDismissable 并六页接入，空态与文案改用户视角，时间范围经 FilterContext 全局化（默认 7d、统计页获得自定义区间），DimensionTable 无障碍与分页展开、tailwind 语义设计 token 与 `formatCompact` 落地。typecheck 两段通过 / 463 用例通过，`pnpm build` 通过。详见 [changelog/2026-09-10-00](changelog/2026-09-10-00.md)。
+- **图表与布局视觉修正 + 滚动容器重构**：统计页「使用量 Top 10」与「费用占比」取消两列并排、恢复单列全宽纵向堆叠；仪表盘两图全系列 `smooth: true` 平滑曲线、请求趋势单系列 emerald 面积渐变；图例修正——`LEGEND_STYLE` 固定 `top: 0`、`GRID_STYLE.top` 8→36 留位（修正 ECharts 6 新默认主题图例落绘图区内底部与柱/X 轴重叠），统计页堆叠柱图例 `type: 'scroll'` 横向滚动、donut 图例保持底部；`App.tsx` main 改 `overflow-y-auto` 全宽滚动 + 内层 `mx-auto max-w-6xl` 版心居中，`index.html` html/body/#root 锁 100% 高度禁滚——main 成为唯一滚动容器，双滚动条根治；删冗余 `w-full`；定价页 `PRICING_PAGE_SIZE` 50 → 15。typecheck / 463 用例 / build 通过。详见 [changelog/2026-09-10-01](changelog/2026-09-10-01.md)。
+- **知识库全量代码-文档配对审计（/repo-wiki）**：以当前工作区代码（typecheck 两段 / vitest 463 用例 / build 通过）为基准对 `docs/` 全部概念页逐陈述核对并重算全部数值（页面 6/组件 13/hooks 12/插件 8/schema v11/invoke 通道 20/RendererApi 成员 21）；七个文档页差异修复——ui-pages 8 处（RendererApi 21 成员契约、token 本地化描述纠正、轮询 6 处）、architecture 4 处（`register.ts` 通道组成、workers 目录树补全）、data-flow 2 处（1500ms 防抖与轮询来源）、index/log 补 01 点档摘要、roadmap 现状推进至 09-10、pricing 分页 15/页；data-model/sync-mechanism/monitor-plugins/plugin-architecture/overview 五页零差异；同步根 `AGENTS.md` RendererApi 契约（21 成员 = 20 invoke 通道 + onUsageUpdated 事件订阅）。详见 [changelog/2026-09-10-02](changelog/2026-09-10-02.md)。
+
 ## 2026-08-29
 
 - **趋势合并与查询性能收敛**：仪表盘接入趋势双图（请求 Line + Token 四桶/成本堆叠 Area），独立趋势页退役（6 页导航，常驻渲染 visitedRef，`rangeToFilters` 分钟对齐，`keepPreviousData` 全量收敛，`isAnimationActive=false` 去动画），`getDailyModelBreakdown` 走日预聚合快路径，`idx_usage_records_model_created` 索引 v11 落地，统计页堆叠改 `Map` 一次遍历。详见 [changelog/2026-08-29-14](changelog/2026-08-29-14.md)。
@@ -31,15 +37,3 @@
 - **主进程防阻塞性能优化**：实测「每时每刻未响应」定位五个阻塞源并全部修复——采集器 mtime 短路（`getCursorMeta` 比对游标与文件 mtime，零变更文件不再重复解析，dsh zstd 整文件解压开销消除）、watcher 定向同步（新增 `syncPlugin(id)`，变更只触发对应插件而非全量扫描）、启动错峰（定价同步 10s / 零成本回填 20s / 存量重算 30s 延迟触发）、定价写入批量化（seed 与 models.dev 同步收敛单事务批量 upsert，数千次 fsync → 1 次）、渲染端轮询默认 5s → 30s（实时性由 usage-updated 推送保证）。typecheck / 361 项单测 / build 全部通过。
 - **dsh 插件模型来源升级三级 + 会话头状态缓存**：经 deepseek-harness 上游源码核实模型身份在 `data.message.source.model`（473/473 实测携带）而顶层 message.model 为 0 条；`request/header` 仅路由变化时稀疏写入（全文仅 1 条），旧两级来源在增量续读时状态丢失致用量永久漏采——现由三级来源 + per-file 会话头缓存（上限 512 近似 LRU、游标精确衔接才复用）消除盲区。typecheck / 361 项单测 / build 全部通过。
 - **dsh 插件修复（早前轮次）**：用户真实数据诊断发现 `assistant/message` 均不携带 `message.model`（6084 条实测为 0），模型实际由 `request/header.data.header.config` 携带——插件改为 request/header 状态机供模 + message 自带优先的两级来源，真实数据端到端验证 6084/6084 全部产出、0 跳过。typecheck / 349 项单测 / build 全部通过。
-
-## 2026-08-23
-
-- **pi / zcode / dsh 三监控插件接入（内置插件 5 → 8）**：pi（JSONL 树解析，semantics=2，requestId=条目 id）、zcode（SQLite rowid 水位 + WAL 感知，实测 input 含缓存 semantics=1）、dsh（fzstd 纯 JS 解压 zstd 帧解析 event-sourced JSONL，semantics=2，preview 格式声明）；AppType 扩至八值，契约/徽标/版本探测同步。typecheck / 346 项单测 / build 全部通过。
-- **各 CLI 最新版日志格式核实与兼容**：联网核实五源——claude 当前版按 content block 逐行写 JSONL（共享 message.id、output 流式单调增长），插件新增 `foldById` 折叠消除约 2.4 倍高估；gemini 新版已迁移 append-only JSONL（首行 metadata + 消息行 + $set 更新行，subagent 嵌套目录），插件双格式兼容（chats 子树 .jsonl 任意层级 + legacy session-*.json 不变）；codex 经 codex-rs 源码定论 output_tokens 已含 reasoning（现有实现正确）、opencode/grok 无变化。typecheck / 297 项单测 / build 全部通过。
-- **第五轮迭代（对标 cc-switch 用量统计）**：计费语义修复——`calcCost` 对 semantics=1 的 codex/gemini/grok 先扣缓存再计价（旧公式重复计费高估费用），opencode 存量标注由 v4 迁移修正为 2、三源历史费用经 `recalcCachedInputCosts` 启动重算；fork/rewrite 语义去重接入——五插件产出稳定 requestId、入库事务内查写 dedup_ledger；opencode WAL mtime 感知与清理前预回填；定价归一化 8 步 + 五级匹配链（effort 后缀剥离、点转横线变体、家族兜底）；前端自定义时间档、趋势图渐变、token 数量级中文本地化。typecheck / 286 项单测 / build 全部通过。
-
-## 2026-08-22
-
-- **第四轮迭代（时间范围五档 + 统计页精简 + 设置拆分）**：时间范围扩为 today/24h/7d/14d/30d 五档，today 与 24h 走小时聚合、其余按天（后端 LogFilters 纯时间戳过滤不变）；统计页「按模型」视图移除「应用」列；AppSettings 新增 statsRefreshIntervalMs（默认 5000）与 pricingSyncIntervalMs（默认 300000），价格自动同步间隔与渲染端轮询间隔均改为设置可配。typecheck / 222 项单测通过。
-- **第三轮迭代（数据质量 + 定价自动化 + CLI 版本探测）**：全零 token 记录入库前统一拦截（游标照常推进）+ v3 迁移清洗存量脏明细并重建受影响日期日聚合；models.dev 定价改为每 5 分钟无条件自动同步（seed 仅离线兜底），定价页只读化、IPC 收窄至 17 方法；新增 CLI `--version` 探测并在监控源页展示；渲染端 5s 兜底轮询、固定侧边栏布局与深色滚动条。typecheck / 222 项单测通过。
-- **AGENTS.md 精简重写**：改为紧凑指令文件，补充 pnpm 非 TTY 环境坑（`$env:CI='true'`）与单文件测试命令，删除与 docs/ 重复的低信号内容。
