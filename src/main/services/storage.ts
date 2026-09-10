@@ -8,20 +8,16 @@ import type {
   UsageDailyRollupRow,
   UsageRecordRow
 } from '../../../shared/tables'
+import { ERROR_MESSAGE_MAX_LENGTH } from '../../../shared/failure'
 import { createDatabase, migrate, type SqliteDatabase } from './db'
 import { semanticFingerprint } from './dedup'
 
-/**
- * 打开数据库并应用迁移，返回满足 StorageService 契约的实例。
- * location 支持 `:memory:` 与目录路径（文件模式落在目录下 token-monitor.db）。
- */
 export function openStorage(location: ':memory:' | string): StorageService {
   const db = createDatabase(location)
   migrate(db)
   return new SqliteStorage(db)
 }
 
-/** 微美元：费用以字符串存储避免浮点误差，聚合时统一转成整数微美元累加 */
 const MICRO_PER_USD = 1_000_000
 
 function toMicroUsd(costUsd?: string | null): number {
@@ -34,7 +30,6 @@ function fromMicroUsd(micro: number): string {
   return (micro / MICRO_PER_USD).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0'
 }
 
-/** epoch ms → YYYY-MM-DD（本地时区，日聚合按本地日归桶） */
 function toDateKey(ms: number): string {
   const d = new Date(ms)
   const y = d.getFullYear()
@@ -43,7 +38,6 @@ function toDateKey(ms: number): string {
   return `${y}-${m}-${day}`
 }
 
-/** 单个 (date, app_type, model) 桶的累计器 */
 interface RollupBucket {
   date: string
   appType: string
@@ -60,8 +54,28 @@ interface RollupBucket {
   updatedAt: number
 }
 
-/** UsageRecord(dto) → usage_records 行 */
+interface HourlyRollupBucket {
+  date: string
+  hour: number
+  appType: string
+  model: string
+  requestCount: number
+  successCount: number
+  errorCount: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  costMicroUsd: number
+  latencyMsTotal: number
+  updatedAt: number
+}
+
 function toUsageRecordRow(r: UsageRecord, dataSource: string, id: string): UsageRecordRow {
+  const truncatedMessage =
+    r.errorMessage != null && r.errorMessage.length > ERROR_MESSAGE_MAX_LENGTH
+      ? r.errorMessage.slice(0, ERROR_MESSAGE_MAX_LENGTH)
+      : (r.errorMessage ?? null)
   return {
     id,
     data_source: dataSource,
@@ -79,22 +93,22 @@ function toUsageRecordRow(r: UsageRecord, dataSource: string, id: string): Usage
     project: r.project ?? null,
     session_id: r.sessionId ?? null,
     status: r.status ?? 'success',
+    http_status: r.httpStatus ?? null,
+    error_message: truncatedMessage,
     file_path: r.source.filePath,
     line: r.source.line,
     created_at: r.createdAt
   }
 }
 
-/**
- * StorageService 的 better-sqlite3 实现（仅主进程，同步 API 内部实现 + Promise 签名）。
- * 方法签名与 shared/context.ts 的 StorageService 契约一致。
- */
 export class SqliteStorage implements StorageService {
   private readonly insertRecordStmt: Database.Statement
   private readonly getDedupStmt: Database.Statement
   private readonly insertDedupStmt: Database.Statement
   private readonly getRollupStmt: Database.Statement
   private readonly upsertRollupStmt: Database.Statement
+  private readonly getHourlyRollupStmt: Database.Statement
+  private readonly upsertHourlyRollupStmt: Database.Statement
   private readonly getCursorStmt: Database.Statement
   private readonly getCursorRowStmt: Database.Statement
   private readonly upsertCursorStmt: Database.Statement
@@ -108,12 +122,12 @@ export class SqliteStorage implements StorageService {
         id, data_source, app_type, model, raw_model,
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
         input_semantics, cost_usd, currency, latency_ms, project, session_id,
-        status, file_path, line, created_at
+        status, http_status, error_message, file_path, line, created_at
       ) VALUES (
         @id, @data_source, @app_type, @model, @raw_model,
         @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens,
         @input_semantics, @cost_usd, @currency, @latency_ms, @project, @session_id,
-        @status, @file_path, @line, @created_at
+        @status, @http_status, @error_message, @file_path, @line, @created_at
       )
     `)
 
@@ -154,6 +168,25 @@ export class SqliteStorage implements StorageService {
         updated_at            = excluded.updated_at
     `)
 
+    this.getHourlyRollupStmt = db.prepare(
+      `SELECT request_count, success_count, error_count, input_tokens, output_tokens,
+              cache_read_tokens, cache_creation_tokens, cost_usd, latency_ms_total
+       FROM usage_hourly_rollups
+       WHERE date = ? AND hour = ? AND app_type = ? AND model = ?`
+    )
+    this.upsertHourlyRollupStmt = db.prepare(
+      `INSERT INTO usage_hourly_rollups
+         (date, hour, app_type, model, request_count, success_count, error_count,
+          input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, latency_ms_total, updated_at)
+       VALUES (@date, @hour, @app_type, @model, @request_count, @success_count, @error_count,
+          @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens, @cost_usd, @latency_ms_total, @updated_at)
+       ON CONFLICT(date, hour, app_type, model) DO UPDATE SET
+         request_count = @request_count, success_count = @success_count, error_count = @error_count,
+         input_tokens = @input_tokens, output_tokens = @output_tokens,
+         cache_read_tokens = @cache_read_tokens, cache_creation_tokens = @cache_creation_tokens,
+         cost_usd = @cost_usd, latency_ms_total = @latency_ms_total, updated_at = @updated_at`
+    )
+
     this.getCursorStmt = db.prepare(`
       SELECT line_offset FROM sync_cursors WHERE file_path = ?
     `)
@@ -163,12 +196,17 @@ export class SqliteStorage implements StorageService {
     `)
 
     this.upsertCursorStmt = db.prepare(`
-      INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, updated_at)
-      VALUES (@file_path, @data_source, @line_offset, @file_mtime, @updated_at)
+      INSERT INTO sync_cursors (file_path, data_source, line_offset, file_mtime, byte_offset, updated_at)
+      VALUES (@file_path, @data_source, @line_offset, @file_mtime, @byte_offset, @updated_at)
       ON CONFLICT(file_path) DO UPDATE SET
         data_source = excluded.data_source,
-        line_offset = excluded.line_offset,
+        line_offset = CASE WHEN @reset_cursor THEN 0 ELSE excluded.line_offset END,
         file_mtime  = excluded.file_mtime,
+        byte_offset = CASE
+          WHEN @reset_cursor THEN NULL
+          WHEN @keep_byte_offset THEN sync_cursors.byte_offset
+          ELSE excluded.byte_offset
+        END,
         updated_at  = excluded.updated_at
     `)
 
@@ -205,27 +243,26 @@ export class SqliteStorage implements StorageService {
   recordUsage(records: UsageRecord[]): Promise<number> {
     const runTx = this.db.transaction((items: UsageRecord[]): number => {
       const buckets = new Map<string, RollupBucket>()
+      const hourlyBuckets = new Map<string, HourlyRollupBucket>()
       const now = Date.now()
       let added = 0
 
       for (const r of items) {
-        // 首版无 provider 维度，data_source 与插件 id（app_type）一致
         const dataSource = r.appType
-        // 主键/去重 key = data_source + file_path + line（':' 分隔避免拼接歧义）
         const id = `${dataSource}:${r.source.filePath}:${r.source.line}`
-        // 语义去重：同 requestId 已入账即跳过（fork/rewrite 场景，明细行号不同但为同一逻辑请求）
         const reqId = r.source.requestId
         if (reqId != null && this.getDedupStmt.get(dataSource, reqId) != null) {
           continue
         }
         const info = this.insertRecordStmt.run(toUsageRecordRow(r, dataSource, id))
-        if (info.changes === 0) continue // 去重命中，跳过（不累计 rollup）
+        if (info.changes === 0) continue
         if (reqId != null) {
           this.insertDedupStmt.run(dataSource, reqId, semanticFingerprint(r), now)
         }
 
         added++
         const date = toDateKey(r.createdAt)
+        const hour = new Date(r.createdAt).getHours()
         const key = `${r.appType}\u0000${date}\u0000${r.model}`
         let b = buckets.get(key)
         if (!b) {
@@ -255,6 +292,27 @@ export class SqliteStorage implements StorageService {
         b.cacheCreationTokens += r.cacheCreationTokens
         b.costMicroUsd += toMicroUsd(r.costUsd)
         b.latencyMsTotal += r.latencyMs ?? 0
+
+        const hKey = `${r.appType}\u0000${date}\u0000${hour}\u0000${r.model}`
+        let hb = hourlyBuckets.get(hKey)
+        if (!hb) {
+          hb = {
+            date, hour, appType: r.appType, model: r.model,
+            requestCount: 0, successCount: 0, errorCount: 0,
+            inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+            cacheCreationTokens: 0, costMicroUsd: 0, latencyMsTotal: 0, updatedAt: now
+          }
+          hourlyBuckets.set(hKey, hb)
+        }
+        hb.requestCount++
+        if (r.status === 'error') hb.errorCount++
+        else hb.successCount++
+        hb.inputTokens += r.inputTokens
+        hb.outputTokens += r.outputTokens
+        hb.cacheReadTokens += r.cacheReadTokens
+        hb.cacheCreationTokens += r.cacheCreationTokens
+        hb.costMicroUsd += toMicroUsd(r.costUsd)
+        hb.latencyMsTotal += r.latencyMs ?? 0
       }
 
       for (const b of buckets.values()) {
@@ -289,6 +347,36 @@ export class SqliteStorage implements StorageService {
         })
       }
 
+      for (const hb of hourlyBuckets.values()) {
+        const existing = this.getHourlyRollupStmt.get(hb.date, hb.hour, hb.appType, hb.model) as
+          | Pick<
+              UsageDailyRollupRow,
+              | 'cost_usd'
+              | 'request_count'
+              | 'success_count'
+              | 'error_count'
+              | 'input_tokens'
+              | 'output_tokens'
+              | 'cache_read_tokens'
+              | 'cache_creation_tokens'
+              | 'latency_ms_total'
+            >
+          | undefined
+        this.upsertHourlyRollupStmt.run({
+          date: hb.date, hour: hb.hour, app_type: hb.appType, model: hb.model,
+          request_count: hb.requestCount + (existing?.request_count ?? 0),
+          success_count: hb.successCount + (existing?.success_count ?? 0),
+          error_count: hb.errorCount + (existing?.error_count ?? 0),
+          input_tokens: hb.inputTokens + (existing?.input_tokens ?? 0),
+          output_tokens: hb.outputTokens + (existing?.output_tokens ?? 0),
+          cache_read_tokens: hb.cacheReadTokens + (existing?.cache_read_tokens ?? 0),
+          cache_creation_tokens: hb.cacheCreationTokens + (existing?.cache_creation_tokens ?? 0),
+          cost_usd: fromMicroUsd(hb.costMicroUsd + toMicroUsd(existing?.cost_usd)),
+          latency_ms_total: hb.latencyMsTotal + (existing?.latency_ms_total ?? 0),
+          updated_at: hb.updatedAt
+        })
+      }
+
       return added
     })
 
@@ -300,26 +388,37 @@ export class SqliteStorage implements StorageService {
     return Promise.resolve(row ? row.line_offset : null)
   }
 
-  getCursorMeta(filePath: string): Promise<{ lineOffset: number; fileMtime: number } | null> {
+  getCursorMeta(
+    filePath: string
+  ): Promise<{ lineOffset: number; fileMtime: number; byteOffset?: number | null } | null> {
     const row = this.getCursorRowStmt.get(filePath) as SyncCursorRow | undefined
-    return Promise.resolve(row ? { lineOffset: row.line_offset, fileMtime: row.file_mtime } : null)
+    return Promise.resolve(
+      row
+        ? { lineOffset: row.line_offset, fileMtime: row.file_mtime, byteOffset: row.byte_offset ?? null }
+        : null
+    )
   }
 
-  setCursor(filePath: string, line: number, fileMtime?: number): Promise<void> {
-    const runTx = this.db.transaction((fp: string, ln: number, mtime?: number) => {
-      const existing = this.getCursorRowStmt.get(fp) as SyncCursorRow | undefined
-      // 文件被 truncate/替换（mtime 变化）：游标重置到 0，下一轮从头部全量重读
-      const offset = existing && mtime != null && existing.file_mtime !== mtime ? 0 : ln
-      const finalMtime = mtime ?? existing?.file_mtime ?? 0
-      this.upsertCursorStmt.run({
-        file_path: fp,
-        data_source: existing?.data_source ?? '',
-        line_offset: offset,
-        file_mtime: finalMtime,
-        updated_at: Date.now()
-      })
-    })
-    runTx(filePath, line, fileMtime)
+  setCursor(filePath: string, line: number, fileMtime?: number, byteOffset?: number | null): Promise<void> {
+    const runTx = this.db.transaction(
+      (fp: string, ln: number, mtime?: number, byte?: number | null) => {
+        const existing = this.getCursorRowStmt.get(fp) as SyncCursorRow | undefined
+        const reset =
+          existing != null && mtime != null && existing.file_mtime !== 0 && existing.file_mtime !== mtime
+        const finalMtime = mtime ?? existing?.file_mtime ?? 0
+        this.upsertCursorStmt.run({
+          file_path: fp,
+          data_source: existing?.data_source ?? '',
+          line_offset: ln,
+          file_mtime: finalMtime,
+          byte_offset: byte ?? null,
+          keep_byte_offset: byte === undefined ? 1 : 0,
+          reset_cursor: reset ? 1 : 0,
+          updated_at: Date.now()
+        })
+      }
+    )
+    runTx(filePath, line, fileMtime, byteOffset)
     return Promise.resolve()
   }
 
@@ -328,15 +427,6 @@ export class SqliteStorage implements StorageService {
     return Promise.resolve(rows)
   }
 
-  /**
-   * 分级 upsert 定价（docs/concepts/pricing.md）：
-   * - source 缺省为 'user'（旧调用向后兼容；手动 IPC 编辑即走此默认值）；
-   * - 新行直接以传入 source 插入；
-   * - 冲突时仅当「现行为非 user 或本次写入为 user」才更新：
-   *   user 行挡住 seed/sync 写入（含 updated_at 在内全不动），user 写入覆盖一切并把行升级为 'user'。
-   * 来源只取调用点显式传入的 source（不信任 entry 载荷携带的 source 字段），
-   * 避免渲染进程回传数据时伪造/遗漏来源导致分级失效。
-   */
   updateModelPricing(entry: ModelPricingRow, source?: PricingSource): Promise<void> {
     const resolvedSource = source ?? 'user'
     this.upsertPricingStmt.run({
@@ -354,11 +444,6 @@ export class SqliteStorage implements StorageService {
     return Promise.resolve()
   }
 
-  /**
-   * 单事务批量 upsert 定价：分级保护 WHERE（user 行不被非 user 写入覆盖）
-   * 复用与单条 upsert 相同的预编译语句，天然生效；
-   * 全部条目在一个事务内提交，仅一次 fsync。空数组不开事务直接返回 0。
-   */
   updateModelPricingBatch(entries: ModelPricingRow[], source: PricingSource): Promise<number> {
     if (entries.length === 0) return Promise.resolve(0)
     const runTx = this.db.transaction((items: ModelPricingRow[], src: PricingSource): number => {
@@ -388,7 +473,6 @@ export class SqliteStorage implements StorageService {
     return Promise.resolve()
   }
 
-  /** 关闭数据库连接（宿主退出时调用；不在 StorageService 契约内） */
   close(): void {
     this.db.close()
   }

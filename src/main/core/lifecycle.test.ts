@@ -10,7 +10,6 @@ interface MockPlugin extends MonitorPlugin {
   dispose?: ReturnType<typeof vi.fn>
 }
 
-/** 构造 Mock 插件；withHooks=true 时附带可断言的 onMount/dispose 钩子 */
 const makePlugin = (
   id: MonitorPlugin['id'],
   deps?: MonitorPlugin['deps'],

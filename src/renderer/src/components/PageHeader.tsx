@@ -6,7 +6,6 @@ export interface PageHeaderProps {
   action?: ReactNode
 }
 
-/** 页面标题栏（标题 + 说明 + 右侧操作区） */
 export function PageHeader({ title, description, action }: PageHeaderProps): ReactElement {
   return (
     <div className="mb-6 flex flex-wrap items-start justify-between gap-3">

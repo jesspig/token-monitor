@@ -8,20 +8,12 @@ import type {
 import type { LifecyclePlugin } from '../core/lifecycle'
 import type { Host } from '../host'
 
-/**
- * IPC handler 注册（docs/concepts/architecture.md → ipc/）。
- * 实现 shared/ipc.ts 的 RendererApi 全部 17 个方法，参数用 shared 类型；
- * 内部委托 host 的服务（usageQuery / storage / pricing / collector / settings / budget）。
- * 事件推送（usage-updated）经 EventBus 订阅，防抖已由 EventBus 处理。
- */
 
-/** ipcMain 的最小抽象（测试可注入 fake 实现） */
 type IpcHandler = (...args: any[]) => unknown
 export interface IpcMainLike {
   handle(channel: string, listener: IpcHandler): void
 }
 
-/** 各 IPC 通道名（preload 侧以相同字符串 invoke） */
 export const IPC_CHANNELS = {
   ping: 'app:ping',
   usageSummary: 'usage:summary',
@@ -31,6 +23,9 @@ export const IPC_CHANNELS = {
   requestLogDetail: 'usage:request-log-detail',
   statsByModel: 'usage:stats-by-model',
   statsByApp: 'usage:stats-by-app',
+  statsByProject: 'usage:stats-by-project',
+  statsBySession: 'usage:stats-by-session',
+  statsByStatus: 'usage:stats-by-status',
   filterOptions: 'usage:filter-options',
   pricingList: 'pricing:list',
   pricingModelsdevSync: 'pricing:modelsdev-sync',
@@ -39,6 +34,7 @@ export const IPC_CHANNELS = {
   settingsGet: 'settings:get',
   settingsUpdate: 'settings:update',
   budgetStatus: 'budget:status',
+  dailyModelBreakdown: 'usage:daily-model-breakdown',
   usageUpdated: 'usage-updated'
 } as const
 
@@ -47,12 +43,14 @@ export function registerIpcHandlers(
   host: Host,
   getMainWindow: () => BrowserWindow | null
 ): void {
-  const on = (channel: string, fn: IpcHandler): void => ipcMain.handle(channel, fn)
+  const on = (channel: string, fn: IpcHandler): void =>
+    ipcMain.handle(channel, async (...args: any[]) => {
+      await host.ready
+      return fn(...args)
+    })
 
-  // 1. 连通性检查（示例 IPC，返回 'pong'）
   on(IPC_CHANNELS.ping, () => 'pong')
 
-  // 2-8. 用量查询（只读，委托 usageQuery）
   on(IPC_CHANNELS.usageSummary, (_e: unknown, filters: LogFilters) =>
     host.usageQuery.getUsageSummary(filters)
   )
@@ -74,14 +72,24 @@ export function registerIpcHandlers(
   on(IPC_CHANNELS.statsByApp, (_e: unknown, filters: LogFilters) =>
     host.usageQuery.getAppStats(filters)
   )
+  on(IPC_CHANNELS.statsByProject, (_e: unknown, filters: LogFilters) =>
+    host.usageQuery.getStatsByProject(filters)
+  )
+  on(IPC_CHANNELS.statsBySession, (_e: unknown, filters: LogFilters) =>
+    host.usageQuery.getStatsBySession(filters)
+  )
+  on(IPC_CHANNELS.statsByStatus, (_e: unknown, filters: LogFilters) =>
+    host.usageQuery.getStatsByStatus(filters)
+  )
   on(IPC_CHANNELS.filterOptions, () => host.usageQuery.getFilterOptions())
 
-  // 9-10. 定价（只读列表 + models.dev 手动全量同步；写入路径已下线，
-  // 定价数据以无条件自动同步为准）
+  on(IPC_CHANNELS.dailyModelBreakdown, (_e: unknown, filters: LogFilters) =>
+    host.usageQuery.getDailyModelBreakdown(filters)
+  )
+
   on(IPC_CHANNELS.pricingList, () => host.storage.getModelPricing())
   on(IPC_CHANNELS.pricingModelsdevSync, () => host.syncModelsDevPricing())
 
-  // 11-12. 监控插件状态与启停（启用=装载，停用=卸载，可逆）
   on(IPC_CHANNELS.pluginsList, () => host.collector.getPluginStatus())
   on(IPC_CHANNELS.pluginsSetEnabled, async (_e: unknown, id: AppType, enabled: boolean) => {
     const plugin = host.registry.get(id)
@@ -97,18 +105,16 @@ export function registerIpcHandlers(
         host.lifecycle.unmount(host.ctx, plugin as LifecyclePlugin)
       }
     }
+    host.collector.invalidateStatusCache()
   })
 
-  // 13-14. 设置读取与更新（部分字段）
   on(IPC_CHANNELS.settingsGet, () => host.getSettings())
   on(IPC_CHANNELS.settingsUpdate, (_e: unknown, patch: Partial<AppSettings>) =>
     host.updateSettings(patch)
   )
 
-  // 15. 预算限额状态（全局日/月费用与上限占比；只读，失败向上抛转 rejection）
   on(IPC_CHANNELS.budgetStatus, () => host.getBudgetStatus())
 
-  // 16. usage-updated 事件推送（200ms 防抖由 EventBus 处理）
   host.events.on('usage-updated', (e: UsageUpdatedEvent) => {
     getMainWindow()?.webContents.send(IPC_CHANNELS.usageUpdated, e)
   })

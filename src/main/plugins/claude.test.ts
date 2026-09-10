@@ -6,13 +6,11 @@ import { claudePlugin, detectFromRoot, foldById, listFilesFromRoot } from './cla
 import type { PluginContext } from '../../../shared/context'
 import type { UsageRecord } from '../../../shared/dto'
 
-/** parseFile 不使用 ctx 上的服务，测试时给个空壳即可 */
 const ctx = {} as PluginContext
 
 const USER_TS = '2026-08-19T10:00:00+08:00'
 const ASST_TS = '2026-08-19T10:00:05+08:00'
 
-/** user 行样例 */
 const userLine = (): string =>
   JSON.stringify({
     type: 'user',
@@ -25,7 +23,6 @@ const userLine = (): string =>
     message: { role: 'user', content: 'hello' }
   })
 
-/** assistant 行样例（含 message.usage，字段可覆盖；id 为 message.id 语义请求 ID） */
 const assistantLine = (o: {
   uuid?: string
   id?: string
@@ -97,9 +94,9 @@ describe('detect', () => {
 describe('parseFile 增量解析', () => {
   it('从 0 解析：跳过 user/损坏行，尾部半行不阻塞，游标停在最后成功解析行', async () => {
     const file = path.join(tmpDir, 'main.jsonl')
-    const brokenMid = '{this is broken json' // 中间损坏行
+    const brokenMid = '{this is broken json'
     const trailingHalf =
-      '{"type":"assistant","uuid":"a-2","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input_tokens":' // 尾部半行（未写完）
+      '{"type":"assistant","uuid":"a-2","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input_tokens":'
     fs.writeFileSync(file, [userLine(), assistantLine(), brokenMid, trailingHalf].join('\n'), 'utf8')
 
     const res = await claudePlugin.parseFile(ctx, file, 0)
@@ -124,7 +121,6 @@ describe('parseFile 增量解析', () => {
     expect(r.createdAt).toBe(Date.parse(ASST_TS))
     expect(r.source).toEqual({ filePath: file, line: 2 })
 
-    // 尾部半行补全后，从 nextLine 续读只产出新增（line 4），不重放 line 2
     fs.writeFileSync(
       file,
       [
@@ -156,12 +152,10 @@ describe('parseFile 增量解析', () => {
     expect(res.nextLine).toBe(4)
     expect(res.eof).toBe(true)
 
-    // 未追加内容时续读：无新增
     const res2 = await claudePlugin.parseFile(ctx, file, res.nextLine)
     expect(res2.records).toHaveLength(0)
     expect(res2.eof).toBe(true)
 
-    // 追加一行后再续读：只产出该新增行
     fs.appendFileSync(file, `\n${assistantLine({ uuid: 'a-3', timestamp: '2026-08-19T10:00:15+08:00' })}`, 'utf8')
     const res3 = await claudePlugin.parseFile(ctx, file, res.nextLine)
     expect(res3.records).toHaveLength(1)
@@ -235,12 +229,11 @@ describe('parseFile 增量解析', () => {
 
   it('message.id 写入 source.requestId；缺失/非字符串时不设置（退回旧去重）', async () => {
     const file = path.join(tmpDir, 'main.jsonl')
-    // 带 id：fork 场景同一消息出现在不同文件也能语义判重
     fs.writeFileSync(
       file,
       [
         assistantLine({ uuid: 'a-1', id: 'msg_01ABC' }),
-        assistantLine({ uuid: 'a-2', timestamp: '2026-08-19T10:00:10+08:00' }), // 无 id
+        assistantLine({ uuid: 'a-2', timestamp: '2026-08-19T10:00:10+08:00' }),
         JSON.stringify({
           type: 'assistant',
           uuid: 'a-3',
@@ -248,7 +241,7 @@ describe('parseFile 增量解析', () => {
           sessionId: 'sess-1',
           cwd: '/Users/a/b',
           message: { role: 'assistant', id: 42, model: 'claude-sonnet-4-5', usage: { input_tokens: 1, output_tokens: 1 } }
-        }) // 非字符串 id
+        })
       ].join('\n'),
       'utf8'
     )
@@ -261,8 +254,255 @@ describe('parseFile 增量解析', () => {
   })
 })
 
+describe('失败请求可观测（isApiErrorMessage === true）', () => {
+  const errorLine = (o: {
+    uuid?: string
+    id?: string
+    timestamp?: string
+    apiErrorStatus?: number
+    contentText?: string
+    messageContentText?: string
+    messageContentAsString?: string
+    model?: string
+    isApiErrorMessage?: boolean | string
+    extraTopContent?: unknown
+  } = {}): string => {
+    const isErr = o.isApiErrorMessage ?? true
+    const topContent =
+      o.extraTopContent !== undefined
+        ? o.extraTopContent
+        : o.contentText !== undefined
+          ? [{ type: 'text', text: o.contentText }]
+          : undefined
+    return JSON.stringify({
+      type: 'assistant',
+      uuid: o.uuid ?? 'err-uuid-1',
+      timestamp: o.timestamp ?? '2026-08-19T10:00:20+08:00',
+      sessionId: 'sess-1',
+      cwd: '/Users/a/b',
+      isApiErrorMessage: isErr,
+      ...(o.apiErrorStatus !== undefined ? { apiErrorStatus: o.apiErrorStatus } : {}),
+      ...(topContent !== undefined ? { content: topContent } : {}),
+      message: {
+        role: 'assistant',
+        ...(o.id ? { id: o.id } : {}),
+        ...(o.model ? { model: o.model } : {}),
+        ...(o.messageContentText !== undefined
+          ? { content: [{ type: 'text', text: o.messageContentText }] }
+          : o.messageContentAsString !== undefined
+            ? { content: o.messageContentAsString }
+            : o.contentText === undefined && o.messageContentText === undefined && o.messageContentAsString === undefined
+              ? { content: [{ type: 'text', text: 'API Error: 429 rate limited' }] }
+              : {}),
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+      }
+    })
+  }
+
+  it('isApiErrorMessage===true 产出 error 记录：status/error、httpStatus、tokens 0、model <synthetic>、截断前 500', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(
+      file,
+      errorLine({ uuid: 'u-err-1', id: 'msg_err_1', apiErrorStatus: 429, contentText: 'API Error: 429 Too Many Requests', model: 'claude-sonnet-4-5' }),
+      'utf8'
+    )
+    const res = await claudePlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    const r = res.records[0]
+    expect(r).toMatchObject({
+      appType: 'claude',
+      model: 'claude-sonnet-4-5',
+      rawModel: 'claude-sonnet-4-5',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      inputSemantics: 2,
+      status: 'error',
+      httpStatus: 429,
+      errorMessage: 'API Error: 429 Too Many Requests'
+    })
+    expect(r.source).toEqual({ filePath: file, line: 1, requestId: 'msg_err_1' })
+    expect(r.createdAt).toBe(Date.parse('2026-08-19T10:00:20+08:00'))
+    expect(r.project).toBe('/Users/a/b')
+    expect(r.sessionId).toBe('sess-1')
+  })
+
+  it('model 缺失时兜底 <synthetic>；无 message.model 且无 msg 时亦为 <synthetic>', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    const lineNoModel = JSON.stringify({
+      type: 'assistant',
+      uuid: 'u-err-2',
+      timestamp: '2026-08-19T10:00:21+08:00',
+      sessionId: 'sess-1',
+      cwd: '/Users/a/b',
+      isApiErrorMessage: true,
+      apiErrorStatus: 500,
+      content: [{ type: 'text', text: 'internal error' }],
+      message: { role: 'assistant', id: 'msg_err_2', content: [{ type: 'text', text: 'internal error' }] }
+    })
+    fs.writeFileSync(file, lineNoModel, 'utf8')
+    const res = await claudePlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].model).toBe('<synthetic>')
+    expect(res.records[0].rawModel).toBe('<synthetic>')
+    expect(res.records[0].httpStatus).toBe(500)
+  })
+
+  it('errorMessage 优先取顶层 content[0].text，其次 message.content；超 500 截断', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(
+      file,
+      [
+        errorLine({ uuid: 'u-1', id: 'msg_a', apiErrorStatus: 400, contentText: 'top level error', messageContentText: 'message level error' }),
+        errorLine({ uuid: 'u-2', id: 'msg_b', apiErrorStatus: 400, contentText: undefined, messageContentText: 'from message', extraTopContent: [] } as any),
+        JSON.stringify({
+          type: 'assistant',
+          uuid: 'u-3',
+          timestamp: '2026-08-19T10:00:22+08:00',
+          sessionId: 'sess-1',
+          cwd: '/Users/a/b',
+          isApiErrorMessage: true,
+          apiErrorStatus: 502,
+          message: { role: 'assistant', id: 'msg_c', model: 'claude-sonnet-4-5', content: 'string content error' }
+        }),
+        errorLine({ uuid: 'u-4', id: 'msg_d', apiErrorStatus: 529, contentText: 'x'.repeat(800) })
+      ].join('\n'),
+      'utf8'
+    )
+    const res = await claudePlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(4)
+    expect(res.records[0].errorMessage).toBe('top level error')
+    expect(res.records[1].errorMessage).toBe('from message')
+    expect(res.records[2].errorMessage).toBe('string content error')
+    expect(res.records[3].errorMessage?.length).toBe(500)
+    expect(res.records[3].errorMessage).toBe('x'.repeat(500))
+  })
+
+  it('requestId 取 message.id 优先，缺失时回落 uuid；apiErrorStatus 非有限数字时不写入 httpStatus', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    const lineWithUuidOnly = JSON.stringify({
+      type: 'assistant',
+      uuid: 'fallback-uuid-99',
+      timestamp: '2026-08-19T10:00:23+08:00',
+      sessionId: 'sess-1',
+      cwd: '/Users/a/b',
+      isApiErrorMessage: true,
+      apiErrorStatus: 'not-a-number' as unknown as number,
+      content: [{ type: 'text', text: 'bad status type' }],
+      message: { role: 'assistant', content: [{ type: 'text', text: 'bad status type' }] }
+    })
+    const lineWithId = errorLine({ uuid: 'u-5', id: 'msg_has_id', apiErrorStatus: 401, contentText: 'unauthorized' })
+    const lineNoId = JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-08-19T10:00:24+08:00',
+      sessionId: 'sess-1',
+      cwd: '/Users/a/b',
+      isApiErrorMessage: true,
+      apiErrorStatus: 403,
+      content: [{ type: 'text', text: 'forbidden' }],
+      message: { role: 'assistant', content: [{ type: 'text', text: 'forbidden' }] }
+    })
+    fs.writeFileSync(file, [lineWithUuidOnly, lineWithId, lineNoId].join('\n'), 'utf8')
+    const res = await claudePlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(3)
+    expect(res.records[0].source.requestId).toBe('fallback-uuid-99')
+    expect(res.records[0].httpStatus).toBeUndefined()
+    expect(res.records[1].source.requestId).toBe('msg_has_id')
+    expect(res.records[1].httpStatus).toBe(401)
+    expect(res.records[2].source.requestId).toBeUndefined()
+    expect('requestId' in res.records[2].source).toBe(false)
+  })
+
+  it('isApiErrorMessage !== true（false/字符串/缺失）不按失败产出，仍走 success/跳过逻辑', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    const falseLine = JSON.stringify({
+      type: 'assistant',
+      uuid: 'u-false',
+      timestamp: '2026-08-19T10:00:25+08:00',
+      sessionId: 'sess-1',
+      cwd: '/Users/a/b',
+      isApiErrorMessage: false,
+      apiErrorStatus: 429,
+      content: [{ type: 'text', text: 'should not be error' }],
+      message: { role: 'assistant', model: 'claude-sonnet-4-5', usage: { input_tokens: 1, output_tokens: 1 } }
+    })
+    const stringLine = JSON.stringify({
+      type: 'assistant',
+      uuid: 'u-str',
+      timestamp: '2026-08-19T10:00:26+08:00',
+      sessionId: 'sess-1',
+      cwd: '/Users/a/b',
+      isApiErrorMessage: 'true' as unknown as boolean,
+      apiErrorStatus: 429,
+      content: [{ type: 'text', text: 'string true not error' }],
+      message: { role: 'assistant', model: 'claude-sonnet-4-5', usage: { input_tokens: 2, output_tokens: 2 } }
+    })
+    fs.writeFileSync(file, [falseLine, stringLine].join('\n'), 'utf8')
+    const res = await claudePlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(2)
+    expect(res.records[0].status).toBe('success')
+    expect(res.records[1].status).toBe('success')
+    expect(res.records[0].httpStatus).toBeUndefined()
+    expect(res.records[1].httpStatus).toBeUndefined()
+  })
+
+  it('与 success 记录共存于同一文件，互不冲突且计数正确', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(file, [assistantLine({ uuid: 'a-1', id: 'msg_succ', output: 10 }), errorLine({ uuid: 'u-err', id: 'msg_err', apiErrorStatus: 429, contentText: 'rate limited' })].join('\n'), 'utf8')
+    const res = await claudePlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(2)
+    const succ = res.records.find((r) => r.status === 'success')!
+    const err = res.records.find((r) => r.status === 'error')!
+    expect(succ.outputTokens).toBe(10)
+    expect(err.httpStatus).toBe(429)
+    expect(err.errorMessage).toBe('rate limited')
+  })
+
+  it('error 记录不被折叠逻辑吞并：同 message.id 的 error 与 success 并存，success 仍按 output 最大折叠', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(
+      file,
+      [
+        assistantLine({ uuid: 'a-1', id: 'shared_id', timestamp: '2026-08-19T10:00:01+08:00', output: 10 }),
+        assistantLine({ uuid: 'a-2', id: 'shared_id', timestamp: '2026-08-19T10:00:02+08:00', output: 50 }),
+        errorLine({ uuid: 'u-err-shared', id: 'shared_id', timestamp: '2026-08-19T10:00:03+08:00', apiErrorStatus: 500, contentText: 'shared id error' })
+      ].join('\n'),
+      'utf8'
+    )
+    const res = await claudePlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(2)
+    const succ = res.records.find((r) => r.status === 'success')!
+    const err = res.records.find((r) => r.status === 'error')!
+    expect(succ.outputTokens).toBe(50)
+    expect(succ.source.requestId).toBe('shared_id')
+    expect(err.source.requestId).toBe('shared_id')
+    expect(err.httpStatus).toBe(500)
+  })
+
+  it('foldById 对 error 记录不折叠：同 requestId 的多条 error 均保留', () => {
+    const errRec = (line: number, rid: string): UsageRecord => ({
+      appType: 'claude',
+      model: '<synthetic>',
+      rawModel: '<synthetic>',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      inputSemantics: 2,
+      status: 'error',
+      httpStatus: 429,
+      errorMessage: 'err',
+      createdAt: line * 1000,
+      source: { filePath: 'f.jsonl', line, requestId: rid }
+    })
+    const folded = foldById([errRec(1, 'msg_E'), errRec(2, 'msg_E')])
+    expect(folded).toHaveLength(2)
+    expect(folded.map((r) => r.source.line)).toEqual([1, 2])
+  })
+})
+
 describe('流式分片按 message.id 折叠', () => {
-  /** foldById 单测用的最小记录构造器（line 兼作 createdAt，便于断言最终行） */
   const foldRecord = (o: { requestId?: string; output: number; line: number }): UsageRecord => ({
     appType: 'claude',
     model: 'claude-sonnet-4-5',
@@ -361,7 +601,6 @@ describe('listFilesFromRoot 收集范围', () => {
     fs.writeFileSync(path.join(sub, 'sub-1.jsonl'), userLine())
     fs.writeFileSync(path.join(sub, 'sub-2.jsonl'), userLine())
     fs.writeFileSync(path.join(wf, 'deep-1.jsonl'), userLine())
-    // 项目目录外的散落 jsonl 不收集
     fs.writeFileSync(path.join(root, 'loose.jsonl'), userLine())
 
     const entries = listFilesFromRoot(root)

@@ -2,25 +2,23 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 
-/** 文件模式下数据库文件名（落在传入目录内） */
 export const DB_FILENAME = 'token-monitor.db'
 
-/** better-sqlite3 实例类型（类型再导出，供调用方标注） */
 export type SqliteDatabase = Database.Database
 
-/**
- * 建库工厂：支持 `:memory:`（内存库）与目录路径两种模式。
- * 目录模式在指定目录下创建 `token-monitor.db`（目录不存在时自动创建）。
- */
 export function createDatabase(location: ':memory:' | string): SqliteDatabase {
   if (location === ':memory:') {
     return new Database(':memory:')
   }
   mkdirSync(location, { recursive: true })
-  return new Database(join(location, DB_FILENAME))
+  const db = new Database(join(location, DB_FILENAME))
+  if (location !== ':memory:') {
+    db.pragma('journal_mode = WAL')
+    db.pragma('busy_timeout = 5000')
+  }
+  return db
 }
 
-/** 单条迁移：version 单调递增，up 由调用方以事务包裹执行 */
 interface Migration {
   version: number
   up: (db: SqliteDatabase) => void
@@ -49,19 +47,6 @@ function microUsdToCostString(micro: number): string {
   return (micro / MICRO_PER_USD).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0'
 }
 
-/**
- * 迁移表：v1 = 首次建表（5 张核心表 + 索引）；
- * v2 = model_pricing 增加 source 列（定价来源分级，存量行保守标 'user'，
- *      使既有用户可见数据不被后续 seed/sync 同步覆盖）；
- * v3 = 清理四项 token 全为 0 的异常明细，并按剩余明细重建受影响日期的日聚合
- *      （聚合口径与 storage.recordUsage 一致；sync_cursors 游标不动；
- *      幂等：重复执行时无全零行即无操作）；
- * v4 = 修正 opencode 存量行的语义标注（input_semantics 1→2：上游已核实其 input
- *      本为纯新输入）；codex/gemini/grok 的历史费用重算不在迁移内做——migrate()
- *      为同步函数拿不到活定价，由 pricing.recalcCachedInputCosts 在宿主启动时
- *      以当前定价重算并增量修正日聚合。
- * 字段/主键/索引与 shared/tables.ts 及 docs/concepts/data-model.md 一致。
- */
 const MIGRATIONS: Migration[] = [
   {
     version: 1,
@@ -148,9 +133,6 @@ const MIGRATIONS: Migration[] = [
   {
     version: 2,
     up(db) {
-      // 定价来源分级：'seed' 内置种子价 / 'sync' models.dev 同步价 / 'user' 用户手动价。
-      // NOT NULL DEFAULT 'user' 使 ALTER 时存量行一律标 'user'（保守策略，
-      // 用户可见数据不被未来 seed/sync 覆盖），新插入行由写入方显式指定来源。
       db.exec(`ALTER TABLE model_pricing ADD COLUMN source TEXT NOT NULL DEFAULT 'user'`)
     }
   },
@@ -236,10 +218,6 @@ const MIGRATIONS: Migration[] = [
   {
     version: 4,
     up(db) {
-      // opencode 源经上游核实 input 本已是纯新输入（与 claude 同为 semantics=2），
-      // 存量错标为 1 的行统一改为 2；条件收敛使重复执行无操作（幂等）。
-      // codex/gemini/grok 的历史费用重算需要活定价，由宿主启动时的
-      // pricing.recalcCachedInputCosts 完成（见 pricing.ts）。
       db.prepare(
         `UPDATE usage_records SET input_semantics = 2
          WHERE app_type = 'opencode' AND input_semantics = 1`
@@ -249,20 +227,144 @@ const MIGRATIONS: Migration[] = [
   {
     version: 5,
     up(db) {
-      // dsh 初版适配器模型来源失效（message.model 实测全量缺失）导致「零记录
-      // 但游标推满」的脏状态；三级来源修复后历史文件又被 mtime 短路挡住无法
-      // 重析。清除 dsh 会话游标让下轮同步全量重析：usage_records 无 dsh 行且
-      // dedup_ledger 空，INSERT OR IGNORE 主键幂等，重放无重复计数风险。
-      // LIKE 模式按 Windows 路径分隔符精确匹配 ~/.dsh/sessions 子树。
       db.prepare('DELETE FROM sync_cursors WHERE file_path LIKE ?').run('%\\.dsh\\sessions%')
+    }
+  },
+  {
+    version: 6,
+    up(db) {
+      const columns = db.pragma('table_info(sync_cursors)') as { name: string }[]
+      if (columns.some((c) => c.name === 'byte_offset')) return
+      db.exec('ALTER TABLE sync_cursors ADD COLUMN byte_offset INTEGER')
+    }
+  },
+  {
+    version: 7,
+    up(db) {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_usage_records_zero_cost
+          ON usage_records (cost_usd)
+          WHERE cost_usd IS NULL OR cost_usd = '0';
+        CREATE INDEX IF NOT EXISTS idx_usage_records_cached_input
+          ON usage_records (input_semantics)
+          WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok');
+      `)
+    }
+  },
+  {
+    version: 8,
+    up(db) {
+      const columns = db.pragma('table_info(usage_records)') as { name: string }[]
+      const hasHttpStatus = columns.some((c) => c.name === 'http_status')
+      const hasErrorMessage = columns.some((c) => c.name === 'error_message')
+      if (!hasHttpStatus) db.exec('ALTER TABLE usage_records ADD COLUMN http_status INTEGER')
+      if (!hasErrorMessage) db.exec('ALTER TABLE usage_records ADD COLUMN error_message TEXT')
+    }
+  },
+  {
+    version: 9,
+    up(db) {
+      db.prepare('DELETE FROM sync_cursors').run()
+    }
+  },
+  {
+    version: 10,
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS usage_hourly_rollups (
+          date                TEXT    NOT NULL,
+          hour                INTEGER NOT NULL,
+          app_type            TEXT    NOT NULL,
+          model               TEXT    NOT NULL,
+          request_count       INTEGER NOT NULL DEFAULT 0,
+          success_count       INTEGER NOT NULL DEFAULT 0,
+          error_count         INTEGER NOT NULL DEFAULT 0,
+          input_tokens        INTEGER NOT NULL DEFAULT 0,
+          output_tokens       INTEGER NOT NULL DEFAULT 0,
+          cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+          cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+          cost_usd            TEXT    NOT NULL DEFAULT '0',
+          latency_ms_total    INTEGER NOT NULL DEFAULT 0,
+          updated_at          INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (date, hour, app_type, model)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_usage_hourly_rollups_date
+          ON usage_hourly_rollups(date, app_type);
+        CREATE INDEX IF NOT EXISTS idx_usage_records_status ON usage_records(status);
+        CREATE INDEX IF NOT EXISTS idx_usage_records_project ON usage_records(project);
+        CREATE INDEX IF NOT EXISTS idx_usage_records_session_id ON usage_records(session_id);
+      `)
+
+      const rows = db.prepare(`
+        SELECT
+          strftime('%Y-%m-%d', created_at / 1000, 'unixepoch', 'localtime') AS date,
+          CAST(strftime('%H', created_at / 1000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+          app_type, model,
+          COUNT(*) AS request_count,
+          SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
+          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
+          SUM(input_tokens) AS input_tokens,
+          SUM(output_tokens) AS output_tokens,
+          SUM(cache_read_tokens) AS cache_read_tokens,
+          SUM(cache_creation_tokens) AS cache_creation_tokens,
+          SUM(CAST(ROUND(COALESCE(cost_usd, '0') * 1000000) AS INTEGER)) AS cost_micro,
+          SUM(COALESCE(latency_ms, 0)) AS latency_ms_total
+        FROM usage_records
+        GROUP BY date, hour, app_type, model
+      `).all() as Array<{
+        date: string; hour: number; app_type: string; model: string
+        request_count: number; success_count: number; error_count: number
+        input_tokens: number; output_tokens: number; cache_read_tokens: number
+        cache_creation_tokens: number; cost_micro: number | null; latency_ms_total: number | null
+      }>
+
+      const ins = db.prepare(`
+        INSERT OR REPLACE INTO usage_hourly_rollups
+          (date, hour, app_type, model, request_count, success_count, error_count,
+           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, latency_ms_total, updated_at)
+        VALUES
+          (@date, @hour, @app_type, @model, @request_count, @success_count, @error_count,
+           @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens, @cost_usd, @latency_ms_total, @updated_at)
+      `)
+
+      const tx = db.transaction(() => {
+        for (const r of rows) {
+          ins.run({
+            date: r.date, hour: r.hour, app_type: r.app_type, model: r.model,
+            request_count: r.request_count, success_count: r.success_count, error_count: r.error_count,
+            input_tokens: r.input_tokens, output_tokens: r.output_tokens,
+            cache_read_tokens: r.cache_read_tokens, cache_creation_tokens: r.cache_creation_tokens,
+            cost_usd: microUsdToCostString(r.cost_micro ?? 0),
+            latency_ms_total: r.latency_ms_total ?? 0, updated_at: 0
+          })
+        }
+      })
+      tx()
+    }
+  },
+  {
+    version: 11,
+    up(db) {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_usage_records_model_created ON usage_records(model, created_at);
+      `)
+    }
+  },
+  {
+    version: 12,
+    up(db) {
+      db.exec(`
+        -- 扩展 cached_input 部分索引：覆盖新增 semantics=1 数据源（workbuddy / codebuddy / qwen / reasonix）
+        DROP INDEX IF EXISTS idx_usage_records_cached_input;
+        CREATE INDEX IF NOT EXISTS idx_usage_records_cached_input
+          ON usage_records (input_semantics)
+          WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix');
+      `)
     }
   }
 ]
 
-/**
- * 幂等迁移：以 PRAGMA user_version 记录已应用版本，逐版本升级至最新。
- * 首次执行建表并逐个应用后续迁移；已应用过的版本自动跳过。
- */
 export function migrate(db: SqliteDatabase): void {
   const current = db.pragma('user_version', { simple: true }) as number
   for (const m of MIGRATIONS) {

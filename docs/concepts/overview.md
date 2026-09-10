@@ -1,15 +1,15 @@
 ---
 type: project-overview
 title: Token Monitor 项目总览
-description: 插件化架构的跨 CLI 用量监控桌面工具，第一阶段内置 5 个监控插件。
+description: 插件化架构的跨 CLI 用量监控桌面工具，内置 22 个监控插件（2026-09-10 第二批 14 源接入）；图表层 ECharts 6.1，查询性能已收敛、缓存口径索引 v12。
 tags: [token-monitor, overview, electron, ai-coding-cli, plugin]
-timestamp: 2026-08-22T18:15:00+08:00
+timestamp: 2026-09-10T05:57:12+08:00
 ---
 
 # 项目总览
 
 > [!note] 当前状态
-> **第一阶段已实现**（2026-08-20）：插件化监控宿主 + 5 个内置监控插件端到端落地于 `src/`。**2026-08-22 第二轮迭代**：聚合查询镜像优化、保留清理接线、实时刷新、定价表 v2 + models.dev 同步、预算告警等；**第三轮迭代**：全零 token 记录入库拦截 + v3 存量清洗迁移、models.dev 定价全自动同步（定价页/IPC 只读化收窄至 17 方法）、CLI 版本探测、渲染端轮询与固定侧边栏布局；**第四轮迭代**：时间范围扩为五档（today/24h/7d/14d/30d，today 与 24h 走小时聚合）、统计页「按模型」视图移除应用列、统计刷新与价格同步间隔改为设置可配（详见 [index](../index.md)）。当前 typecheck / 222 项单测全部通过。本页描述与实现一致。
+> **第一阶段已实现**（2026-08-20）：插件化监控宿主 + 5 个内置监控插件端到端落地于 `src/`。**2026-08-22 第二轮迭代**：聚合查询镜像优化、保留清理接线、实时刷新、定价表 v2 + models.dev 同步、预算告警等；**第三轮迭代**：全零 token 记录入库拦截 + v3 存量清洗迁移、models.dev 定价全自动同步（定价页/IPC 只读化收窄至 17 方法）、CLI 版本探测、渲染端轮询与固定侧边栏布局；**第四轮迭代**：时间范围扩为五档（today/24h/7d/14d/30d，today 与 24h 走小时聚合）、统计页「按模型」视图移除应用列、统计刷新与价格同步间隔改为设置可配（详见 [index](../index.md)）。后续迭代已扩展至 8 个内置监控插件、统计查询卸载到只读 worker 线程、系统托盘后台常驻（见 [总体架构](architecture.md) / [数据流](data-flow.md)）。**2026-08-29**：仪表盘接入趋势双图并退役独立趋势页（6 页导航，常驻渲染），`getDailyModelBreakdown` 走日预聚合快路径，`rangeToFilters` 分钟对齐与 `keepPreviousData` 全量收敛，`idx_usage_records_model_created` 索引 v11 落地。**2026-09-10**：渲染层图表库由 Recharts 整体迁移至 ECharts 6.1（按需注册，经 `useECharts` + `chart-theme` 统一承载），新增 QueryState 四态边界 / Toast / Toggle 等反馈基建，时间范围经 FilterContext 全局化（默认 7d），tailwind 语义设计 token 落地（详见 [UI 页面](ui-pages.md)）；**同日第二批 14 个监控数据源接入（内置插件 8 → 22）**，db v12 迁移扩展缓存口径七源部分索引（详见 [监控插件](monitor-plugins.md) / [数据模型](data-model.md)）。当前 typecheck / 840 项单测通过。本页描述与实现一致。
 
 ## 定位
 
@@ -19,8 +19,12 @@ timestamp: 2026-08-22T18:15:00+08:00
 
 ## 阶段性范围
 
-- **第一阶段（5 个内置监控插件）**：Claude Code / Codex / OpenCode / Gemini CLI / Grok Build。
+- **第一阶段（8 个内置监控插件）**：Claude Code / Codex / OpenCode / Gemini CLI / Grok Build / Pi / ZCode / DSH。
+- **第二批（2026-09-10，+14 源至 22 个内置插件）**：WorkBuddy / CodeBuddy / Cline / Roo Code / Kilo Code / Qwen Code / Qoder / Qoder CN / Kimi Code / Zed / Kiro CLI / Reasonix / Command Code / Copilot Chat。
 - **后续阶段**：扩展 OpenClaw / Hermes / 其它 CLI / 代理拦截 / 云账单等。
+
+> [!note] 截至 2026-09-10
+> 已交付 22 个内置监控插件（首批 8 + 第二批 14）、统计查询卸载到只读 worker 线程、系统托盘后台常驻、仪表盘双图合并与趋势页退役、查询预聚合与联合索引 v11 及缓存口径七源索引 v12；图表层已由 Recharts 迁移至 ECharts 6.1；全部代码注释已于 2026-08-28 移除，`docs/` 为唯一事实来源。
 
 > [!todo] 待补充
 > 后续阶段的监控类型细节尚未展开设计。
@@ -36,7 +40,7 @@ timestamp: 2026-08-22T18:15:00+08:00
 | 渲染框架 | React + Vite |
 | 样式 | Tailwind CSS |
 | 数据请求/状态 | TanStack Query |
-| 图表 | Recharts |
+| 图表 | ECharts 6.1（echarts/core 按需注册，经 useECharts + chart-theme 承载） |
 | 数据存储 | better-sqlite3（主进程，同步 API） |
 | 文件监听 | chokidar + 定时兜底扫描 |
 | 插件框架 | 自研（注册表 + 服务容器 + 生命周期 + 事件总线） |

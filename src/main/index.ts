@@ -1,17 +1,58 @@
 import { join } from 'path'
-import { app, shell, BrowserWindow, ipcMain } from 'electron'
-import { createHost, type Host } from './host'
+import { app, dialog, shell, BrowserWindow, ipcMain } from 'electron'
+import { bootstrapHost, type Host } from './host'
 import { registerIpcHandlers } from './ipc/register'
+import { createTray, type TrayHandle } from './tray'
+
+const STARTUP_SYNC_DELAY_MS = 1500
 
 let mainWindow: BrowserWindow | null = null
 let host: Host | null = null
+let tray: TrayHandle | null = null
+let willQuit = false
 
-function createWindow(): void {
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+}
+
+function resolveTrayIcon(): string {
+  const name =
+    process.platform === 'win32' ? 'icon.ico'
+    : process.platform === 'darwin' ? 'iconTemplate.png'
+    : 'icon.png'
+  return app.isPackaged
+    ? join(process.resourcesPath, 'tray', name)
+    : join(app.getAppPath(), 'resources', 'tray', name)
+}
+
+function showWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+    return
+  }
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function quitApp(): void {
+  willQuit = true
+  tray?.destroy()
+  tray = null
+  app.quit()
+}
+
+function showFatalError(err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err)
+  dialog.showErrorBox('token-monitor 启动失败', message)
+}
+
+function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1100,
     height: 720,
     show: false,
     autoHideMenuBar: true,
+    backgroundColor: '#0a0a0a',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false
@@ -20,50 +61,81 @@ function createWindow(): void {
 
   mainWindow = window
 
+  window.on('close', (e) => {
+    if (!willQuit && host?.getSettings().closeToTray) {
+      e.preventDefault()
+      window.hide()
+    }
+  })
+
   window.on('ready-to-show', () => {
     window.show()
   })
 
-  // 外部链接一律交给系统浏览器打开
   window.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
   })
 
-  // 开发模式加载 electron-vite 渲染进程 dev server，生产模式加载打包产物
   const rendererUrl = process.env['ELECTRON_RENDERER_URL']
   if (!app.isPackaged && rendererUrl) {
     window.loadURL(rendererUrl)
   } else {
     window.loadFile(join(__dirname, '../renderer/index.html'))
   }
+
+  return window
 }
 
-app.whenReady().then(async () => {
-  // 组装插件宿主：存储/定价/事件/调度/监听 + 8 个内置监控插件
-  host = await createHost({ dataDir: app.getPath('userData') })
+async function bootstrapApp(): Promise<void> {
+  const boot = await bootstrapHost({ dataDir: app.getPath('userData') })
+  host = boot.host
 
-  // 注册全部 IPC handler（含示例 ping，渲染进程经 preload 白名单调用）
   registerIpcHandlers(ipcMain, host, () => mainWindow)
-
-  // 启动采集：首次立即全量同步 + 按设置间隔定时兜底扫描
-  host.collector.start(host.getSettings().syncIntervalMs)
 
   createWindow()
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  if (host.getSettings().closeToTray) {
+    tray = createTray(resolveTrayIcon(), { showWindow, quitApp })
+  }
+
+  const windowShown = new Promise<void>((resolve) => {
+    mainWindow?.once('show', () => resolve())
   })
+
+  boot.startServices().catch(showFatalError)
+
+  const h = host
+  void Promise.all([windowShown, boot.ready])
+    .then(() => {
+      h.collector.start(h.getSettings().syncIntervalMs, {
+        initialSyncDelayMs: STARTUP_SYNC_DELAY_MS
+      })
+    })
+    .catch(() => {})
+
+  app.on('activate', () => {
+    showWindow()
+  })
+}
+
+app.whenReady().then(() => {
+  void bootstrapApp().catch(showFatalError)
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+  if (process.platform !== 'darwin' && !host?.getSettings().closeToTray) {
     app.quit()
   }
 })
 
-// 退出前清理宿主：停采集 → 卸载全部插件 → 关闭数据库
+app.on('second-instance', () => {
+  showWindow()
+})
+
 app.on('before-quit', () => {
+  tray?.destroy()
+  tray = null
   host?.dispose()
   host = null
 })

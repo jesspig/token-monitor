@@ -1,30 +1,114 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef } from 'react'
 import type { ReactElement } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { graphic } from 'echarts/core'
+import type { LineSeriesOption } from 'echarts/charts'
 import { Activity, CircleDollarSign, Database, Gauge, ShieldCheck, TriangleAlert } from 'lucide-react'
-import type { BudgetStatus, UsageSummary } from '../../../../shared/query'
+import type { BudgetStatus, DailyStats, HourlyStats, UsageSummary } from '../../../../shared/query'
 import { api, isMock } from '../api'
+import {
+  AXIS_LABEL_STYLE,
+  AXIS_LINE_STYLE,
+  AXIS_TICK_STYLE,
+  buildBaseOption,
+  CHART_PALETTE,
+  GRID_STYLE,
+  SPLIT_LINE_STYLE,
+  TOOLTIP_STYLE,
+  type ChartOption
+} from '../components/chart-theme'
 import { Card } from '../components/Card'
 import { EmptyState } from '../components/EmptyState'
 import { HeroCard } from '../components/HeroCard'
 import { PageHeader } from '../components/PageHeader'
+import { QueryState } from '../components/QueryState'
 import { RangeSelector } from '../components/RangeSelector'
 import { StatCard } from '../components/StatCard'
-import { TrendChart } from '../components/TrendChart'
 import { useDailyTrends } from '../hooks/useDailyTrends'
+import { useECharts } from '../hooks/useECharts'
 import { useUsageSummary } from '../hooks/useUsageSummary'
-import { formatNumber, formatPercent, formatTokens, formatUsd } from '../lib/format'
+import { useFilter } from '../context/FilterContext'
+import { formatCompact, formatNumber, formatPercent, formatTokens, formatUsd } from '../lib/format'
 import {
   RANGE_OPTIONS,
   customRangeToMs,
-  rangeToFilters,
-  type CustomRange,
-  type RangeKey
+  rangeToFilters
 } from '../lib/range'
+import { getStatsRefreshInterval } from '../lib/settings-cache'
 
-/** HourlyStats.hour（0–23）→ 'HH:00' 横轴标签，与原 formatHour 视觉一致 */
+const COST_COLOR = '#f87171'
+
+const TOKEN_SERIES_META = [
+  { key: 'inputTokens', name: '输入', color: '#60a5fa', rgb: '96,165,250' },
+  { key: 'outputTokens', name: '输出', color: '#34d399', rgb: '52,211,153' },
+  { key: 'cacheCreationTokens', name: '缓存创建', color: '#fbbf24', rgb: '251,191,36' },
+  { key: 'cacheReadTokens', name: '缓存命中', color: '#a78bfa', rgb: '167,139,250' }
+] as const
+
+interface TrendRow {
+  label: string
+  requestCount: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  cost: number
+}
+
 function hourLabel(hour: number): string {
   return `${String(hour).padStart(2, '0')}:00`
+}
+
+function buildHourlyRows(data: HourlyStats[]): TrendRow[] {
+  const rows = data ?? []
+  const crossDay = new Set(rows.map((h) => h.dayKey)).size >= 2
+  return rows.map((h) => ({
+    label: crossDay && h.dayKey ? `${h.dayKey.slice(5)} ${hourLabel(h.hour)}` : hourLabel(h.hour),
+    requestCount: h.requestCount,
+    inputTokens: h.inputTokens,
+    outputTokens: h.outputTokens,
+    cacheReadTokens: h.cacheReadTokens,
+    cacheCreationTokens: h.cacheCreationTokens,
+    cost: Number.parseFloat(h.costUsd)
+  }))
+}
+
+function buildDailyRows(data: DailyStats[]): TrendRow[] {
+  return (data ?? []).map((d) => ({
+    label: d.date.slice(5),
+    requestCount: d.requestCount,
+    inputTokens: d.inputTokens,
+    outputTokens: d.outputTokens,
+    cacheReadTokens: d.cacheReadTokens,
+    cacheCreationTokens: d.cacheCreationTokens,
+    cost: Number.parseFloat(d.costUsd)
+  }))
+}
+
+function compactAxisLabel(value: number | string): string {
+  return formatCompact(Number(value))
+}
+
+function costAxisLabel(value: number | string): string {
+  return formatUsd(Number(value))
+}
+
+function areaGradient(rgb: string): graphic.LinearGradient {
+  return new graphic.LinearGradient(0, 0, 0, 1, [
+    { offset: 0, color: `rgba(${rgb},0.3)` },
+    { offset: 1, color: `rgba(${rgb},0)` }
+  ])
+}
+
+function categoryAxis(data: string[]): ChartOption['xAxis'] {
+  return {
+    type: 'category',
+    boundaryGap: false,
+    data,
+    axisTick: AXIS_TICK_STYLE,
+    axisLine: AXIS_LINE_STYLE,
+    axisLabel: AXIS_LABEL_STYLE
+  }
 }
 
 const EMPTY_SUMMARY: UsageSummary = {
@@ -41,13 +125,8 @@ const EMPTY_SUMMARY: UsageSummary = {
   successRate: 0
 }
 
-/** 预算横幅状态：danger（已超限）/ warning（占比 ≥ 80%）/ 无（未设置预算或占比低） */
 type BudgetBanner = { level: 'danger' | 'warning'; text: string } | null
 
-/**
- * 预算横幅派生：monthlyExceeded 或 dailyExceeded → danger「费用已超预算:$X / 上限 $Y」；
- * 未超但任一占比 ≥ 80% → warning 显示占比百分比；未设置预算或占比 < 80% → 不渲染。
- */
 function deriveBudgetBanner(b: BudgetStatus | undefined): BudgetBanner {
   if (!b) return null
   const parts: string[] = []
@@ -74,11 +153,104 @@ function deriveBudgetBanner(b: BudgetStatus | undefined): BudgetBanner {
   return null
 }
 
-/** Dashboard：Hero 汇总卡 + 时间范围筛选 + 请求/Token 迷你趋势 */
+function RequestTrendChart({ rows }: { rows: TrendRow[] }): ReactElement {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const option = useMemo<ChartOption>(
+    () =>
+      buildBaseOption({
+        grid: { ...GRID_STYLE, top: 36 },
+        tooltip: { ...TOOLTIP_STYLE, trigger: 'axis' },
+        xAxis: categoryAxis(rows.map((row) => row.label)),
+        yAxis: {
+          type: 'value',
+          axisTick: AXIS_TICK_STYLE,
+          axisLine: { show: false },
+          splitLine: SPLIT_LINE_STYLE,
+          axisLabel: { ...AXIS_LABEL_STYLE, formatter: compactAxisLabel }
+        },
+        series: [
+          {
+            name: '请求数',
+            type: 'line',
+            smooth: true,
+            symbol: 'circle',
+            symbolSize: 6,
+            showSymbol: false,
+            itemStyle: { color: CHART_PALETTE[0] },
+            lineStyle: { width: 2, color: CHART_PALETTE[0] },
+            areaStyle: { color: areaGradient('52,211,153') },
+            tooltip: { valueFormatter: (v) => formatNumber(Number(v)) },
+            data: rows.map((row) => row.requestCount)
+          }
+        ]
+      }),
+    [rows]
+  )
+  useECharts(containerRef, option)
+  return <div ref={containerRef} className="h-60 w-full" />
+}
+
+function TokenTrendChart({ rows }: { rows: TrendRow[] }): ReactElement {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const option = useMemo<ChartOption>(() => {
+    const tokenSeries: LineSeriesOption[] = TOKEN_SERIES_META.map((meta) => ({
+      name: meta.name,
+      type: 'line',
+      stack: 'tokens',
+      smooth: true,
+      symbol: 'circle',
+      symbolSize: 6,
+      showSymbol: false,
+      itemStyle: { color: meta.color },
+      lineStyle: { width: 1.5, color: meta.color },
+      areaStyle: { color: areaGradient(meta.rgb) },
+      tooltip: { valueFormatter: (v) => formatTokens(Number(v)) },
+      data: rows.map((row) => row[meta.key])
+    }))
+    const costSeries: LineSeriesOption = {
+      name: '成本',
+      type: 'line',
+      yAxisIndex: 1,
+      smooth: true,
+      symbol: 'circle',
+      symbolSize: 6,
+      showSymbol: false,
+      itemStyle: { color: COST_COLOR },
+      lineStyle: { width: 2, color: COST_COLOR, type: 'dashed' },
+      tooltip: { valueFormatter: (v) => formatUsd(Number(v)) },
+      data: rows.map((row) => row.cost)
+    }
+    return buildBaseOption({
+      grid: { ...GRID_STYLE, top: 36 },
+      tooltip: { ...TOOLTIP_STYLE, trigger: 'axis' },
+      xAxis: categoryAxis(rows.map((row) => row.label)),
+      yAxis: [
+        {
+          type: 'value',
+          axisTick: AXIS_TICK_STYLE,
+          axisLine: { show: false },
+          splitLine: SPLIT_LINE_STYLE,
+          axisLabel: { ...AXIS_LABEL_STYLE, formatter: compactAxisLabel }
+        },
+        {
+          type: 'value',
+          axisTick: AXIS_TICK_STYLE,
+          axisLine: { show: false },
+          splitLine: { show: false },
+          axisLabel: { ...AXIS_LABEL_STYLE, formatter: costAxisLabel }
+        }
+      ],
+      series: [...tokenSeries, costSeries]
+    })
+  }, [rows])
+  useECharts(containerRef, option)
+  return <div ref={containerRef} className="h-72 w-full" />
+}
+
 export default function DashboardPage(): ReactElement {
-  const [range, setRange] = useState<RangeKey>('today')
-  const [customRange, setCustomRange] = useState<CustomRange | null>(null)
-  // custom 且区间合法时按自定义毫秒区间查询，否则回退既有五档（custom 无区间时 rangeToFilters 内部回退 7 天）
+  const { filter, setRange, setCustomRange } = useFilter()
+  const range = filter.range
+  const customRange = filter.customRange
   const filters = useMemo(() => {
     if (range === 'custom' && customRange) {
       return rangeToFilters('custom', customRangeToMs(customRange) ?? {})
@@ -88,55 +260,46 @@ export default function DashboardPage(): ReactElement {
 
   const summaryQuery = useUsageSummary(filters)
   const dailyQuery = useDailyTrends(filters)
-  // 今日 / 24 小时迷你趋势改由后端按小时分桶（不再取明细在前端分桶，避免大流量日截断）；
-  // queryKey 复用 daily-trends 一级前缀，纳入既有 usage-updated 失效清单
   const hourlyQuery = useQuery({
     queryKey: ['daily-trends', 'hourly', filters],
     queryFn: () => api.getHourlyTrends(filters),
-    enabled: range === 'today' || range === '24h'
+    enabled: range === 'today' || range === '24h',
+    staleTime: 2 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    placeholderData: keepPreviousData,
+    refetchInterval: getStatsRefreshInterval
   })
-  // 预算限额状态（全局维度，staleTime 与页面其他查询一致走全局默认）
   const budgetQuery = useQuery({
     queryKey: ['budget-status'],
-    queryFn: () => api.getBudgetStatus()
+    queryFn: () => api.getBudgetStatus(),
+    staleTime: 2 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    placeholderData: keepPreviousData,
+    refetchInterval: getStatsRefreshInterval
   })
 
   const banner = useMemo(() => deriveBudgetBanner(budgetQuery.data), [budgetQuery.data])
 
   const s = summaryQuery.data ?? EMPTY_SUMMARY
-  const rangeLabel = RANGE_OPTIONS.find((o) => o.key === range)?.label ?? (range === 'custom' ? '自定义' : '')
 
-  const trend = useMemo(() => {
-    if (range === 'today' || range === '24h') {
-      const hourly = hourlyQuery.data ?? []
-      const crossDay = new Set(hourly.map((h) => h.dayKey)).size >= 2
-      return hourly.map((h) => ({
-        label:
-          crossDay && h.dayKey
-            ? `${h.dayKey.slice(5)} ${hourLabel(h.hour)}`
-            : hourLabel(h.hour),
-        requests: h.requestCount,
-        tokens:
-          h.inputTokens + h.outputTokens + h.cacheReadTokens + h.cacheCreationTokens
-      }))
-    }
-    return (dailyQuery.data ?? []).map((d) => ({
-      label: d.date.slice(5),
-      requests: d.requestCount,
-      tokens: d.inputTokens + d.outputTokens + d.cacheReadTokens + d.cacheCreationTokens
-    }))
-  }, [range, dailyQuery.data, hourlyQuery.data])
+  const hourlyMode = range === 'today' || range === '24h'
+  const activeTrendQuery = hourlyMode ? hourlyQuery : dailyQuery
+
+  const rows = useMemo(() => {
+    if (hourlyMode) return buildHourlyRows(hourlyQuery.data ?? [])
+    return buildDailyRows(dailyQuery.data ?? [])
+  }, [hourlyMode, dailyQuery.data, hourlyQuery.data])
+
+  const granularity = hourlyMode ? '按小时' : '按天'
 
   return (
     <div className="space-y-6">
       <PageHeader
         title="仪表盘"
         description={
-          summaryQuery.isLoading
-            ? '加载中…'
-            : isMock
-              ? '当前展示 Mock 数据，后端 IPC 就绪后自动切换真实数据'
-              : 'Token 用量汇总'
+          isMock
+            ? '当前展示演示数据，接入真实数据源后自动切换'
+            : 'Token 用量汇总'
         }
         action={
           <RangeSelector
@@ -154,8 +317,8 @@ export default function DashboardPage(): ReactElement {
           role="alert"
           className={`flex items-center gap-2 rounded-lg border px-4 py-3 text-sm ${
             banner.level === 'danger'
-              ? 'border-red-500/40 bg-red-500/10 text-red-300'
-              : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+              ? 'border-danger/40 bg-danger/10 text-danger'
+              : 'border-warning/40 bg-warning/10 text-warning'
           }`}
         >
           <TriangleAlert className="h-4 w-4 shrink-0" />
@@ -163,51 +326,71 @@ export default function DashboardPage(): ReactElement {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
-        <HeroCard
-          label="总请求"
-          value={formatNumber(s.totalRequests)}
-          hint={`成功 ${formatNumber(s.successCount)} · 失败 ${formatNumber(s.errorCount)}`}
-          icon={<Activity className="h-4 w-4" />}
-        />
-        <StatCard
-          label="真实消耗 Tokens"
-          value={formatTokens(s.realTotalTokens)}
-          sub={`输入 ${formatTokens(s.inputTokens)} · 输出 ${formatTokens(s.outputTokens)}`}
-          icon={<Database className="h-4 w-4" />}
-        />
-        <StatCard
-          label="缓存命中率"
-          value={formatPercent(s.cacheHitRate)}
-          sub={`缓存读 ${formatTokens(s.cacheReadTokens)}`}
-          icon={<Gauge className="h-4 w-4" />}
-        />
-        <StatCard
-          label="估算费用"
-          value={formatUsd(s.totalCost)}
-          sub="USD · 按定价表估算"
-          icon={<CircleDollarSign className="h-4 w-4" />}
-        />
-        <StatCard
-          label="成功率"
-          value={formatPercent(s.successRate)}
-          sub={`${formatNumber(s.errorCount)} 条失败`}
-          icon={<ShieldCheck className="h-4 w-4" />}
-        />
-      </div>
-
-      <Card
-        title={`${rangeLabel} 请求 / Token 趋势（${range === 'today' || range === '24h' ? '按小时' : '按天'}）`}
+      <QueryState
+        isPending={summaryQuery.isPending}
+        error={summaryQuery.error}
+        refetch={summaryQuery.refetch}
+        hasData={summaryQuery.data != null}
+        isFetching={summaryQuery.isFetching}
+        skeletonVariant="cards"
+        dimWhenRefreshing
       >
-        {trend.length > 0 ? (
-          <TrendChart data={trend} />
-        ) : (
-          <EmptyState
-            title="等待真实数据"
-            description="当前时间范围内暂无用量记录，接入真实 IPC 后端后将在此展示趋势。"
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
+          <HeroCard
+            label="总请求"
+            value={formatNumber(s.totalRequests)}
+            hint={`成功 ${formatNumber(s.successCount)} · 失败 ${formatNumber(s.errorCount)}`}
+            icon={<Activity className="h-4 w-4" />}
           />
-        )}
-      </Card>
+          <StatCard
+            label="真实消耗 Tokens"
+            value={formatTokens(s.realTotalTokens)}
+            sub={`输入 ${formatTokens(s.inputTokens)} · 输出 ${formatTokens(s.outputTokens)}`}
+            icon={<Database className="h-4 w-4" />}
+          />
+          <StatCard
+            label="缓存命中率"
+            value={formatPercent(s.cacheHitRate)}
+            sub={`缓存读 ${formatTokens(s.cacheReadTokens)}`}
+            icon={<Gauge className="h-4 w-4" />}
+          />
+          <StatCard
+            label="估算费用"
+            value={formatUsd(s.totalCost)}
+            sub="USD · 按定价表估算"
+            icon={<CircleDollarSign className="h-4 w-4" />}
+          />
+          <StatCard
+            label="成功率"
+            value={formatPercent(s.successRate)}
+            sub={`${formatNumber(s.errorCount)} 条失败`}
+            icon={<ShieldCheck className="h-4 w-4" />}
+          />
+        </div>
+      </QueryState>
+
+      <QueryState
+        isPending={activeTrendQuery.isPending}
+        error={activeTrendQuery.error}
+        refetch={activeTrendQuery.refetch}
+        hasData={activeTrendQuery.data != null}
+        isEmpty={rows.length === 0}
+        isFetching={activeTrendQuery.isFetching}
+        skeletonVariant="chart"
+        dimWhenRefreshing
+        empty={
+          <EmptyState title="暂无趋势数据" description="当前时间范围内没有用量记录。" />
+        }
+      >
+        <div className="space-y-6">
+          <Card title={`请求趋势（${granularity}）`}>
+            <RequestTrendChart rows={rows} />
+          </Card>
+          <Card title={`Token 趋势（${granularity}）：输入 / 输出 / 缓存创建 / 缓存命中 / 成本`}>
+            <TokenTrendChart rows={rows} />
+          </Card>
+        </div>
+      </QueryState>
     </div>
   )
 }

@@ -5,15 +5,9 @@ import fs from 'node:fs'
 import { codexPlugin, detectFromRoot, listFilesFromRoot } from './codex'
 import type { PluginContext } from '../../../shared/context'
 
-/** parseFile 不使用 ctx 上的服务，测试时给个空壳即可 */
 const ctx = {} as PluginContext
 
-/**
- * 样例行构造器（对齐已核实的 Codex rollout JSONL 格式）：
- * { type: session_meta|turn_context|event_msg, timestamp, payload }。
- */
 
-/** session_meta 行：payload.cwd = 工作目录、payload.id = 会话 id、payload.thread_id = 语义线程 id；传 null 可省略该字段 */
 const sessionMetaLine = (o: { id?: string | null; cwd?: string | null; threadId?: string | null } = {}): string =>
   JSON.stringify({
     type: 'session_meta',
@@ -22,11 +16,10 @@ const sessionMetaLine = (o: { id?: string | null; cwd?: string | null; threadId?
       ...(o.id === null ? {} : { id: o.id ?? 'sess-1' }),
       ...(o.cwd === null ? {} : { cwd: o.cwd ?? '/Users/a/b' }),
       ...(o.threadId ? { thread_id: o.threadId } : {}),
-      model: 'gpt-5' // 注意：session_meta.model 不作为「当前模型」
+      model: 'gpt-5'
     }
   })
 
-/** turn_context 行：payload.model = 本轮模型（可覆盖） */
 const turnContextLine = (o: { model?: string; timestamp?: string } = {}): string =>
   JSON.stringify({
     type: 'turn_context',
@@ -34,7 +27,6 @@ const turnContextLine = (o: { model?: string; timestamp?: string } = {}): string
     payload: { id: 'tc-1', model: o.model ?? 'gpt-5' }
   })
 
-/** token_count 事件行：用 info.last_token_usage（本轮增量）产出记录；timestamp 传 null 可省略 */
 const tokenCountLine = (o: {
   input?: number
   cached?: number
@@ -73,12 +65,35 @@ const tokenCountLine = (o: {
   })
 }
 
-/** token_count 事件但 info.last_token_usage 缺失（如仅 total_token_usage） */
 const tokenCountNoLast = (): string =>
   JSON.stringify({
     type: 'event_msg',
     timestamp: '2026-08-19T09:00:03+08:00',
     payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10, output_tokens: 5 } } }
+  })
+
+const streamErrorLine = (o: {
+  message?: string | null
+  httpStatus?: number | null
+  timestamp?: string | null
+} = {}): string =>
+  JSON.stringify({
+    type: 'event_msg',
+    ...(o.timestamp === null ? {} : { timestamp: o.timestamp ?? '2026-08-19T09:00:03+08:00' }),
+    payload: {
+      type: 'stream_error',
+      ...(o.message === null ? {} : { message: o.message ?? 'stream disconnected' }),
+      ...(o.httpStatus === null || o.httpStatus === undefined
+        ? {}
+        : { codex_error_info: { http_status_code: o.httpStatus } })
+    }
+  })
+
+const turnAbortedLine = (o: { reason?: string; timestamp?: string } = {}): string =>
+  JSON.stringify({
+    type: 'event_msg',
+    timestamp: o.timestamp ?? '2026-08-19T09:00:04+08:00',
+    payload: { type: 'turn_aborted', reason: o.reason ?? 'interrupted' }
   })
 
 let tmpDir = ''
@@ -121,9 +136,9 @@ describe('detect', () => {
 describe('parseFile 增量解析', () => {
   it('从 0 解析：模型来自最近 turn_context、token 字段映射正确、损坏行跳过、尾部半行不阻塞', async () => {
     const file = path.join(tmpDir, 'rollout-abc123.jsonl')
-    const brokenMid = '{this is broken json' // 中间损坏行
+    const brokenMid = '{this is broken json'
     const trailingHalf =
-      '{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":' // 尾部半行（未写完）
+      '{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":'
     fs.writeFileSync(
       file,
       [sessionMetaLine(), turnContextLine(), tokenCountLine(), brokenMid, trailingHalf].join('\n'),
@@ -142,7 +157,7 @@ describe('parseFile 增量解析', () => {
       rawModel: 'gpt-5',
       inputTokens: 100,
       outputTokens: 50,
-      cacheReadTokens: 20, // cached_input_tokens
+      cacheReadTokens: 20,
       cacheCreationTokens: 0,
       inputSemantics: 1,
       status: 'success',
@@ -167,7 +182,6 @@ describe('parseFile 增量解析', () => {
     expect(res.nextLine).toBe(4)
     expect(res.eof).toBe(true)
 
-    // 追加一行 token_count（真实场景：本轮 token_count 晚于 turn_context 写入）
     fs.appendFileSync(
       file,
       `\n${tokenCountLine({ input: 7, cached: 1, output: 3, reasoning: 0, timestamp: '2026-08-19T09:00:10+08:00' })}`,
@@ -177,7 +191,7 @@ describe('parseFile 增量解析', () => {
     expect(res2.records).toHaveLength(1)
     expect(res2.records[0].source).toEqual({ filePath: file, line: 4 })
     expect(res2.records[0]).toMatchObject({
-      model: 'gpt-5', // 模型状态由全文件扫描维持
+      model: 'gpt-5',
       inputTokens: 7,
       outputTokens: 3,
       cacheReadTokens: 1,
@@ -218,9 +232,9 @@ describe('parseFile 增量解析', () => {
       [
         sessionMetaLine(),
         turnContextLine(),
-        tokenCountLine({ input: 0, cached: 0, output: 0, reasoning: 0 }), // 全 0 → 跳过
-        tokenCountNoLast(), // last_token_usage 缺失 → 跳过
-        tokenCountLine({ timestamp: '2026-08-19T09:00:12+08:00' }) // 有效 → 产出
+        tokenCountLine({ input: 0, cached: 0, output: 0, reasoning: 0 }),
+        tokenCountNoLast(),
+        tokenCountLine({ timestamp: '2026-08-19T09:00:12+08:00' })
       ].join('\n'),
       'utf8'
     )
@@ -242,13 +256,11 @@ describe('parseFile 增量解析', () => {
   })
 
   it('sessionId：payload.id 覆盖文件名提取；两者皆无则省略', async () => {
-    // payload.id='sess-1' 覆盖文件名提取的 'abc123'
     const f1 = path.join(tmpDir, 'rollout-abc123.jsonl')
     fs.writeFileSync(f1, [sessionMetaLine(), turnContextLine(), tokenCountLine()].join('\n'), 'utf8')
     const r1 = await codexPlugin.parseFile(ctx, f1, 0)
     expect(r1.records[0].sessionId).toBe('sess-1')
 
-    // 文件名非 rollout-* 且 payload 无 id/cwd → sessionId 与 project 省略
     const f2 = path.join(tmpDir, 'session-2026.jsonl')
     fs.writeFileSync(
       f2,
@@ -261,7 +273,6 @@ describe('parseFile 增量解析', () => {
   })
 
   it('createdAt：行无 timestamp 时取 info.time；timestamp 非法时兜底为当前时间', async () => {
-    // info.time 兜底
     const f1 = path.join(tmpDir, 'rollout-a.jsonl')
     fs.writeFileSync(
       f1,
@@ -276,7 +287,6 @@ describe('parseFile 增量解析', () => {
     expect(r1.records).toHaveLength(1)
     expect(r1.records[0].createdAt).toBe(Date.parse('2026-08-19T09:00:05+08:00'))
 
-    // timestamp 非法 → Date.now()（非 NaN）
     const f2 = path.join(tmpDir, 'rollout-b.jsonl')
     fs.writeFileSync(
       f2,
@@ -305,7 +315,6 @@ describe('parseFile 增量解析', () => {
   })
 
   it('thread_id + 行 timestamp + 用量组合为 source.requestId；成分缺失时不设置', async () => {
-    // 全成分齐备：requestId = <threadId>:<行顶层timestamp>:<input>-<cached>-<output>
     const f1 = path.join(tmpDir, 'rollout-abc123.jsonl')
     fs.writeFileSync(
       f1,
@@ -320,7 +329,6 @@ describe('parseFile 增量解析', () => {
       requestId: 'thr-9:2026-08-19T09:00:02+08:00:100-20-50'
     })
 
-    // 无 session_meta（无 threadId）→ 不设置 requestId，其余解析不变
     const f2 = path.join(tmpDir, 'rollout-noMeta.jsonl')
     fs.writeFileSync(f2, [turnContextLine(), tokenCountLine()].join('\n'), 'utf8')
     const r2 = await codexPlugin.parseFile(ctx, f2, 0)
@@ -328,7 +336,6 @@ describe('parseFile 增量解析', () => {
     expect(r2.records[0].source.requestId).toBeUndefined()
     expect('requestId' in r2.records[0].source).toBe(false)
 
-    // session_meta 有 thread_id 但 token_count 行无顶层 timestamp → 不设置
     const f3 = path.join(tmpDir, 'rollout-noTs.jsonl')
     fs.writeFileSync(
       f3,
@@ -360,7 +367,6 @@ describe('parseFile 增量解析', () => {
     expect(res.nextLine).toBe(5)
     expect(res.eof).toBe(true)
 
-    // 半行补全为完整 token_count 行后，从 nextLine 续读
     fs.writeFileSync(
       file,
       [
@@ -381,6 +387,123 @@ describe('parseFile 增量解析', () => {
   })
 })
 
+describe('parseFile stream_error 失败可观测（T01 矩阵 codex 分支）', () => {
+  it('stream_error 产出 error 记录：tokens 全 0、status error、httpStatus/errorMessage/createdAt/model 正确', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [sessionMetaLine(), turnContextLine({ model: 'gpt-5' }), streamErrorLine({ message: 'upstream 429', httpStatus: 429 })].join(
+        '\n'
+      ),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    const r = res.records[0]
+    expect(r).toMatchObject({
+      appType: 'codex',
+      model: 'gpt-5',
+      rawModel: 'gpt-5',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      inputSemantics: 1,
+      status: 'error',
+      httpStatus: 429,
+      errorMessage: 'upstream 429',
+      project: '/Users/a/b',
+      sessionId: 'sess-1'
+    })
+    expect(r.createdAt).toBe(Date.parse('2026-08-19T09:00:03+08:00'))
+    expect(r.source).toEqual({ filePath: file, line: 3 })
+  })
+
+  it('stream_error 无 http_status_code 时 httpStatus 省略；无 message 时 errorMessage 省略', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [sessionMetaLine(), turnContextLine(), streamErrorLine({ message: null, httpStatus: null })].join('\n'),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].httpStatus).toBeUndefined()
+    expect(res.records[0].errorMessage).toBeUndefined()
+    expect('httpStatus' in res.records[0]).toBe(false)
+    expect('errorMessage' in res.records[0]).toBe(false)
+  })
+
+  it('stream_error 无当前模型时 model 回落为 unknown（不跳过）', async () => {
+    const file = path.join(tmpDir, 'rollout-noModel.jsonl')
+    fs.writeFileSync(file, [sessionMetaLine(), streamErrorLine()].join('\n'), 'utf8')
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].model).toBe('unknown')
+    expect(res.records[0].rawModel).toBe('unknown')
+    expect(res.records[0].status).toBe('error')
+  })
+
+  it('turn_aborted(interrupted) 不判 error：忽略不产出记录', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [sessionMetaLine(), turnContextLine(), turnAbortedLine({ reason: 'interrupted' })].join('\n'),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(0)
+    expect(res.nextLine).toBe(4)
+    expect(res.eof).toBe(true)
+
+    const file2 = path.join(tmpDir, 'rollout-abc124.jsonl')
+    fs.writeFileSync(file2, [sessionMetaLine(), turnContextLine(), turnAbortedLine({ reason: 'Interrupted' })].join('\n'), 'utf8')
+    const res2 = await codexPlugin.parseFile(ctx, file2, 0)
+    expect(res2.records).toHaveLength(0)
+  })
+
+  it('stream_error 与 token_count 共存：分别产出 success/error，token_count 逻辑不变', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [
+        sessionMetaLine(),
+        turnContextLine({ model: 'gpt-5' }),
+        tokenCountLine(),
+        streamErrorLine({ message: 'rate limited', httpStatus: 500, timestamp: '2026-08-19T09:00:10+08:00' }),
+        tokenCountLine({ timestamp: '2026-08-19T09:00:11+08:00' })
+      ].join('\n'),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(3)
+    expect(res.records[0]).toMatchObject({ status: 'success', source: { line: 3 } })
+    expect(res.records[1]).toMatchObject({
+      status: 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      httpStatus: 500,
+      errorMessage: 'rate limited',
+      source: { line: 4 }
+    })
+    expect(res.records[2]).toMatchObject({ status: 'success', source: { line: 5 } })
+    expect(res.nextLine).toBe(6)
+  })
+
+  it('stream_error createdAt 取 timestamp；非法 timestamp 兜底不为 NaN', async () => {
+    const file = path.join(tmpDir, 'rollout-abc123.jsonl')
+    fs.writeFileSync(
+      file,
+      [sessionMetaLine(), turnContextLine(), streamErrorLine({ timestamp: 'not-a-date' })].join('\n'),
+      'utf8'
+    )
+    const res = await codexPlugin.parseFile(ctx, file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(Number.isNaN(res.records[0].createdAt)).toBe(false)
+    expect(Math.abs(res.records[0].createdAt - Date.now())).toBeLessThan(60_000)
+  })
+})
+
 describe('listFilesFromRoot 收集范围', () => {
   it('递归收集日期分区与 archived_sessions 下 *.jsonl，过滤临时/隐藏文件', () => {
     const root = path.join(tmpDir, 'sessions')
@@ -391,11 +514,11 @@ describe('listFilesFromRoot 收集范围', () => {
 
     fs.writeFileSync(path.join(day, 'rollout-1.jsonl'), sessionMetaLine())
     fs.writeFileSync(path.join(day, 'rollout-2.jsonl'), sessionMetaLine())
-    fs.writeFileSync(path.join(day, 'rollout-3.jsonl.tmp'), 'ignore me') // 临时文件
-    fs.writeFileSync(path.join(day, 'rollout-4.jsonl~'), 'ignore me') // 备份文件
-    fs.writeFileSync(path.join(day, 'rollout-5.jsonl.swp'), 'ignore me') // 编辑交换文件
-    fs.writeFileSync(path.join(day, '.rollout-hidden.jsonl'), 'ignore me') // 隐藏文件
-    fs.writeFileSync(path.join(day, 'notes.txt'), 'ignore me') // 非 jsonl
+    fs.writeFileSync(path.join(day, 'rollout-3.jsonl.tmp'), 'ignore me')
+    fs.writeFileSync(path.join(day, 'rollout-4.jsonl~'), 'ignore me')
+    fs.writeFileSync(path.join(day, 'rollout-5.jsonl.swp'), 'ignore me')
+    fs.writeFileSync(path.join(day, '.rollout-hidden.jsonl'), 'ignore me')
+    fs.writeFileSync(path.join(day, 'notes.txt'), 'ignore me')
     fs.writeFileSync(path.join(day, 'rollout-6.jsonl'), sessionMetaLine())
     fs.writeFileSync(path.join(archived, 'rollout-old.jsonl'), sessionMetaLine())
 

@@ -4,6 +4,7 @@ import type {
   AppSettings,
   AppStats,
   BudgetStatus,
+  DailyModelBreakdown,
   DailyStats,
   HourlyStats,
   LogFilters,
@@ -11,21 +12,16 @@ import type {
   ModelsDevCatalogEntry,
   PaginatedLogs,
   PluginStatus,
+  ProjectStats,
   RequestLogDetail,
+  SessionStats,
+  StatusStats,
   UsageSummary
 } from '../../../shared/query'
 import type { ModelPricingRow } from '../../../shared/tables'
 import { DAY_MS, startOfToday } from './lib/range'
 
-/**
- * Mock 数据源：在后端（src/main + preload）实现完整 RendererApi 之前，
- * 用确定性伪随机数据让渲染层骨架可独立运行。
- *
- * - 单例数据集在模块加载时生成一次（日志/汇总/趋势/统计互相一致）。
- * - 所有方法返回 Promise，契约与 shared/ipc.ts 的 RendererApi 完全对齐。
- */
 
-/** 确定性伪随机数（种子固定，重渲染不抖动） */
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0
   return () => {
@@ -71,7 +67,21 @@ const APP_MODELS: Record<AppType, string[]> = {
   grok: ['grok-4'],
   pi: [],
   zcode: [],
-  dsh: []
+  dsh: [],
+  workbuddy: [],
+  codebuddy: [],
+  cline: [],
+  'roo-code': [],
+  'kilo-code': [],
+  qwen: [],
+  qoder: [],
+  'qoder-cn': [],
+  kimi: [],
+  zed: [],
+  kiro: [],
+  reasonix: [],
+  'command-code': [],
+  'copilot-chat': []
 }
 
 const APP_WEIGHTS: Array<[AppType, number]> = [
@@ -102,7 +112,6 @@ function buildRecords(): RequestLogDetail[] {
   for (let offset = 29; offset >= 0; offset--) {
     const dayStart = todayStart - offset * DAY_MS
     const dateStr = toDateStr(dayStart)
-    // 今日只生成到当前时刻，保证汇总/趋势/日志一致
     const span = offset === 0 ? Math.max(1, NOW - dayStart) : DAY_MS - 1
     const count = 6 + Math.floor(rnd() * 28)
 
@@ -125,6 +134,20 @@ function buildRecords(): RequestLogDetail[] {
               cacheCreation * def.cacheCreationPerM) /
             1_000_000
           : null
+      const HTTP_ERROR_CODES = [400, 401, 403, 404, 429, 500, 502, 503] as const
+      const ERROR_TEMPLATES = [
+        'API Error 429: rate limit exceeded, retry after 60s',
+        'API Error 500: internal server error, model overloaded',
+        'API Error 403: permission denied, check api key scope',
+        'API Error 400: invalid request, prompt too long exceeding context window limit',
+        'API Error 502: bad gateway, upstream provider unavailable transient failure'
+      ] as const
+      const httpStatus =
+        status === 'error' ? HTTP_ERROR_CODES[Math.floor(rnd() * HTTP_ERROR_CODES.length)] : null
+      const errorMessage =
+        status === 'error'
+          ? ERROR_TEMPLATES[Math.floor(rnd() * ERROR_TEMPLATES.length)]
+          : null
 
       records.push({
         id: `${app}-${dateStr}-${i}-${offset}`,
@@ -143,6 +166,8 @@ function buildRecords(): RequestLogDetail[] {
         project: rnd() < 0.6 ? projects[Math.floor(rnd() * projects.length)] : null,
         sessionId: `sess-${Math.floor(rnd() * 0xffffffff).toString(16)}`,
         status,
+        httpStatus,
+        errorMessage,
         createdAt,
         sourceFile: `.config/${app}/sessions/${dateStr}.jsonl`,
         sourceLine: 2 + Math.floor(rnd() * 800)
@@ -154,9 +179,31 @@ function buildRecords(): RequestLogDetail[] {
 
 const ALL_RECORDS = buildRecords()
 
-function buildDaily(): DailyStats[] {
+function filterRecords(filters: LogFilters): RequestLogDetail[] {
+  const { startTime, endTime, appTypes, models, status, keyword, project, sessionId } = filters
+  const httpStatus = filters.httpStatus ?? filters.statusCode
+  return ALL_RECORDS.filter((r) => {
+    if (startTime != null && r.createdAt < startTime) return false
+    if (endTime != null && r.createdAt > endTime) return false
+    if (appTypes && appTypes.length > 0 && !appTypes.includes(r.appType)) return false
+    if (models && models.length > 0 && !models.includes(r.model)) return false
+    if (status && r.status !== status) return false
+    if (httpStatus != null && r.httpStatus !== httpStatus) return false
+    if (project && r.project !== project) return false
+    if (sessionId && r.sessionId !== sessionId) return false
+    if (keyword) {
+      const kw = keyword.toLowerCase()
+      const hay = `${r.model} ${r.sessionId} ${r.project ?? ''} ${r.appType} ${r.errorMessage ?? ''} ${r.httpStatus ?? ''}`.toLowerCase()
+      if (!hay.includes(kw)) return false
+    }
+    return true
+  })
+}
+
+function filterDaily(filters: LogFilters): DailyStats[] {
+  const records = filterRecords(filters)
   const map = new Map<string, DailyStats>()
-  for (const r of ALL_RECORDS) {
+  for (const r of records) {
     const key = toDateStr(r.createdAt)
     let d = map.get(key)
     if (!d) {
@@ -187,38 +234,6 @@ function buildDaily(): DailyStats[] {
   return [...map.values()].sort((a, b) => a.date.localeCompare(b.date))
 }
 
-const DAILY = buildDaily()
-
-function filterRecords(filters: LogFilters): RequestLogDetail[] {
-  const { startTime, endTime, appTypes, models, status, keyword, project, sessionId } = filters
-  return ALL_RECORDS.filter((r) => {
-    if (startTime != null && r.createdAt < startTime) return false
-    if (endTime != null && r.createdAt > endTime) return false
-    if (appTypes && appTypes.length > 0 && !appTypes.includes(r.appType)) return false
-    if (models && models.length > 0 && !models.includes(r.model)) return false
-    if (status && r.status !== status) return false
-    if (project && r.project !== project) return false
-    if (sessionId && r.sessionId !== sessionId) return false
-    if (keyword) {
-      const kw = keyword.toLowerCase()
-      const hay = `${r.model} ${r.sessionId} ${r.project ?? ''} ${r.appType}`.toLowerCase()
-      if (!hay.includes(kw)) return false
-    }
-    return true
-  })
-}
-
-function filterDaily(filters: LogFilters): DailyStats[] {
-  const start = filters.startTime != null ? toDateStr(filters.startTime) : null
-  const end = filters.endTime != null ? toDateStr(filters.endTime) : null
-  return DAILY.filter((d) => {
-    if (start && d.date < start) return false
-    if (end && d.date > end) return false
-    return true
-  })
-}
-
-/** 按本地时区 (dayKey, hour) 双维聚合（与后端 getHourlyTrends 同口径：跨天窗口不合并同钟点；不补零，仅返回有数据的桶） */
 function aggregateHourly(records: RequestLogDetail[]): HourlyStats[] {
   const map = new Map<string, HourlyStats>()
   for (const r of records) {
@@ -380,7 +395,6 @@ let SETTINGS: AppSettings = {
   pricingSyncIntervalMs: 300_000
 }
 
-/** 预算占比与超限判定（与主进程 budget.ts 同口径：null/<=0 视同未设置=不告警，严格大于才判超限） */
 function evaluateBudget(costMicro: number, budget: number | null | undefined) {
   const effective = budget != null && budget > 0 ? budget : null
   if (effective == null) return { ratio: null as number | null, exceeded: false, normalized: null }
@@ -388,7 +402,6 @@ function evaluateBudget(costMicro: number, budget: number | null | undefined) {
   return { ratio, exceeded: ratio > 1, normalized: effective }
 }
 
-/** 按当前 Mock 记录集聚合今日/本月费用（本地时区），结合 SETTINGS 预算得出状态 */
 function buildBudgetStatus(): BudgetStatus {
   const todayKey = toDateStr(NOW)
   const monthPrefix = todayKey.slice(0, 7)
@@ -416,7 +429,6 @@ function buildBudgetStatus(): BudgetStatus {
   }
 }
 
-/** models.dev 目录 Mock 小样本（确定性，模拟全量同步导入的条目） */
 const MODELSDEV_MOCK_CATALOG: ModelsDevCatalogEntry[] = [
   {
     provider: 'anthropic',
@@ -456,7 +468,6 @@ const MODELSDEV_MOCK_CATALOG: ModelsDevCatalogEntry[] = [
   }
 ]
 
-/** 目录条目 → 定价行并 upsert 进 Mock 定价表（Mock 不区分 seed/sync/user 分级） */
 function upsertCatalogEntry(entry: ModelsDevCatalogEntry): void {
   const row: ModelPricingRow = {
     model_id: entry.modelId,
@@ -473,7 +484,6 @@ function upsertCatalogEntry(entry: ModelsDevCatalogEntry): void {
   PRICING = idx >= 0 ? PRICING.map((p, i) => (i === idx ? row : p)) : [...PRICING, row]
 }
 
-/** 生成与 RendererApi 契约对齐的 Mock 实现 */
 export function createMockApi(): RendererApi {
   return {
     ping: async () => 'pong',
@@ -575,6 +585,114 @@ export function createMockApi(): RendererApi {
         .sort((a, b) => b.requestCount - a.requestCount)
     },
 
+    getStatsByProject: async (filters): Promise<ProjectStats[]> => {
+      const map = new Map<string, ProjectStats>()
+      for (const r of filterRecords(filters)) {
+        const project = r.project ?? '(unknown)'
+        let s = map.get(project)
+        if (!s) {
+          s = {
+            project,
+            requestCount: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            costUsd: '0',
+            successRate: 0
+          }
+          map.set(project, s)
+        }
+        s.requestCount += 1
+        s.inputTokens += r.inputTokens
+        s.outputTokens += r.outputTokens
+        s.cacheReadTokens += r.cacheReadTokens
+        s.cacheCreationTokens += r.cacheCreationTokens
+        if (r.costUsd) {
+          s.costUsd = (Number.parseFloat(s.costUsd) + Number.parseFloat(r.costUsd)).toFixed(6)
+        }
+        if (r.status === 'success') s.successRate += 1
+      }
+      return [...map.values()]
+        .map((s) => ({
+          ...s,
+          successRate: s.requestCount > 0 ? s.successRate / s.requestCount : 0
+        }))
+        .sort((a, b) => b.requestCount - a.requestCount)
+    },
+
+    getStatsBySession: async (filters): Promise<SessionStats[]> => {
+      const map = new Map<string, SessionStats>()
+      for (const r of filterRecords(filters)) {
+        const sessionId = r.sessionId ?? '(unknown)'
+        let s = map.get(sessionId)
+        if (!s) {
+          s = {
+            sessionId,
+            requestCount: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            costUsd: '0',
+            successRate: 0
+          }
+          map.set(sessionId, s)
+        }
+        s.requestCount += 1
+        s.inputTokens += r.inputTokens
+        s.outputTokens += r.outputTokens
+        s.cacheReadTokens += r.cacheReadTokens
+        s.cacheCreationTokens += r.cacheCreationTokens
+        if (r.costUsd) {
+          s.costUsd = (Number.parseFloat(s.costUsd) + Number.parseFloat(r.costUsd)).toFixed(6)
+        }
+        if (r.status === 'success') s.successRate += 1
+      }
+      return [...map.values()]
+        .map((s) => ({
+          ...s,
+          successRate: s.requestCount > 0 ? s.successRate / s.requestCount : 0
+        }))
+        .sort((a, b) => b.requestCount - a.requestCount)
+    },
+
+    getStatsByStatus: async (filters): Promise<StatusStats[]> => {
+      const map = new Map<string, StatusStats>()
+      for (const r of filterRecords(filters)) {
+        const status = r.status
+        let s = map.get(status)
+        if (!s) {
+          s = {
+            status,
+            requestCount: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            costUsd: '0',
+            successRate: 0
+          }
+          map.set(status, s)
+        }
+        s.requestCount += 1
+        s.inputTokens += r.inputTokens
+        s.outputTokens += r.outputTokens
+        s.cacheReadTokens += r.cacheReadTokens
+        s.cacheCreationTokens += r.cacheCreationTokens
+        if (r.costUsd) {
+          s.costUsd = (Number.parseFloat(s.costUsd) + Number.parseFloat(r.costUsd)).toFixed(6)
+        }
+        if (r.status === 'success') s.successRate += 1
+      }
+      return [...map.values()]
+        .map((s) => ({
+          ...s,
+          successRate: s.requestCount > 0 ? s.successRate / s.requestCount : 0
+        }))
+        .sort((a, b) => b.requestCount - a.requestCount)
+    },
+
     getFilterOptions: async () => {
       const models = new Set<string>()
       const projects = new Set<string>()
@@ -605,6 +723,31 @@ export function createMockApi(): RendererApi {
 
     updateSettings: async (patch) => {
       SETTINGS = { ...SETTINGS, ...patch }
+    },
+
+    getDailyModelBreakdown: async (filters): Promise<DailyModelBreakdown[]> => {
+      const map = new Map<string, DailyModelBreakdown & { costMicro: number }>()
+      for (const r of filterRecords(filters)) {
+        const date = toDateStr(r.createdAt)
+        const key = `${date}\u0000${r.model}`
+        let entry = map.get(key)
+        if (!entry) {
+          entry = { date, model: r.model, tokens: 0, cost: '0', costMicro: 0, requestCount: 0 }
+          map.set(key, entry)
+        }
+        entry.tokens += r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheCreationTokens
+        entry.costMicro += r.costUsd ? Math.round(Number.parseFloat(r.costUsd) * 1_000_000) : 0
+        entry.requestCount += 1
+      }
+      const out: DailyModelBreakdown[] = [...map.values()].map((e) => ({
+        date: e.date,
+        model: e.model,
+        tokens: e.tokens,
+        cost: (e.costMicro / 1_000_000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') || '0',
+        requestCount: e.requestCount
+      }))
+      out.sort((a, b) => a.date.localeCompare(b.date) || b.tokens - a.tokens)
+      return out
     },
 
     getBudgetStatus: async () => buildBudgetStatus(),

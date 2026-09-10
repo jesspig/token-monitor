@@ -15,7 +15,6 @@ import {
 } from './zcode'
 import type { PluginContext } from '../../../shared/context'
 
-/** parseFile 不使用 ctx 上的服务，测试时给个空壳即可 */
 const ctx = {} as PluginContext
 
 let tmpDir = ''
@@ -28,7 +27,6 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
 
-/** model_usage 行种子（字段可覆盖，默认对齐 CLI db v0.14.8 schema） */
 interface UsageSeed {
   id: string
   sessionId?: string | null
@@ -47,6 +45,71 @@ const USAGE_COLUMNS =
 
 const USAGE_PLACEHOLDERS = '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
 
+interface FailureUsageSeed extends UsageSeed {
+  status?: string | null
+  errorType?: string | null
+  errorCode?: string | number | null
+  errorMessage?: string | null
+}
+
+const USAGE_COLUMNS_FAILURE =
+  '(id, session_id, turn_id, model_id, input_tokens, output_tokens, reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens, started_at, completed_at, status, error_type, error_code, error_message)'
+
+const USAGE_PLACEHOLDERS_FAILURE = '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+
+function failureValues(u: FailureUsageSeed): unknown[] {
+  return [
+    ...usageValues(u),
+    u.status ?? null,
+    u.errorType ?? null,
+    u.errorCode ?? null,
+    u.errorMessage ?? null
+  ]
+}
+
+function buildZcodeDbWithFailure(
+  dbPath: string,
+  opts: {
+    sessions?: Array<{ id: string; directory?: string | null }>
+    usages?: FailureUsageSeed[]
+  } = {}
+): void {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true })
+  const db = new Database(dbPath)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session (
+      id TEXT PRIMARY KEY,
+      directory TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS model_usage (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      turn_id TEXT,
+      model_id TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      status TEXT,
+      error_type TEXT,
+      error_code TEXT,
+      error_message TEXT
+    );
+  `)
+  const insS = db.prepare('INSERT INTO session (id, directory) VALUES (?, ?)')
+  for (const s of opts.sessions ?? []) {
+    insS.run(s.id, s.directory ?? '')
+  }
+  const insU = db.prepare(`INSERT INTO model_usage ${USAGE_COLUMNS_FAILURE} VALUES ${USAGE_PLACEHOLDERS_FAILURE}`)
+  for (const u of opts.usages ?? []) {
+    insU.run(...failureValues(u))
+  }
+  db.close()
+}
+
 function usageValues(u: UsageSeed): unknown[] {
   return [
     u.id,
@@ -63,7 +126,6 @@ function usageValues(u: UsageSeed): unknown[] {
   ]
 }
 
-/** 构造 zcode 风格 SQLite（session + model_usage 两表，schema 对齐 CLI db v0.14.8） */
 function buildZcodeDb(
   dbPath: string,
   opts: {
@@ -103,7 +165,6 @@ function buildZcodeDb(
   db.close()
 }
 
-/** 向已有 db 追加一行 model_usage（增量游标测试用） */
 function appendUsage(dbPath: string, u: UsageSeed): void {
   const db = new Database(dbPath)
   db.prepare(`INSERT INTO model_usage ${USAGE_COLUMNS} VALUES ${USAGE_PLACEHOLDERS}`).run(...usageValues(u))
@@ -161,7 +222,6 @@ describe('detectFromRoot 探测', () => {
 })
 
 describe('listFilesFromRoot 收集范围与 WAL 感知', () => {
-  /** 写入空文件并设置指定 mtime（epoch ms），返回实际 stat 到的毫秒值（规避文件系统时间精度截断） */
   function writeWithMtime(p: string, atMs: number): number {
     fs.writeFileSync(p, '')
     const t = new Date(atMs)
@@ -295,7 +355,6 @@ describe('parseDbFile 解析与水位游标', () => {
     expect(r1.records.map((r) => r.source.line)).toEqual([1, 2])
     expect(r1.nextLine).toBe(2)
 
-    // 追加两行后再解析：只产出新增（rowid 3、4），line=rowid 单调递增跨轮去重唯一
     appendUsage(dbPath, { id: 'mu-3', startedAt: 3_000 })
     appendUsage(dbPath, { id: 'mu-4', startedAt: 4_000 })
 
@@ -305,7 +364,6 @@ describe('parseDbFile 解析与水位游标', () => {
     expect(r2.nextLine).toBe(4)
     expect(r2.eof).toBe(true)
 
-    // 无新增：nextLine 返回原 fromLine
     const r3 = parseDbFile(dbPath, r2.nextLine)
     expect(r3.records).toHaveLength(0)
     expect(r3.nextLine).toBe(4)
@@ -339,7 +397,6 @@ describe('parseDbFile 解析与水位游标', () => {
   })
 
   it('id 缺失/空白时不设 requestId（退回 (file,line) 主键去重）', () => {
-    // TEXT PK 允许空串；宽松透传为 undefined
     const dbPath = path.join(tmpDir, 'cli', 'db', 'db.sqlite')
     fs.mkdirSync(path.dirname(dbPath), { recursive: true })
     const db = new Database(dbPath)
@@ -376,7 +433,6 @@ describe('parseDbFile 解析与水位游标', () => {
     expect(r1.nextLine).toBe(0)
     expect(r1.eof).toBe(true)
 
-    // 仅含无关表的空库（无 model_usage 表）
     const emptyDb = path.join(tmpDir, 'empty.sqlite')
     const db = new Database(emptyDb)
     db.exec('CREATE TABLE unrelated (x TEXT)')
@@ -385,6 +441,114 @@ describe('parseDbFile 解析与水位游标', () => {
     expect(r2.records).toHaveLength(0)
     expect(r2.nextLine).toBe(42)
     expect(r2.eof).toBe(true)
+  })
+})
+
+describe('parseDbFile 失败语义（status/error_type/error_code/error_message）', () => {
+  it('error_type 非 cancelled 且 status != completed 时产 error：status error、httpStatus/errorMessage 正确、截断500', () => {
+    const dbPath = path.join(tmpDir, 'cli', 'db', 'db.sqlite')
+    const longMsg = 'x'.repeat(800)
+    buildZcodeDbWithFailure(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      usages: [
+        { id: 'mu-err-1', status: 'failed', errorType: 'api_error', errorCode: '429', errorMessage: longMsg },
+        { id: 'mu-err-2', status: 'error', errorType: 'timeout', errorCode: 500, errorMessage: 'timeout boom' },
+        { id: 'mu-err-3', status: 'failed', errorType: 'api_error', errorCode: 'not-a-number', errorMessage: 'bad code' }
+      ]
+    })
+    const res = parseDbFile(dbPath, 0)
+    expect(res.records).toHaveLength(3)
+    expect(res.records[0].status).toBe('error')
+    expect(res.records[0].httpStatus).toBe(429)
+    expect(res.records[0].errorMessage?.length).toBe(500)
+    expect(res.records[0].errorMessage).toBe('x'.repeat(500))
+    expect(res.records[1].status).toBe('error')
+    expect(res.records[1].httpStatus).toBe(500)
+    expect(res.records[1].errorMessage).toBe('timeout boom')
+    expect(res.records[2].status).toBe('error')
+    expect(res.records[2].httpStatus).toBeUndefined()
+    expect(res.records[2].errorMessage).toBe('bad code')
+    expect(res.nextLine).toBe(3)
+  })
+
+  it('error_type 为 cancelled 时仍 success，不产 errorMessage/httpStatus（忽略不计 error）', () => {
+    const dbPath = path.join(tmpDir, 'cli', 'db', 'db.sqlite')
+    buildZcodeDbWithFailure(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      usages: [
+        { id: 'mu-cancel', status: 'failed', errorType: 'cancelled', errorCode: '499', errorMessage: 'cancelled by user' },
+        { id: 'mu-cancel2', status: 'interrupted', errorType: 'cancelled', errorCode: 500, errorMessage: 'should ignore' }
+      ]
+    })
+    const res = parseDbFile(dbPath, 0)
+    expect(res.records).toHaveLength(2)
+    for (const r of res.records) {
+      expect(r.status).toBe('success')
+      expect(r.httpStatus).toBeUndefined()
+      expect(r.errorMessage).toBeUndefined()
+    }
+    expect(res.records.map((r) => r.source.requestId)).toEqual(['mu-cancel', 'mu-cancel2'])
+  })
+
+  it('status 为 completed 时忽略 error_type，仍产 success', () => {
+    const dbPath = path.join(tmpDir, 'cli', 'db', 'db.sqlite')
+    buildZcodeDbWithFailure(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      usages: [
+        { id: 'mu-completed', status: 'completed', errorType: 'api_error', errorCode: '500', errorMessage: 'should be ignored' },
+        { id: 'mu-completed2', status: 'completed', errorType: 'timeout', errorCode: 429, errorMessage: 'also ignored' }
+      ]
+    })
+    const res = parseDbFile(dbPath, 0)
+    expect(res.records).toHaveLength(2)
+    for (const r of res.records) {
+      expect(r.status).toBe('success')
+      expect(r.httpStatus).toBeUndefined()
+      expect(r.errorMessage).toBeUndefined()
+    }
+  })
+
+  it('缺列兼容：旧库无 status/error_* 列时宽松视为 success，不抛错且无 httpStatus/errorMessage', () => {
+    const dbPath = path.join(tmpDir, 'cli', 'db', 'db.sqlite')
+    buildZcodeDb(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      usages: [{ id: 'mu-old-1' }, { id: 'mu-old-2', input: 10, output: 20 }]
+    })
+    const res = parseDbFile(dbPath, 0)
+    expect(res.records).toHaveLength(2)
+    for (const r of res.records) {
+      expect(r.status).toBe('success')
+      expect(r.httpStatus).toBeUndefined()
+      expect(r.errorMessage).toBeUndefined()
+    }
+    expect(res.nextLine).toBe(2)
+  })
+
+  it('边界：status 非 completed 但 error_type 为空/NULL 时仍 success；error_message 空白时不产 errorMessage', () => {
+    const dbPath = path.join(tmpDir, 'cli', 'db', 'db.sqlite')
+    buildZcodeDbWithFailure(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      usages: [
+        { id: 'mu-null-type', status: 'failed', errorType: null, errorCode: '500', errorMessage: 'has code but no type' },
+        { id: 'mu-empty-type', status: 'failed', errorType: '', errorCode: '500', errorMessage: 'empty type' },
+        { id: 'mu-empty-msg', status: 'failed', errorType: 'api_error', errorCode: '500', errorMessage: '   ' },
+        { id: 'mu-no-code', status: 'failed', errorType: 'api_error', errorCode: null, errorMessage: 'no code' }
+      ]
+    })
+    const res = parseDbFile(dbPath, 0)
+    expect(res.records).toHaveLength(4)
+    expect(res.records[0].status).toBe('success')
+    expect(res.records[0].httpStatus).toBeUndefined()
+    expect(res.records[0].errorMessage).toBeUndefined()
+    expect(res.records[1].status).toBe('success')
+    expect(res.records[1].httpStatus).toBeUndefined()
+    expect(res.records[1].errorMessage).toBeUndefined()
+    expect(res.records[2].status).toBe('error')
+    expect(res.records[2].httpStatus).toBe(500)
+    expect(res.records[2].errorMessage).toBeUndefined()
+    expect(res.records[3].status).toBe('error')
+    expect(res.records[3].httpStatus).toBeUndefined()
+    expect(res.records[3].errorMessage).toBe('no code')
   })
 })
 

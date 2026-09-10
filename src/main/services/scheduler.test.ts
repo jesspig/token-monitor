@@ -70,4 +70,19 @@ describe('SchedulerServiceImpl', () => {
     await vi.advanceTimersByTimeAsync(1000)
     expect(calls).toHaveLength(1)
   })
+
+  it('initialDelayMs 错相：首触提前到偏移点，后续按整周期推进', async () => {
+    const scheduler = new SchedulerServiceImpl()
+    const calls: number[] = []
+    scheduler.schedule(1000, () => { calls.push(1) }, 500)
+
+    await vi.advanceTimersByTimeAsync(500)
+    expect(calls).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(calls).toHaveLength(2)
+
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(calls).toHaveLength(3)
+  })
 })

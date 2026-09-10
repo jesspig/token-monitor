@@ -4,13 +4,13 @@ title: 定价与费用
 description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填与存量缓存口径重算；费用 = fresh_input × input 价 + 其余 token × 各自价格，input 按 semantics 三态扣减。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-08-24T16:58:00+08:00
+timestamp: 2026-09-10T20:51:31+08:00
 ---
 
 # 定价与费用
 
 > [!note] 当前状态
-> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）；2026-08-23 第五轮迭代接入输入语义计费（v4 迁移 + 存量重算）并增强匹配兜底链；**2026-08-24 定价写入批量化（seed 播种与 models.dev 同步均收敛为单事务批量 upsert，数千次独立 fsync → 1 次）与启动错峰（models.dev 首次同步延迟 10s）落地**。
+> **已实现**。归一化与费用计算落地于 `src/main/services/pricing.ts`；定价表 v2 迁移（`source` 列）与 models.dev 同步（`src/main/services/modelsdev.ts`）于 2026-08-22 落地；同日第三轮迭代将 models.dev 同步改为**无条件自动同步**（无启停开关），定价 UI/IPC 收窄为只读；第四轮迭代把同步间隔改为设置可配（`pricingSyncIntervalMs`，默认 5 分钟）；2026-08-23 第五轮迭代接入输入语义计费（v4 迁移 + 存量重算）并增强匹配兜底链；2026-08-24 定价写入批量化（seed 播种与 models.dev 同步均收敛为单事务批量 upsert，数千次独立 fsync → 1 次）与启动错峰（models.dev 首次同步延迟 10s）落地；**2026-08-26：定价索引升级排序数组 + 二分查找（短 ID/家族匹配 O(n·L) → O(L·log n)）、新增批量计费 calcCostBatch、零成本回填与存量重算改分批执行并命中 v7 部分索引**。
 
 ## 定价表（v2，已实现）
 
@@ -28,6 +28,8 @@ timestamp: 2026-08-24T16:58:00+08:00
 
 估算费用 = `fresh_input × input 价 + output × output 价 + cacheRead × read 价 + cacheCreation × write 价`（全部乘 cost_multiplier），按微美元整数精度求和后输出 USD 字符串；未找到定价项返回 undefined（记录照常入库，costUsd 为空）。
 
+**批量计费 `calcCostBatch(records)`（2026-08-26，采集主路径）**：单次取定价索引后对 records 同步逐条计算（内部复用与 `calcCost` 相同的 computeCost 纯函数），返回按位对应的费用数组——无价 undefined、空数组短路、异常向上抛；`collector.syncOne` 由逐条 await calcCost 改为一次批量调用 + 按位回填（undefined 跳过），行为与逐条完全一致。`PricingService` 契约（shared/context.ts）已同步新增该方法。
+
 **fresh_input 按 `record.inputSemantics` 三态区分口径**（SSOT 定义，与 data-model.md 一致）：
 
 | inputSemantics | 含义 | fresh_input |
@@ -36,7 +38,13 @@ timestamp: 2026-08-24T16:58:00+08:00
 | 1 | input 为含缓存读写的总量 | `max(0, input − cacheRead − cacheCreation)` |
 | 2 | input 已为纯新输入 | inputTokens |
 
-五源实际口径（2026-08-23 经上游源码逐一核实）：claude 与 opencode 上游已扣减缓存（=2，不扣）；codex / gemini / grok 的 input_tokens 为含缓存总量（=1，扣 read+write，三源 write 桶实际恒为 0）。旧公式对 semantics=1 全额计价曾造成缓存部分重复计费、费用系统性高估，已修复。
+22 源实际口径（首批 8 源经 2026-08-23 上游源码逐一核实；第二批 14 源于 2026-09-10 接入，semantics 依据各自上游源码/实测核定，逐源依据见 [监控插件](monitor-plugins.md)）：
+
+- **semantics=1（input 为含缓存总量，扣 read+write，共八源）**：codex / gemini / grok / zcode（首批四源，write 桶实际恒为 0）+ workbuddy / codebuddy（`rawUsage.prompt_tokens` 含缓存命中）/ qwen（`inputTokens` 含 `cachedTokens`）/ reasonix（`prompt = cache_hit + cache_miss`）。
+- **semantics=2（纯新输入，不扣，共十一源）**：claude / opencode（上游已自行扣减缓存）/ pi / dsh（首批）+ cline / roo-code / kilo-code / kimi / zed / command-code / copilot-chat（第二批）。
+- **semantics=0（未知，全额保守计价不扣，共三源）**：qoder / qoder-cn（`prompt_tokens` 与 `cached_tokens` 包含关系存疑）/ kiro（explicit 计数恒 0 待验证）。
+
+旧公式对 semantics=1 全额计价曾造成缓存部分重复计费、费用系统性高估，已修复。
 
 ## 模型 ID 归一化（已实现，8 步规则）
 
@@ -53,13 +61,15 @@ timestamp: 2026-08-24T16:58:00+08:00
 
 ## 定价匹配策略（已实现，五级兜底链）
 
+内存索引为 `PricingIndex{ map, keys }`：map 为归一化 ID → 定价行，keys 为**字典序排序**的 key 数组（缓存重建时排序一次，`invalidateCache` 后随重建刷新）。前缀类匹配经 `lowerBound` 二分定位（2026-08-26，短 ID/家族匹配由 O(n·L) 线性扫描降为 O(L·log n)）。
+
 `matchPrice` 按序尝试，命中即返回：
 
 1. **精确**匹配归一化 ID；
 2. **点转横线变体的精确匹配**（`claude-sonnet-4.5 → claude-sonnet-4-5`）：仅作查价尝试，不进入 normalizeModelId——Gemini 等官方 id 自带点号，无条件转换会破坏精确命中；
-3. **短 ID 匹配带版本/后缀项**（请求 ID 以定价 key 为前缀且后继为边界字符 `-`/`.`/数字时命中，取最长 key，避免家族误配）；
+3. **短 ID 匹配带版本/后缀项**（请求 ID 以定价 key 为前缀且后继为边界字符 `-`/`.`/数字时命中，取最长 key，避免家族误配）：从长到短枚举请求 ID 的真前缀，每个候选经二分判存在；
 4. 点转横线变体的短 ID 匹配（同规则作用于 dotted 变体）；
-5. **家族兜底**：定价 key 以请求 ID 为前缀且后继为边界字符时取**最短 key**（避免过专分档误配），仅当请求 ID 长度 ≥3 才启用。
+5. **家族兜底**：定价 key 以请求 ID 为前缀且后继为边界字符时取**最短 key**（避免过专分档误配），仅当请求 ID 长度 ≥3 才启用；在排序数组上从 lowerBound 起连续段扫描，最短优先、同长取字典序。
 
 > 排序约束：级 2 必须先于级 3——否则 `claude-opus-4.5` 会被短 ID `claude-opus-4` 截胡（`.` 通过边界判定），错配上一代价格（单价差 3 倍）；有防回归用例。
 
@@ -75,7 +85,7 @@ timestamp: 2026-08-24T16:58:00+08:00
 
 - 启动序列 seed 定价后**延迟 10 秒**执行一次全量同步（2026-08-24 启动错峰，避免与首轮采集同帧争抢 IO）；
 - 此后经 scheduler 按 `pricingSyncIntervalMs` 周期执行（默认 `300000` = 5 分钟），设置变更时即时重启调度；无启停开关，UI 仅在设置页暴露间隔输入（分钟）；
-- PricingPage 仅保留「立即全量同步」按钮，手动触发同一宿主入口。
+- PricingPage 为只读列表（客户端搜索框过滤 + 15/页分页 `PRICING_PAGE_SIZE`），仅保留「立即全量同步」按钮，手动触发同一宿主入口，同步结果经 toast 反馈。
 
 IPC 仅两通道：`pricing:list`（只读列表）/ `pricing:modelsdev-sync`（手动全量同步）。`pricing:update` / `pricing:delete` / 目录浏览与勾选导入通道已删除，定价表对 UI **只读**；user 档保护规则不变，历史手动价仍不会被 seed/sync 覆盖。
 
@@ -86,15 +96,17 @@ IPC 仅两通道：`pricing:list`（只读列表）/ `pricing:modelsdev-sync`（
 `pricing.backfillZeroCost(db, pricing)`：扫描明细表中 `cost_usd = 0` 或为空的行，用当前定价重算费用并增量修正对应 `usage_daily_rollups.cost_usd`。
 
 - 不变量：rollup 费用 ≡ 组内明细费用之和（增量修正而非重算全桶）；rollup 行缺失时不重建。
+- 分批执行（2026-08-26 防阻塞第二轮，与 recalcCachedInputCosts 同构）：rowid 游标按 `REPRICE_BATCH_SIZE = 500` 逐批扫描候选，每批「事务外取价计算 → 单事务原子提交」，批间 setImmediate 让出事件循环——消除一次性长事务对主进程的阻塞；候选查询命中 v7 部分索引 `idx_usage_records_zero_cost`（见 [数据模型](data-model.md)），稳态扫描成本从 O(全表) 降为 O(候选数)。
 - 触发时机：应用启动、每次 models.dev 全量同步之后（自动调度与手动按钮共用同一入口）。
 
 ## 存量缓存口径重算（已实现，recalcCachedInputCosts）
 
-`pricing.recalcCachedInputCosts(db, pricing)`：计费语义修复前 codex/gemini/grok 三源的历史明细（semantics=1）按「input 全额计价」被高估；本函数扫描这三源的 semantics=1 行，以新公式按**当前活定价**重算并回写，delta 增量修正对应 rollup（不变量与零成本回填一致）。
+`pricing.recalcCachedInputCosts(db, pricing)`：计费语义修复前 codex/gemini/grok 三源的历史明细（semantics=1）按「input 全额计价」被高估；本函数扫描 **semantics=1 七源**（`app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')`——2026-09-10 随第二批 14 数据源接入由三源扩为七源，workbuddy/codebuddy/qwen/reasonix 新增行同样需扣缓存计价；zcode 虽同为 semantics=1，但自接入起即按扣缓存口径计费，不在本候选与 v12 索引内），以新公式按**当前活定价**重算并回写，delta 增量修正对应 rollup（不变量与零成本回填一致）。候选扫描命中 v12 重建的 `idx_usage_records_cached_input` 部分索引（见 [数据模型](data-model.md)）。
 
 - 与迁移的分工：v4 迁移只做纯 SQL 的 opencode semantics 标注修正（1→2）；费用重算需要活定价而 migrate() 为同步纯 SQL,故落地为独立函数由宿主**启动序列**异步调用一次。
 - 幂等：重算值与现值一致（delta=0）即跳过零写入,重复调用 updated=0;阶段二 UPDATE 附带 `cost_usd IS ?` 乐观守卫（NULL 安全），防覆盖并发写入。
 - rollup 行缺失时不创建（同零成本回填口径）。
+- 分批执行（2026-08-26 防阻塞第二轮，与 backfillZeroCost 同构）：rowid 游标按 `REPRICE_BATCH_SIZE = 500` 逐批扫描，每批「事务外取价计算 → 单事务原子提交」，批间 setImmediate 让出事件循环；候选查询命中 `idx_usage_records_cached_input` 部分索引（v7 建立、v12 按七源重建，见 [数据模型](data-model.md)），稳态不再全表扫描。
 
 ## 关联页面
 

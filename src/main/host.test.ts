@@ -24,13 +24,7 @@ vi.mock('./services/cli-version', () => ({
   detectCliVersion: vi.fn(async (command: string) => (command === 'claude' ? '9.9.9' : null))
 }))
 
-/**
- * 集成测试：宿主装配（createHost）+ 采集（collector.syncAll）+ IPC（registerIpcHandlers）。
- * 不依赖真实 ~/.claude：beforeEach 用 vi.spyOn 把 os.homedir 指向临时目录，
- * claude 插件即扫描临时目录下的 .claude/projects 会话 JSONL。
- */
 
-/** 可注入的 fake ipcMain（记录 handler 并支持 invoke；handler 同步抛错转为 rejection，对齐 ipcRenderer.invoke 语义） */
 type FakeIpc = IpcMainLike & {
   invoke(channel: string, ...args: unknown[]): Promise<unknown>
 }
@@ -50,7 +44,6 @@ function makeFakeIpcMain(): FakeIpc {
 
 const USER_TS = '2026-08-19T10:00:00+08:00'
 
-/** claude 会话 JSONL 单行（assistant + message.usage） */
 function claudeLine(model: string, input: number, output: number, timestamp: string = USER_TS): string {
   return JSON.stringify({
     type: 'assistant',
@@ -66,7 +59,6 @@ function claudeLine(model: string, input: number, output: number, timestamp: str
   })
 }
 
-/** 在临时 homedir 下写一个 claude 会话文件，返回绝对路径（不带尾随 \n，游标语义与插件测试一致） */
 function writeClaudeSession(project: string, file: string, lines: string[]): string {
   const dir = path.join(tempHome, '.claude', 'projects', project)
   mkdirSync(dir, { recursive: true })
@@ -78,34 +70,69 @@ function writeClaudeSession(project: string, file: string, lines: string[]): str
 let tempHome = ''
 let homeSpy: MockInstance<() => string>
 
+const PLUGIN_ISOLATION_ENV_KEYS = [
+  'WORKBUDDY_DIR',
+  'CODEBUDDY_DIR',
+  'CLINE_DIR',
+  'ROO_CODE_DIR',
+  'KILO_CODE_DIR',
+  'QWEN_RUNTIME_DIR',
+  'QODER_DIR',
+  'QODER_CN_DIR',
+  'KIMI_CODE_HOME',
+  'ZED_DIR',
+  'KIRO_DIR',
+  'REASONIX_STATE_HOME',
+  'COMMANDCODE_DIR',
+  'COPILOT_CHAT_DIR'
+]
+
 beforeEach(() => {
   tempHome = mkdtempSync(path.join(os.tmpdir(), 'token-monitor-home-'))
   homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(tempHome)
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({}) })))
+  const isolatedPluginsDir = path.join(tempHome, 'isolated-plugins')
+  mkdirSync(isolatedPluginsDir, { recursive: true })
+  for (const key of PLUGIN_ISOLATION_ENV_KEYS) vi.stubEnv(key, isolatedPluginsDir)
 })
 
 afterEach(() => {
+  vi.unstubAllEnvs()
   homeSpy.mockRestore()
   rmSync(tempHome, { recursive: true, force: true })
   vi.unstubAllGlobals()
 })
 
 describe('createHost 装配', () => {
-  it('listPlugins 返回 8 个内置插件，默认全启用；claude 检测可用', async () => {
+  it('listPlugins 返回 22 个内置插件，默认全启用；claude 检测可用', async () => {
     mkdirSync(path.join(tempHome, '.claude', 'projects'), { recursive: true })
     const host = await createHost({ dataDir: ':memory:' })
     try {
       const statuses = await host.collector.getPluginStatus()
-      expect(statuses).toHaveLength(8)
+      expect(statuses).toHaveLength(22)
       expect(statuses.map((s) => s.id).sort()).toEqual([
         'claude',
+        'cline',
+        'codebuddy',
         'codex',
+        'command-code',
+        'copilot-chat',
         'dsh',
         'gemini',
         'grok',
+        'kilo-code',
+        'kimi',
+        'kiro',
         'opencode',
         'pi',
-        'zcode'
+        'qoder',
+        'qoder-cn',
+        'qwen',
+        'reasonix',
+        'roo-code',
+        'workbuddy',
+        'zcode',
+        'zed'
       ])
       for (const s of statuses) expect(s.enabled).toBe(true)
 
@@ -135,7 +162,6 @@ describe('createHost 装配', () => {
   })
 
   it('IPC 冒烟：budget:status 贯通——今日费用可见，设置预算后超限告警', async () => {
-    // 时间戳取「现在」，保证 rollup 归桶落在本地今天（预算口径为当日/当月）
     writeClaudeSession('proj-a', 'session-1.jsonl', [
       claudeLine('claude-sonnet-4-5', 1_000_000, 0, new Date().toISOString())
     ])
@@ -145,7 +171,6 @@ describe('createHost 装配', () => {
     try {
       await host.collector.syncAll()
 
-      // 未设置预算：不告警，但今日费用可见（seed 价 input $3/M → 3 USD）
       const unset = (await ipc.invoke('budget:status')) as BudgetStatus
       expect(unset.dailyBudgetUsd).toBeNull()
       expect(unset.monthlyBudgetUsd).toBeNull()
@@ -154,7 +179,6 @@ describe('createHost 装配', () => {
       expect(unset.monthlyExceeded).toBe(false)
       expect(unset.dailyCostUsd).toBe('3')
 
-      // 设置日预算 2 < 今日费用 3 → 日超限；月上限未设 → 月维度不告警
       host.updateSettings({ dailyBudgetUsd: 2 })
       const over = await host.getBudgetStatus()
       expect(over.dailyBudgetUsd).toBe(2)
@@ -206,7 +230,6 @@ describe('collector.syncAll 采集链路', () => {
       await host.collector.syncAll()
       expect((await host.usageQuery.getUsageSummary({})).totalRequests).toBe(1)
 
-      // 覆盖为 3 行（保留原第 1 行 + 新增 2 行）
       writeFileSync(
         file,
         [
@@ -217,7 +240,7 @@ describe('collector.syncAll 采集链路', () => {
         'utf8'
       )
       const result = await host.collector.syncAll()
-      expect(result.addedRecords).toBe(2) // 去重后仅新增 2 行
+      expect(result.addedRecords).toBe(2)
 
       const summary = await host.usageQuery.getUsageSummary({})
       expect(summary.totalRequests).toBe(3)
@@ -234,10 +257,8 @@ describe('collector.syncAll 采集链路', () => {
     const host = await createHost({ dataDir: ':memory:' })
     try {
       await host.collector.syncAll()
-      // seed 价格 input 3/M → 1M token = 3 USD
       expect((await host.usageQuery.getRequestLogDetail(`claude:${file}:1`))?.costUsd).toBe('3')
 
-      // 更新定价（input 3 → 6）并失效 pricing 缓存
       const row = (await host.storage.getModelPricing()).find(
         (r) => r.model_id === 'claude-sonnet-4-5'
       )
@@ -249,7 +270,6 @@ describe('collector.syncAll 采集链路', () => {
       })
       host.pricing.invalidateCache()
 
-      // 追加一行 → 新记录按新价计算 = 6 USD
       writeFileSync(
         file,
         [
@@ -272,13 +292,11 @@ describe('collector.syncAll 采集链路', () => {
     try {
       writeClaudeSession('proj-a', 'session-1.jsonl', [claudeLine('claude-sonnet-4-5', 100, 0)])
       await host.collector.syncAll()
-      // 等待 EventBus 200ms 防抖窗口结束
       await new Promise((resolve) => setTimeout(resolve, 300))
       expect(received).toHaveLength(1)
       expect(received[0].addedRecords).toBe(1)
       expect(received[0].updatedAt).toBeGreaterThan(0)
 
-      // 无新增时不触发
       await host.collector.syncAll()
       await new Promise((resolve) => setTimeout(resolve, 300))
       expect(received).toHaveLength(1)
@@ -300,11 +318,9 @@ describe('插件启停（经 IPC）', () => {
       await host.collector.syncAll()
       expect((await host.usageQuery.getUsageSummary({})).totalRequests).toBe(1)
 
-      // 停用 claude：注册表置为禁用 + 卸载（watcher 一并清理）
       await ipc.invoke('plugins:set-enabled', 'claude', false)
       expect((await host.collector.getPluginStatus()).find((s) => s.id === 'claude')?.enabled).toBe(false)
 
-      // 追加行后同步：claude 被跳过，不新增
       writeFileSync(
         file,
         [
@@ -316,7 +332,6 @@ describe('插件启停（经 IPC）', () => {
       await host.collector.syncAll()
       expect((await host.usageQuery.getUsageSummary({})).totalRequests).toBe(1)
 
-      // 重新启用后可再次同步
       await ipc.invoke('plugins:set-enabled', 'claude', true)
       await host.collector.syncAll()
       expect((await host.usageQuery.getUsageSummary({})).totalRequests).toBe(2)
@@ -336,7 +351,6 @@ describe('插件启停（经 IPC）', () => {
       await host.collector.syncAll()
       expect((await host.usageQuery.getUsageSummary({})).totalRequests).toBe(1)
 
-      // 连续 5 轮启停：每轮 mount/unmount（watcher 注册/清理）都应可逆、无异常
       for (let i = 0; i < 5; i++) {
         await ipc.invoke('plugins:set-enabled', 'claude', false)
         expect((await host.collector.getPluginStatus()).find((s) => s.id === 'claude')?.enabled).toBe(false)
@@ -347,7 +361,6 @@ describe('插件启停（经 IPC）', () => {
         expect(host.lifecycle.isMounted('claude')).toBe(true)
       }
 
-      // 最终处于启用状态，追加行可正常同步
       writeFileSync(
         file,
         [
@@ -426,7 +439,6 @@ describe('createCollector 插件注入', () => {
   })
 })
 
-/** models.dev api.json 最小载荷：1 有效 + 1 解析丢弃 + 1 无 models 的 provider */
 const MODELSDEV_PAYLOAD = {
   anthropic: {
     name: 'Anthropic',
@@ -453,7 +465,6 @@ function stubModelsDevFetch(): ReturnType<typeof vi.fn> {
 
 const MINUTE_MS = 60 * 1000
 
-/** 测试定价项（默认 in 3 / out 15 USD 每百万 → 1M input token = 3 USD） */
 function testPricing(modelId: string, overrides: Partial<ModelPricingRow> = {}): ModelPricingRow {
   return {
     model_id: modelId,
@@ -475,29 +486,24 @@ describe('models.dev 定价目录（T8 主进程侧）', () => {
     const fetchMock = stubModelsDevFetch()
     const host = await createHost({ dataDir: ':memory:' })
     try {
-      // 启动序列在错峰延迟（10 秒）后同步一次并入库（sync 来源），覆盖 seed 兜底价
       await vi.advanceTimersByTimeAsync(10_000)
       expect(fetchMock).toHaveBeenCalledTimes(1)
       expect(
         (await host.storage.getModelPricing()).find((r) => r.model_id === 'claude-test-model')
       ).toMatchObject({ source: 'sync' })
 
-      // 未满一个周期不触发；此时更新 retentionDays/syncIntervalMs 均不应重置/启停 pricing 调度
       await vi.advanceTimersByTimeAsync(MINUTE_MS)
       expect(fetchMock).toHaveBeenCalledTimes(1)
       host.updateSettings({ retentionDays: 30 })
       host.updateSettings({ syncIntervalMs: 60_000 })
 
-      // 自注册起满一个周期（5 分钟）：周期同步触发，且未被设置更新重置
       await vi.advanceTimersByTimeAsync(MINUTE_MS * 4)
       expect(fetchMock).toHaveBeenCalledTimes(2)
 
-      // 改定价同步间隔为 1 分钟：stop+重启，从变更时刻起按新周期触发
       host.updateSettings({ pricingSyncIntervalMs: MINUTE_MS })
       await vi.advanceTimersByTimeAsync(MINUTE_MS)
       expect(fetchMock).toHaveBeenCalledTimes(3)
 
-      // 继续按新周期（1 分钟）触发，而非原 5 分钟节奏
       await vi.advanceTimersByTimeAsync(MINUTE_MS)
       expect(fetchMock).toHaveBeenCalledTimes(4)
     } finally {
@@ -513,7 +519,6 @@ describe('models.dev 定价目录（T8 主进程侧）', () => {
     const ipc = makeFakeIpcMain()
     registerIpcHandlers(ipc, host, () => null)
     try {
-      // 手动全量同步：fetched = imported + skipped
       await expect(ipc.invoke('pricing:modelsdev-sync')).resolves.toEqual({
         fetched: 2,
         imported: 1,
@@ -532,15 +537,12 @@ describe('models.dev 定价目录（T8 主进程侧）', () => {
 describe('过期明细清理调度（清理前尽力回填）', () => {
   it('启动 sweep 先回填再清理：超期零成本明细已删除，其费用保留在日聚合中', async () => {
     vi.useFakeTimers()
-    // 模型不在 seed 定价目录 → 入库时 calcCost 无价，cost_usd 为 NULL；
-    // created_at 取 400 天前，默认 retentionDays=90 下必过期
     const oldTs = new Date(Date.now() - 400 * 86_400_000).toISOString()
     const file = writeClaudeSession('proj-a', 'session-old.jsonl', [
       claudeLine('unknown-model-x', 1_000_000, 0, oldTs)
     ])
     const host = await createHost({ dataDir: ':memory:' })
     try {
-      // 冲刷启动序列（models.dev 同步 + 零成本回填）：此时模型仍无价，不会提前回填
       await vi.advanceTimersByTimeAsync(0)
       await host.collector.syncAll()
       expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toMatchObject({
@@ -548,17 +550,12 @@ describe('过期明细清理调度（清理前尽力回填）', () => {
       })
       expect((await host.usageQuery.getUsageSummary({})).totalCost).toBe('0')
 
-      // 给该模型补价并失效缓存：只有「清理前的回填」能解锁这笔费用
       await host.storage.updateModelPricing(testPricing('unknown-model-x'))
       host.pricing.invalidateCache()
 
-      // 推过 RETENTION_SWEEP_DELAY_MS：启动 sweep 执行「先回填 → 后清理」
-      await vi.advanceTimersByTimeAsync(30_000)
+      await vi.advanceTimersByTimeAsync(45_000)
 
-      // 明细已被清理……
       expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toBeNull()
-      // ……但 rollup 带上了被清理行的费用（1M input × $3/M = 3 USD）：
-      // 清理只删明细不删 rollup，若清理前未回填，此处将保持 '0'
       const summary = await host.usageQuery.getUsageSummary({})
       expect(summary.totalCost).toBe('3')
       expect(summary.totalRequests).toBe(1)
@@ -581,15 +578,12 @@ describe('过期明细清理调度（清理前尽力回填）', () => {
       await host.collector.syncAll()
       expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).not.toBeNull()
 
-      // 让回填第一步查价即抛错（该行零成本必命中候选，getPrice 必被调用）
       vi.spyOn(host.pricing, 'getPrice').mockRejectedValue(new Error('pricing unavailable'))
 
-      await vi.advanceTimersByTimeAsync(30_000)
+      await vi.advanceTimersByTimeAsync(45_000)
 
-      // 回填失败仅记日志，清理照常执行
       expect(await host.usageQuery.getRequestLogDetail(`claude:${file}:1`)).toBeNull()
       expect(errorSpy).toHaveBeenCalledWith('[host] 清理前零成本回填失败:', expect.any(Error))
-      // 宿主未崩溃：查询与退出清理均正常
       expect((await host.usageQuery.getUsageSummary({})).totalRequests).toBe(1)
     } finally {
       errorSpy.mockRestore()
