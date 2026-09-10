@@ -4,7 +4,7 @@ title: 定价与费用
 description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填与存量缓存口径重算；费用 = fresh_input × input 价 + 其余 token × 各自价格，input 按 semantics 三态扣减。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-09-10T05:57:12+08:00
+timestamp: 2026-09-10T20:51:31+08:00
 ---
 
 # 定价与费用
@@ -40,8 +40,8 @@ timestamp: 2026-09-10T05:57:12+08:00
 
 22 源实际口径（首批 8 源经 2026-08-23 上游源码逐一核实；第二批 14 源于 2026-09-10 接入，semantics 依据各自上游源码/实测核定，逐源依据见 [监控插件](monitor-plugins.md)）：
 
-- **semantics=1（input 为含缓存总量，扣 read+write，共七源）**：codex / gemini / grok / zcode（首批四源，write 桶实际恒为 0）+ workbuddy / codebuddy（`rawUsage.prompt_tokens` 含缓存命中）/ qwen（`inputTokens` 含 `cachedTokens`）/ reasonix（`prompt = cache_hit + cache_miss`）。
-- **semantics=2（纯新输入，不扣，共十二源）**：claude / opencode（上游已自行扣减缓存）/ pi / dsh（首批）+ cline / roo-code / kilo-code / kimi / zed / command-code / copilot-chat（第二批）。
+- **semantics=1（input 为含缓存总量，扣 read+write，共八源）**：codex / gemini / grok / zcode（首批四源，write 桶实际恒为 0）+ workbuddy / codebuddy（`rawUsage.prompt_tokens` 含缓存命中）/ qwen（`inputTokens` 含 `cachedTokens`）/ reasonix（`prompt = cache_hit + cache_miss`）。
+- **semantics=2（纯新输入，不扣，共十一源）**：claude / opencode（上游已自行扣减缓存）/ pi / dsh（首批）+ cline / roo-code / kilo-code / kimi / zed / command-code / copilot-chat（第二批）。
 - **semantics=0（未知，全额保守计价不扣，共三源）**：qoder / qoder-cn（`prompt_tokens` 与 `cached_tokens` 包含关系存疑）/ kiro（explicit 计数恒 0 待验证）。
 
 旧公式对 semantics=1 全额计价曾造成缓存部分重复计费、费用系统性高估，已修复。
@@ -101,7 +101,7 @@ IPC 仅两通道：`pricing:list`（只读列表）/ `pricing:modelsdev-sync`（
 
 ## 存量缓存口径重算（已实现，recalcCachedInputCosts）
 
-`pricing.recalcCachedInputCosts(db, pricing)`：计费语义修复前 codex/gemini/grok 三源的历史明细（semantics=1）按「input 全额计价」被高估；本函数扫描 **semantics=1 七源**（`app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')`——2026-09-10 随第二批 14 数据源接入由三源扩为七源，workbuddy/codebuddy/qwen/reasonix 新增行同样需扣缓存计价），以新公式按**当前活定价**重算并回写，delta 增量修正对应 rollup（不变量与零成本回填一致）。候选扫描命中 v12 重建的 `idx_usage_records_cached_input` 部分索引（见 [数据模型](data-model.md)）。
+`pricing.recalcCachedInputCosts(db, pricing)`：计费语义修复前 codex/gemini/grok 三源的历史明细（semantics=1）按「input 全额计价」被高估；本函数扫描 **semantics=1 七源**（`app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')`——2026-09-10 随第二批 14 数据源接入由三源扩为七源，workbuddy/codebuddy/qwen/reasonix 新增行同样需扣缓存计价；zcode 虽同为 semantics=1，但自接入起即按扣缓存口径计费，不在本候选与 v12 索引内），以新公式按**当前活定价**重算并回写，delta 增量修正对应 rollup（不变量与零成本回填一致）。候选扫描命中 v12 重建的 `idx_usage_records_cached_input` 部分索引（见 [数据模型](data-model.md)）。
 
 - 与迁移的分工：v4 迁移只做纯 SQL 的 opencode semantics 标注修正（1→2）；费用重算需要活定价而 migrate() 为同步纯 SQL,故落地为独立函数由宿主**启动序列**异步调用一次。
 - 幂等：重算值与现值一致（delta=0）即跳过零写入,重复调用 updated=0;阶段二 UPDATE 附带 `cost_usd IS ?` 乐观守卫（NULL 安全），防覆盖并发写入。

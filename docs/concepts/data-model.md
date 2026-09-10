@@ -1,10 +1,10 @@
 ---
 type: data-model
 title: 数据模型
-description: SQLite 六张核心表：明细、日聚合、定价、同步游标、去重账本；失败可观测性扩展（http_status/error_message，v8/v9）；小时物化 v10、联合索引 v11 与缓存口径七源部分索引 v12。
+description: SQLite 六张核心表：明细、日聚合、小时聚合、定价、同步游标、去重账本；失败可观测性扩展（http_status/error_message，v8/v9）；小时物化 v10、联合索引 v11 与缓存口径七源部分索引 v12。
 tags: [data-model, sqlite, schema, usage, failure-observability]
 resource: src/main/services/db.ts
-timestamp: 2026-09-10T05:57:12+08:00
+timestamp: 2026-09-10T20:51:16+08:00
 ---
 
 # 数据模型
@@ -165,7 +165,7 @@ CREATE INDEX idx_usage_records_app_created ON usage_records (app_type, created_a
 - `app_type` 直接区分监控对象（插件 id）：22 个内置插件（首批 8 源 `claude / codex / opencode / gemini / grok / pi / zcode / dsh` + 第二批 14 源 `workbuddy / codebuddy / cline / roo-code / kilo-code / qwen / qoder / qoder-cn / kimi / zed / kiro / reasonix / command-code / copilot-chat`，无 provider 维度）。
 - `data_source` 与插件 id 对应，标识数据来源插件。
 - `model` 为归一化后模型 ID（计费用）；`raw_model` 保留日志原始名。
-- `input_semantics`（SSOT 三态）：**0=未知 / 1=input 为含缓存读写的总量（计费前需扣减缓存）/ 2=input 已为纯新输入**。22 源实际取值：semantics=1（七源）——codex、gemini、grok、zcode（首批）+ workbuddy、codebuddy、qwen、reasonix（第二批）；semantics=2（十二源）——claude、opencode（上游已自行扣减）、pi、dsh（首批）+ cline、roo-code、kilo-code、kimi、zed、command-code、copilot-chat（第二批）；semantics=0（三源）——qoder、qoder-cn、kiro（第二批，包含关系存疑/explicit 恒 0 待验证）。费用侧按此扣减，见 [定价与费用](pricing.md)。
+- `input_semantics`（SSOT 三态）：**0=未知 / 1=input 为含缓存读写的总量（计费前需扣减缓存）/ 2=input 已为纯新输入**。22 源实际取值：semantics=1（八源；其中 v12 索引与存量重算候选为七源、不含 zcode）——codex、gemini、grok、zcode（首批）+ workbuddy、codebuddy、qwen、reasonix（第二批）；semantics=2（十一源）——claude、opencode（上游已自行扣减）、pi、dsh（首批）+ cline、roo-code、kilo-code、kimi、zed、command-code、copilot-chat（第二批）；semantics=0（三源）——qoder、qoder-cn、kiro（第二批，包含关系存疑/explicit 恒 0 待验证）。费用侧按此扣减，见 [定价与费用](pricing.md)。
 - 费用精度：`cost_usd` 以字符串存储避免浮点误差，聚合时统一转为整数微美元累加再回写字符串。
 - `project` / `session_id` 记录会话归属（可选）。
 - `status` 三态语义（v1 起列，v8 起失败可观测）：

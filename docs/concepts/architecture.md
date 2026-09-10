@@ -4,13 +4,13 @@ title: 总体架构
 description: 插件宿主（Electron 主进程）承担全部数据逻辑，渲染进程经 preload contextBridge 白名单通信；统计查询经只读 worker 池 offload，采集插件级并发；仪表盘双图与 6 页导航常驻渲染。
 tags: [architecture, electron, main-process, renderer, ipc, plugin-host, worker-pool]
 resource: src/main/
-timestamp: 2026-09-10T05:57:12+08:00
+timestamp: 2026-09-10T20:51:43+08:00
 ---
 
 # 总体架构
 
 > [!note] 当前状态
-> **第一阶段已实现**（2026-08-20）。分层结构落地于 `src/main`（core/、plugins/、services/、ipc/、worker/、workers/、tray.ts）+ `src/preload` + `src/renderer`，与仓库实际代码一致。2026-08-22：IPC 收窄至 17 方法（定价只读化），新增 CLI 版本探测服务，schema 升级至 v3。**2026-08-26：启动拆两阶段（bootstrapHost 快速段 + startServices 阶段二），窗口创建不再被插件装载阻塞；全部 IPC handler 经 `host.ready` 门控；首轮采集错峰延迟触发**。**2026-08-27：统计查询 offload 到只读 worker 线程（`worker/queryClient.ts` + `workers/query-worker.ts`，WAL 共享 DB）；新增系统托盘后台常驻（`tray.ts`，关窗隐藏不退出、单实例锁、closeToTray 设置）；schema 升级至 v10（`usage_hourly_rollups` + 三筛选索引）**。**2026-08-28：IPC 维持 20 方法（当前契约见 `shared/ipc.ts:RendererApi`，现 21 方法 = 20 个 invoke 通道 + `onUsageUpdated` 事件订阅），统计查询通用化为 queryGroupBy；渲染层跨页状态抽为 FilterContext + NavContext；worker/queryClient 池化为 2 worker（重聚合/轻查询分流，in-flight 跨池去重，统一 pending/terminate），采集层插件级有界并发（SYNC_CONCURRENCY=4）+ dsh 目录列举异步化**。**2026-08-29：仪表盘接入趋势双图（请求趋势 Line + Token 四桶/成本堆叠 Area），独立趋势页退役，导航由 7 页缩至 6 页（`NavContext:PageKey` 移除 `trends`）；`App.tsx` 切页改为 `visitedRef` 常驻渲染+`display:none` 切换，查询缓存与渲染优化见 [数据流](data-flow.md)；schema 升级至 v11（`idx_usage_records_model_created`）**。**2026-09-10：渲染层图表库由 Recharts 整体迁移至 ECharts 6.1（按需注册），统一经 `hooks/useECharts.ts` + `components/chart-theme.ts`；新增 QueryState 四态边界 / ToastContext / Toggle / useDismissable 等共享基建，时间范围经 FilterContext 全局化（默认 7d），依赖分包 `echarts|zrender → 'echarts'` chunk；主进程无改动**。
+> **第一阶段已实现**（2026-08-20）。分层结构落地于 `src/main`（core/、plugins/、services/、ipc/、worker/、workers/、tray.ts）+ `src/preload` + `src/renderer`，与仓库实际代码一致。2026-08-22：IPC 收窄至 17 方法（定价只读化），新增 CLI 版本探测服务，schema 升级至 v3。**2026-08-26：启动拆两阶段（bootstrapHost 快速段 + startServices 阶段二），窗口创建不再被插件装载阻塞；全部 IPC handler 经 `host.ready` 门控；首轮采集错峰延迟触发**。**2026-08-27：统计查询 offload 到只读 worker 线程（`worker/queryClient.ts` + `workers/query-worker.ts`，WAL 共享 DB）；新增系统托盘后台常驻（`tray.ts`，关窗隐藏不退出、单实例锁、closeToTray 设置）；schema 升级至 v10（`usage_hourly_rollups` + 三筛选索引）**。**2026-08-28：IPC 维持 20 方法（当前契约见 `shared/ipc.ts:RendererApi`，现 21 方法 = 20 个 invoke 通道 + `onUsageUpdated` 事件订阅），统计查询通用化为 queryGroupBy；渲染层跨页状态抽为 FilterContext + NavContext；worker/queryClient 池化为 2 worker（重聚合/轻查询分流，in-flight 跨池去重，统一 pending/terminate），采集层插件级有界并发（SYNC_CONCURRENCY=4）+ dsh 目录列举异步化**。**2026-08-29：仪表盘接入趋势双图（请求趋势 Line + Token 四桶/成本堆叠 Area），独立趋势页退役，导航由 7 页缩至 6 页（`NavContext:PageKey` 移除 `trends`）；`App.tsx` 切页改为 `visitedRef` 常驻渲染+`display:none` 切换，查询缓存与渲染优化见 [数据流](data-flow.md)；schema 升级至 v11（`idx_usage_records_model_created`）**。**2026-09-10：渲染层图表库由 Recharts 整体迁移至 ECharts 6.1（按需注册），统一经 `hooks/useECharts.ts` + `components/chart-theme.ts`；新增 QueryState 四态边界 / ToastContext / Toggle / useDismissable 等共享基建，时间范围经 FilterContext 全局化（默认 7d），依赖分包 `echarts|zrender → 'echarts'` chunk**。**同日第二批 14 数据源接入**：主进程新增 14 个插件源码与 `_lib/` 共享解析内核、`BUILTIN_PLUGINS` 登记 8 → 22（见 [监控插件](monitor-plugins.md)）；`shared/app.ts` 的 `AppType`、`CLI_VERSION_COMMANDS` 等类型/常量各补 14 键；db 升级 v12 重建七源缓存口径索引、`pricing.recalcCachedInputCosts` 候选同步扩源（见 [数据模型](data-model.md) 与 [定价与费用](pricing.md)）**。
 
 ## 分层结构
 
@@ -32,7 +32,7 @@ Electron 主进程（插件宿主）
 │   ├── modelsdev.ts   models.dev 目录拉取与定价同步
 │   ├── budget.ts      预算状态计算（只读 rollups 算今日/本月费用与占比）
 │   ├── cli-version.ts CLI 版本探测（execFile <cli> --version，进程级缓存）
-│   ├── db.ts          建库与迁移（v1 建表 → v10 小时物化+筛选索引；启用 WAL）+ 只读连接工厂
+│   ├── db.ts          建库与迁移（v1 建表 → v12 缓存口径七源索引重建，其间 v8/v9 失败列与存量回溯、v10 小时物化+筛选索引、v11 联合索引；启用 WAL）+ 只读连接工厂
 │   └── retention.ts   明细保留清理
 ├── worker/        主线程侧 worker 客户端
 │   └── queryClient.ts 统计查询 RPC 客户端（2 worker 池：重聚合→pool[0]/轻查询→pool[1]；in-flight 跨池去重；统一 nextId/pending/terminate；:memory: 回退直查）
