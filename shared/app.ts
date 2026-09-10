@@ -21,6 +21,15 @@ export type AppType =
   | 'reasonix'
   | 'command-code'
   | 'copilot-chat'
+  | 'dev-eco'
+  | 'mimo'
+  | 'goose'
+  | 'copilot-cli'
+  | 'gptme'
+  | 'trae-agent'
+  | 'codewhale'
+  | 'droid'
+  | 'minimax'
 
 export type ServiceKey = 'storage' | 'pricing' | 'events' | 'scheduler' | 'watcher'
 

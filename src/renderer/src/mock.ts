@@ -81,7 +81,16 @@ const APP_MODELS: Record<AppType, string[]> = {
   kiro: [],
   reasonix: [],
   'command-code': [],
-  'copilot-chat': []
+  'copilot-chat': [],
+  'dev-eco': [],
+  mimo: [],
+  goose: [],
+  'copilot-cli': [],
+  gptme: [],
+  'trae-agent': [],
+  codewhale: [],
+  droid: [],
+  minimax: []
 }
 
 const APP_WEIGHTS: Array<[AppType, number]> = [
