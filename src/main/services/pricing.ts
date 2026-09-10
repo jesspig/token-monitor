@@ -1189,7 +1189,7 @@ export async function recalcCachedInputCosts(
            cache_read_tokens, cache_creation_tokens, input_semantics,
            cost_usd, created_at, file_path, line, rowid AS rid
     FROM usage_records
-    WHERE app_type IN ('codex', 'gemini', 'grok') AND input_semantics = 1 AND rowid > ?
+    WHERE app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix') AND input_semantics = 1 AND rowid > ?
     ORDER BY rowid
     LIMIT ?
     `

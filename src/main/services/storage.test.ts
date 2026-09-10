@@ -45,7 +45,7 @@ describe('数据库迁移', () => {
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(11)
+      expect(db.pragma('user_version', { simple: true })).toBe(12)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
@@ -298,7 +298,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     expect(db.pragma('user_version', { simple: true })).toBe(2)
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(11)
+    expect(db.pragma('user_version', { simple: true })).toBe(12)
 
     const zeroCount = db.prepare(`SELECT COUNT(*) AS c FROM usage_records WHERE ${ZERO_COND}`).get() as { c: number }
     expect(zeroCount.c).toBe(0)
@@ -373,7 +373,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     db.pragma('user_version = 2')
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(11)
+    expect(db.pragma('user_version', { simple: true })).toBe(12)
     expect(snapshot()).toEqual(before)
   })
 })
@@ -453,7 +453,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(11)
+      expect(db.pragma('user_version', { simple: true })).toBe(12)
       const rows = db
         .prepare('SELECT id, input_semantics FROM usage_records ORDER BY id')
         .all() as { id: string; input_semantics: number }[]
@@ -468,12 +468,12 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
     }
   })
 
-  it('全新库直接建至 v9，重复迁移幂等', () => {
+  it('全新库直接建至 v12，重复迁移幂等', () => {
     const db = createDatabase(':memory:')
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(11)
+      expect(db.pragma('user_version', { simple: true })).toBe(12)
     } finally {
       db.close()
     }
@@ -495,7 +495,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       db.pragma('user_version = 3')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(11)
+      expect(db.pragma('user_version', { simple: true })).toBe(12)
       expect(snapshot()).toEqual(before)
     } finally {
       db.close()
@@ -529,7 +529,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(11)
+      expect(db.pragma('user_version', { simple: true })).toBe(12)
       const dsh = db
         .prepare('SELECT COUNT(*) AS c FROM sync_cursors WHERE file_path LIKE ?')
         .get('%\\.dsh\\sessions%') as { c: number }
@@ -556,7 +556,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       db.pragma('user_version = 4')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(11)
+      expect(db.pragma('user_version', { simple: true })).toBe(12)
       expect(snapshot()).toEqual([])
       expect(before).toHaveLength(1)
     } finally {

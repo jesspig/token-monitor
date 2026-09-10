@@ -8,7 +8,21 @@ export const APP_META: Record<AppType, { label: string; badge: string }> = {
   grok: { label: 'Grok', badge: 'bg-violet-500/15 text-violet-300 border-violet-500/30' },
   pi: { label: 'Pi', badge: 'bg-amber-500/15 text-amber-300 border-amber-500/30' },
   zcode: { label: 'ZCode', badge: 'bg-rose-500/15 text-rose-300 border-rose-500/30' },
-  dsh: { label: 'DSH', badge: 'bg-teal-500/15 text-teal-300 border-teal-500/30' }
+  dsh: { label: 'DSH', badge: 'bg-teal-500/15 text-teal-300 border-teal-500/30' },
+  workbuddy: { label: 'WorkBuddy', badge: 'bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30' },
+  codebuddy: { label: 'CodeBuddy', badge: 'bg-purple-500/15 text-purple-300 border-purple-500/30' },
+  cline: { label: 'Cline', badge: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30' },
+  'roo-code': { label: 'Roo Code', badge: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30' },
+  'kilo-code': { label: 'Kilo Code', badge: 'bg-lime-500/15 text-lime-300 border-lime-500/30' },
+  qwen: { label: 'Qwen Code', badge: 'bg-green-500/15 text-green-300 border-green-500/30' },
+  qoder: { label: 'Qoder', badge: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30' },
+  'qoder-cn': { label: 'Qoder CN', badge: 'bg-pink-500/15 text-pink-300 border-pink-500/30' },
+  kimi: { label: 'Kimi Code', badge: 'bg-red-500/15 text-red-300 border-red-500/30' },
+  zed: { label: 'Zed', badge: 'bg-slate-500/15 text-slate-300 border-slate-500/30' },
+  kiro: { label: 'Kiro CLI', badge: 'bg-stone-500/15 text-stone-300 border-stone-500/30' },
+  reasonix: { label: 'Reasonix', badge: 'bg-zinc-500/15 text-zinc-300 border-zinc-500/30' },
+  'command-code': { label: 'Command Code', badge: 'bg-gray-500/15 text-gray-300 border-gray-500/30' },
+  'copilot-chat': { label: 'Copilot Chat', badge: 'bg-neutral-500/15 text-neutral-300 border-neutral-500/30' }
 }
 
 export function formatNumber(n: number, locale?: string): string {

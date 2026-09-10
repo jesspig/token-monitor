@@ -93,7 +93,7 @@ describe('detectCliVersion', () => {
 })
 
 describe('常量映射', () => {
-  it('八个监控对象均映射到同名 CLI 命令', () => {
+  it('二十二个监控对象均映射到 CLI 命令（同名直接映射，别名取实际可执行名）', () => {
     expect(CLI_VERSION_COMMANDS).toEqual({
       claude: 'claude',
       codex: 'codex',
@@ -102,7 +102,21 @@ describe('常量映射', () => {
       grok: 'grok',
       pi: 'pi',
       zcode: 'zcode',
-      dsh: 'dsh'
+      dsh: 'dsh',
+      workbuddy: 'workbuddy',
+      codebuddy: 'codebuddy',
+      cline: 'cline',
+      'roo-code': 'roo',
+      'kilo-code': 'kilo',
+      qwen: 'qwen',
+      qoder: 'qoder',
+      'qoder-cn': 'qoder',
+      kimi: 'kimi',
+      zed: 'zed',
+      kiro: 'kiro',
+      reasonix: 'reasonix',
+      'command-code': 'commandcode',
+      'copilot-chat': 'copilot'
     })
   })
 

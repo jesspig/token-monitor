@@ -1,16 +1,16 @@
 ---
 type: data-model
 title: 数据模型
-description: SQLite 六张核心表：明细、日聚合、定价、同步游标、去重账本；失败可观测性扩展（http_status/error_message，v8/v9）；小时物化 v10 与模型-时间联合索引 v11。
+description: SQLite 六张核心表：明细、日聚合、小时聚合、定价、同步游标、去重账本；失败可观测性扩展（http_status/error_message，v8/v9）；小时物化 v10、联合索引 v11 与缓存口径七源部分索引 v12。
 tags: [data-model, sqlite, schema, usage, failure-observability]
 resource: src/main/services/db.ts
-timestamp: 2026-08-29T14:40:04+08:00
+timestamp: 2026-09-10T20:51:16+08:00
 ---
 
 # 数据模型
 
 > [!note] 当前状态
-> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5；2026-08-26 升级至 v6/v7；**2026-08-27 升级至 v8/v9——失败可观测性**；**同日升级至 v10——小时粒度物化 `usage_hourly_rollups` + `usage_records` 三筛选索引**；**2026-08-29 升级至 v11——`usage_records` 新增联合索引 `idx_usage_records_model_created(model, created_at)`**）。六表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；v6 为 `sync_cursors` 增可空列 `byte_offset` 字节游标；v7 为 `usage_records` 新增两个部分索引服务回填/重算候选扫描；**v8 为 `usage_records` 新增 `http_status` / `error_message` 失败可观测列（INTEGER/TEXT，仅失败有效，存量 NULL，见下方 v8）；v9 清空 `sync_cursors` 触发失败记录存量回溯全量重析（见下方 v9）**；**v10 新增 `usage_hourly_rollups` 小时聚合物化表（日聚合镜像的小时版，见下方 v10）并为 `usage_records` 增加 `status` / `project` / `session_id` 三单列索引（服务状态与归属维度筛选，见索引章节）**；**v11 新增 `idx_usage_records_model_created(model, created_at)`（见下方 v11，支撑 `getDailyModelBreakdown` 的 `model + created_at` 范围过滤，24h/7d 等趋势查询由预聚合快路径覆盖后该索引主要兜底带维度过滤的回退明细路径）**；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`，**自 v10 起启用 WAL（`journal_mode = WAL`，见下方「WAL 与并发读」）**。
+> **已实现**（2026-08-20；2026-08-22 schema 升级至 v3；2026-08-23 升级至 v4；2026-08-25 升级至 v5；2026-08-26 升级至 v6/v7；**2026-08-27 升级至 v8/v9——失败可观测性**；**同日升级至 v10——小时粒度物化 `usage_hourly_rollups` + `usage_records` 三筛选索引**；**2026-08-29 升级至 v11——`usage_records` 新增联合索引 `idx_usage_records_model_created(model, created_at)`**；**2026-09-10 升级至 v12——重建 `idx_usage_records_cached_input` 部分索引，semantics=1 组从三源扩为七源**）。六表与迁移（v1 建表；v2 为 `model_pricing` 增加 `source` 列；v3 一次性清理存量四项 token 全 0 明细并对受影响日期重建日聚合；v4 修正 opencode 存量行 `input_semantics` 错标 1→2；v5 清除 dsh 会话文件脏游标触发全量重析；v6 为 `sync_cursors` 增可空列 `byte_offset` 字节游标；v7 为 `usage_records` 新增两个部分索引服务回填/重算候选扫描；**v8 为 `usage_records` 新增 `http_status` / `error_message` 失败可观测列（INTEGER/TEXT，仅失败有效，存量 NULL，见下方 v8）；v9 清空 `sync_cursors` 触发失败记录存量回溯全量重析（见下方 v9）**；**v10 新增 `usage_hourly_rollups` 小时聚合物化表（日聚合镜像的小时版，见下方 v10）并为 `usage_records` 增加 `status` / `project` / `session_id` 三单列索引（服务状态与归属维度筛选，见索引章节）**；**v11 新增 `idx_usage_records_model_created(model, created_at)`（见下方 v11，支撑 `getDailyModelBreakdown` 的 `model + created_at` 范围过滤，24h/7d 等趋势查询由预聚合快路径覆盖后该索引主要兜底带维度过滤的回退明细路径）**；**v12 重建 `idx_usage_records_cached_input` 部分索引（DROP 后重建，`input_semantics = 1 AND app_type IN ('codex','gemini','grok','workbuddy','codebuddy','qwen','reasonix')`，见下方 v12，随第二批 14 数据源接入把 semantics=1 组从三源扩为七源）**；`PRAGMA user_version` 幂等升级）落地于 `src/main/services/db.ts`，DAO 于 `storage.ts`；数据库文件为数据目录下 `token-monitor.db`，**自 v10 起启用 WAL（`journal_mode = WAL`，见下方「WAL 与并发读」）**。
 
 ## 表清单
 
@@ -63,7 +63,7 @@ timestamp: 2026-08-29T14:40:04+08:00
 
 - 创建两个部分索引，WHERE 子句与各自候选查询条件完全一致，使候选枚举走 index scan：
   - `idx_usage_records_zero_cost ON usage_records (cost_usd) WHERE cost_usd IS NULL OR cost_usd = '0'`——零成本回填的候选行；
-  - `idx_usage_records_cached_input ON usage_records (input_semantics) WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok')`——存量缓存口径重算的候选行。
+  - `idx_usage_records_cached_input ON usage_records (input_semantics) WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')`——存量缓存口径重算的候选行（建库时为三源，2026-09-10 v12 迁移 DROP 后按七源重建，见下方 v12）。
 - 动机（2026-08-26 防阻塞第二轮）：两个候选查询此前无任何可用索引，每次执行都是 `usage_records` 全表过滤扫描，且为周期任务、成本随明细量线性上涨；部分索引把稳态扫描成本降为 O(候选数)——稳态下候选集仅为「永久缺价/全免费定价」的滞留行，体量极小。
 - 幂等：`CREATE INDEX IF NOT EXISTS` 保证 user_version 回拨重放安全。配合分批执行消除长事务，见 [定价与费用](pricing.md)。
 
@@ -98,13 +98,19 @@ timestamp: 2026-08-29T14:40:04+08:00
 - 动机：`getDailyModelBreakdown` 的回退明细路径需按 `model IN (...) AND created_at BETWEEN ? AND ? GROUP BY date, model` 扫描，`model + created_at` 联合索引提升范围过滤效率；`canUseRollups` 为真时的主路径已走 `usage_daily_rollups` 预聚合（见下方），该索引主要兜底带 `status/project/sessionId/keyword` 的回退明细路径。
 - 与本次查询快路径的关系：2026-08-29 同步接入 `usage_daily_rollups` 预聚合快路径（见 [数据流](data-flow.md) 与 `usageQuery.ts:queryDailyModelRows`），无维度过滤的趋势/仪表盘查询不再触及明细表；该索引与快路径互为补充——快路径覆盖高频无过滤查询，索引覆盖带维度过滤的回退路径。
 
+## v12 缓存口径索引扩展迁移（已实现，幂等，2026-09-10）
+
+- `DROP INDEX IF EXISTS idx_usage_records_cached_input` 后 `CREATE INDEX IF NOT EXISTS` 重建，WHERE 子句由 `input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok')` 扩为 `IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')`——随第二批 14 数据源接入，semantics=1 组从三源扩为七源（新增 workbuddy / codebuddy / qwen / reasonix，四源 input 均含缓存总量需扣减）。
+- 动机：`pricing.recalcCachedInputCosts` 的候选扫描 SELECT 同步扩为七源（见 [定价与费用](pricing.md)），旧三源索引对新增四源候选无效，会退化为全表过滤扫描；部分索引与候选查询条件保持一致，稳态扫描维持 O(候选数)。
+- 幂等：DROP + `CREATE INDEX IF NOT EXISTS` 保证 `user_version` 回拨重放安全（重建结果确定），仅一次 `fsync`；SQLite 无 `ALTER INDEX`，DROP 重建是该类 WHERE 变更的标准路径。
+
 ## 小时聚合物化表结构（usage_hourly_rollups，v10 新增）
 
 ```sql
 CREATE TABLE usage_hourly_rollups (
   date                  TEXT    NOT NULL,
   hour                  INTEGER NOT NULL,
-  app_type              TEXT    NOT NULL,  -- 插件 id：claude/codex/opencode/gemini/grok/pi/zcode/dsh
+  app_type              TEXT    NOT NULL,  -- 插件 id：22 个内置插件（见监控插件页清单）
   model                 TEXT    NOT NULL,
   request_count         INTEGER NOT NULL DEFAULT 0,
   success_count         INTEGER NOT NULL DEFAULT 0,
@@ -128,7 +134,7 @@ CREATE INDEX idx_usage_hourly_rollups_date ON usage_hourly_rollups (date, app_ty
 CREATE TABLE usage_records (
   id                    TEXT    NOT NULL PRIMARY KEY,
   data_source           TEXT    NOT NULL,
-  app_type              TEXT    NOT NULL,  -- 插件 id：claude/codex/opencode/gemini/grok/pi/zcode/dsh
+  app_type              TEXT    NOT NULL,  -- 插件 id：22 个内置插件（见监控插件页清单）
   model                 TEXT    NOT NULL,  -- 归一化后模型 ID（计费用）
   raw_model             TEXT,               -- 日志原始模型名
   input_tokens          INTEGER NOT NULL DEFAULT 0,
@@ -156,10 +162,10 @@ CREATE INDEX idx_usage_records_app_created ON usage_records (app_type, created_a
 
 ## 明细表要点
 
-- `app_type` 直接区分监控对象（插件 id）：`claude / codex / opencode / gemini / grok / pi / zcode / dsh`（8 个内置插件阶段，无 provider 维度）。
+- `app_type` 直接区分监控对象（插件 id）：22 个内置插件（首批 8 源 `claude / codex / opencode / gemini / grok / pi / zcode / dsh` + 第二批 14 源 `workbuddy / codebuddy / cline / roo-code / kilo-code / qwen / qoder / qoder-cn / kimi / zed / kiro / reasonix / command-code / copilot-chat`，无 provider 维度）。
 - `data_source` 与插件 id 对应，标识数据来源插件。
 - `model` 为归一化后模型 ID（计费用）；`raw_model` 保留日志原始名。
-- `input_semantics`（SSOT 三态）：**0=未知 / 1=input 为含缓存读写的总量（计费前需扣减缓存）/ 2=input 已为纯新输入**。八源实际取值：claude=2、codex=1、opencode=2（上游已自行扣减）、gemini=1、grok=1、pi=2、zcode=1、dsh=2；费用侧按此扣减，见 [定价与费用](pricing.md)。
+- `input_semantics`（SSOT 三态）：**0=未知 / 1=input 为含缓存读写的总量（计费前需扣减缓存）/ 2=input 已为纯新输入**。22 源实际取值：semantics=1（八源；其中 v12 索引与存量重算候选为七源、不含 zcode）——codex、gemini、grok、zcode（首批）+ workbuddy、codebuddy、qwen、reasonix（第二批）；semantics=2（十一源）——claude、opencode（上游已自行扣减）、pi、dsh（首批）+ cline、roo-code、kilo-code、kimi、zed、command-code、copilot-chat（第二批）；semantics=0（三源）——qoder、qoder-cn、kiro（第二批，包含关系存疑/explicit 恒 0 待验证）。费用侧按此扣减，见 [定价与费用](pricing.md)。
 - 费用精度：`cost_usd` 以字符串存储避免浮点误差，聚合时统一转为整数微美元累加再回写字符串。
 - `project` / `session_id` 记录会话归属（可选）。
 - `status` 三态语义（v1 起列，v8 起失败可观测）：

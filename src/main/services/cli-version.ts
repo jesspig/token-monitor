@@ -15,7 +15,21 @@ export const CLI_VERSION_COMMANDS: Record<AppType, string> = {
   grok: 'grok',
   pi: 'pi',
   zcode: 'zcode',
-  dsh: 'dsh'
+  dsh: 'dsh',
+  workbuddy: 'workbuddy',
+  codebuddy: 'codebuddy',
+  cline: 'cline',
+  'roo-code': 'roo',
+  'kilo-code': 'kilo',
+  qwen: 'qwen',
+  qoder: 'qoder',
+  'qoder-cn': 'qoder',
+  kimi: 'kimi',
+  zed: 'zed',
+  kiro: 'kiro',
+  reasonix: 'reasonix',
+  'command-code': 'commandcode',
+  'copilot-chat': 'copilot'
 }
 
 const execFileAsync = promisify(execFile)
