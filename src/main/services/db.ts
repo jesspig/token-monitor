@@ -350,6 +350,18 @@ const MIGRATIONS: Migration[] = [
         CREATE INDEX IF NOT EXISTS idx_usage_records_model_created ON usage_records(model, created_at);
       `)
     }
+  },
+  {
+    version: 12,
+    up(db) {
+      db.exec(`
+        -- 扩展 cached_input 部分索引：覆盖新增 semantics=1 数据源（workbuddy / codebuddy / qwen / reasonix）
+        DROP INDEX IF EXISTS idx_usage_records_cached_input;
+        CREATE INDEX IF NOT EXISTS idx_usage_records_cached_input
+          ON usage_records (input_semantics)
+          WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix');
+      `)
+    }
   }
 ]
 
