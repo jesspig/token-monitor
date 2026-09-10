@@ -67,7 +67,21 @@ const APP_MODELS: Record<AppType, string[]> = {
   grok: ['grok-4'],
   pi: [],
   zcode: [],
-  dsh: []
+  dsh: [],
+  workbuddy: [],
+  codebuddy: [],
+  cline: [],
+  'roo-code': [],
+  'kilo-code': [],
+  qwen: [],
+  qoder: [],
+  'qoder-cn': [],
+  kimi: [],
+  zed: [],
+  kiro: [],
+  reasonix: [],
+  'command-code': [],
+  'copilot-chat': []
 }
 
 const APP_WEIGHTS: Array<[AppType, number]> = [
