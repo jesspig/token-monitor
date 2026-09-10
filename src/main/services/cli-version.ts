@@ -29,7 +29,16 @@ export const CLI_VERSION_COMMANDS: Record<AppType, string> = {
   kiro: 'kiro',
   reasonix: 'reasonix',
   'command-code': 'commandcode',
-  'copilot-chat': 'copilot'
+  'copilot-chat': 'copilot',
+  'dev-eco': 'deveco',
+  mimo: 'mimo',
+  goose: 'goose',
+  'copilot-cli': 'copilot',
+  gptme: 'gptme',
+  'trae-agent': 'trae-cli',
+  codewhale: 'codewhale',
+  droid: 'droid',
+  minimax: 'mcode'
 }
 
 const execFileAsync = promisify(execFile)

@@ -1,22 +1,22 @@
 ---
 type: plugin-implementation
 title: 监控插件
-description: MonitorPlugin 统一接口与 22 个内置监控插件实现清单——首批 8 源（claude/codex/opencode/gemini/grok/pi/zcode/dsh）+ 第二批 14 源（workbuddy/codebuddy/cline/roo-code/kilo-code/qwen/qoder/qoder-cn/kimi/zed/kiro/reasonix/command-code/copilot-chat）；失败可观测性（T01 矩阵，status/errorMessage/httpStatus，覆盖首批 8 源）。
-tags: [plugin, monitor, cli, claude, codex, opencode, gemini, grok, pi, zcode, dsh, failure-observability, workbuddy, codebuddy, cline, roo-code, kilo-code, qwen, qoder, kimi, zed, kiro, reasonix, command-code, copilot-chat]
+description: MonitorPlugin 统一接口与 31 个内置监控插件实现清单——首批 8 源（claude/codex/opencode/gemini/grok/pi/zcode/dsh）+ 第二批 14 源（workbuddy/codebuddy/cline/roo-code/kilo-code/qwen/qoder/qoder-cn/kimi/zed/kiro/reasonix/command-code/copilot-chat）+ 第三批 9 源（dev-eco/mimo/goose/copilot-cli/gptme/trae-agent/codewhale/droid/minimax）；失败可观测性（T01 矩阵，status/errorMessage/httpStatus，覆盖首批 8 源）。
+tags: [plugin, monitor, cli, claude, codex, opencode, gemini, grok, pi, zcode, dsh, failure-observability, workbuddy, codebuddy, cline, roo-code, kilo-code, qwen, qoder, kimi, zed, kiro, reasonix, command-code, copilot-chat, dev-eco, mimo, goose, copilot-cli, gptme, trae-agent, codewhale, droid, minimax, opencode-like]
 resource: src/main/plugins/
-timestamp: 2026-09-10T05:57:12+08:00
+timestamp: 2026-09-11T03:05:47+08:00
 ---
 
 # 监控插件
 
 > [!note] 当前状态
-> **第一阶段 5 个内置插件已实现**（2026-08-20）：`src/main/plugins/{claude,codex,opencode,gemini,grok}.ts`，各有单测覆盖；解析格式均经联网核实。本页清单已按实际实现核对（2026-08-21）；CLI 版本探测于 2026-08-22 接入；语义请求 ID（requestId）与 opencode 语义标注修正/WAL 感知于 2026-08-23 接入；**claude 流式分片折叠与 gemini 新版 JSONL 双格式兼容于 2026-08-23 落地**（五源日志格式已按各 CLI 最新版联网复核）；**pi / zcode / dsh 三插件于 2026-08-23 接入，内置监控对象扩展至 8 个**（格式均经上游源码/社区实测核实）；**dsh 插件模型来源升级为三级 + 会话头状态缓存于 2026-08-24 落地**（经 deepseek-harness 上游源码核实：`assistant/message` 的模型身份在 `data.message.source.model` 而非顶层字段；`request/header` 仅路由/配置变化时稀疏写入——旧两级来源在增量续读时因状态丢失漏采用量，现由 per-file 缓存消除）；**2026-08-25 脏游标收尾**：初版两级来源在真实数据上全部失效（零记录产出却推进满游标），三级修复又被 mtime 短路挡住无法重析，最终由数据库 v5 迁移清除 dsh 会话文件游标触发全量重析自愈（120/120 文件、6084 条入库，见 [数据模型](data-model.md)）；**2026-08-26：dsh zstd 工件升级尾部帧级增量解压（scanZstdFrames + sync_cursors.byte_offset 字节游标），续读只解压新增帧而非整文件**；**同日防阻塞第二轮——dsh 解压下沉 worker_threads 单例线程（10s 超时销毁重建 + 异常环境恒主线程回退）、坏帧切割尝试上限 MAX_CUT_ATTEMPTS=8、pi/dsh detect 存在性短路、grok 映射 summary.json path:mtime 签名缓存**；**2026-08-27：失败请求可观测性接入（T01 矩阵，8 插件各自失败判定，status/errorMessage/httpStatus 全链路，见下方「失败判定」与 [数据模型](data-model.md) v8/v9、[同步与去重](sync-mechanism.md) 失败放行）**；**2026-09-10：第二批 14 个监控数据源接入，内置监控对象扩展至 22 个**（workbuddy/codebuddy/cline/roo-code/kilo-code/qwen/qoder/qoder-cn/kimi/zed/kiro/reasonix/command-code/copilot-chat，类型/DB 层同日预登记、v12 迁移扩展七源缓存口径索引，详见下方「第二批数据源」章节）；失败判定 T01 矩阵当前覆盖首批 8 源，新 14 源按宽松解析不产出 error 记录。
+> **第一阶段 5 个内置插件已实现**（2026-08-20）：`src/main/plugins/{claude,codex,opencode,gemini,grok}.ts`，各有单测覆盖；解析格式均经联网核实。本页清单已按实际实现核对（2026-08-21）；CLI 版本探测于 2026-08-22 接入；语义请求 ID（requestId）与 opencode 语义标注修正/WAL 感知于 2026-08-23 接入；**claude 流式分片折叠与 gemini 新版 JSONL 双格式兼容于 2026-08-23 落地**（五源日志格式已按各 CLI 最新版联网复核）；**pi / zcode / dsh 三插件于 2026-08-23 接入，内置监控对象扩展至 8 个**（格式均经上游源码/社区实测核实）；**dsh 插件模型来源升级为三级 + 会话头状态缓存于 2026-08-24 落地**（经 deepseek-harness 上游源码核实：`assistant/message` 的模型身份在 `data.message.source.model` 而非顶层字段；`request/header` 仅路由/配置变化时稀疏写入——旧两级来源在增量续读时因状态丢失漏采用量，现由 per-file 缓存消除）；**2026-08-25 脏游标收尾**：初版两级来源在真实数据上全部失效（零记录产出却推进满游标），三级修复又被 mtime 短路挡住无法重析，最终由数据库 v5 迁移清除 dsh 会话文件游标触发全量重析自愈（120/120 文件、6084 条入库，见 [数据模型](data-model.md)）；**2026-08-26：dsh zstd 工件升级尾部帧级增量解压（scanZstdFrames + sync_cursors.byte_offset 字节游标），续读只解压新增帧而非整文件**；**同日防阻塞第二轮——dsh 解压下沉 worker_threads 单例线程（10s 超时销毁重建 + 异常环境恒主线程回退）、坏帧切割尝试上限 MAX_CUT_ATTEMPTS=8、pi/dsh detect 存在性短路、grok 映射 summary.json path:mtime 签名缓存**；**2026-08-27：失败请求可观测性接入（T01 矩阵，8 插件各自失败判定，status/errorMessage/httpStatus 全链路，见下方「失败判定」与 [数据模型](data-model.md) v8/v9、[同步与去重](sync-mechanism.md) 失败放行）**；**2026-09-10：第二批 14 个监控数据源接入，内置监控对象扩展至 22 个**（workbuddy/codebuddy/cline/roo-code/kilo-code/qwen/qoder/qoder-cn/kimi/zed/kiro/reasonix/command-code/copilot-chat，类型/DB 层同日预登记、v12 迁移扩展七源缓存口径索引，详见下方「第二批数据源」章节）；失败判定 T01 矩阵当前覆盖首批 8 源，新 14 源按宽松解析不产出 error 记录；**2026-09-11：第三批 9 个监控数据源接入，内置监控对象扩展至 31 个**（dev-eco/mimo/goose/copilot-cli/gptme/trae-agent/codewhale/droid/minimax）——12 候选联网侦察（多数源码级核实），cursor-cli/antigravity/crush 三源 NO-GO 排除（见下方「第三批侦察排除」）；db v13 迁移扩展 cached_input 部分索引至十源（见 [数据模型](data-model.md)）；opencode 解析内核抽取为 `src/main/plugins/_lib/opencode-shared.ts`（`createOpencodeLikePluginCore` 工厂）供 opencode 同构 fork（dev-eco/mimo）复用，详见下方「第三批数据源」章节；第三批 9 源同第二批按宽松解析不产出 error 记录，未接入 T01 矩阵；vitest 全量 1061 用例通过。
 
 ## `MonitorPlugin` 接口（实现于 shared/plugin.ts）
 
 ```ts
 interface MonitorPlugin {
-  id: AppType;               // AppType 联合（shared/app.ts）22 个监控对象之一
+  id: AppType;               // AppType 联合（shared/app.ts）31 个监控对象之一
   name: string;              // 显示名
   version: string;           // 插件适配器版本（非被监控 CLI 的实际版本）
   deps?: ServiceKey[];       // 依赖服务，宿主按依赖解析装载顺序
@@ -27,7 +27,7 @@ interface MonitorPlugin {
 }
 ```
 
-`ParsedResult` 含 `records`、`nextLine`（游标推进）、`eof`（是否到文件尾）。22 个内置插件的 `deps` 均为 `['storage','pricing','events']`（workbuddy/codebuddy 经 `createBuddyPlugin` 工厂、qoder/qoder-cn 经 `_lib/qoder-shared` 共享内核产出，deps 一致）。`Detection` 另含可选 `cliVersion?: string | null` 字段（dto 层预留）。
+`ParsedResult` 含 `records`、`nextLine`（游标推进）、`eof`（是否到文件尾）。31 个内置插件的 `deps` 均为 `['storage','pricing','events']`（workbuddy/codebuddy 经 `createBuddyPlugin` 工厂、qoder/qoder-cn 经 `_lib/qoder-shared`、dev-eco/mimo 经 `_lib/opencode-shared` 共享内核产出，deps 一致）。`Detection` 另含可选 `cliVersion?: string | null` 字段（dto 层预留）。
 
 ## CLI 版本探测（已实现）
 
@@ -38,9 +38,9 @@ interface MonitorPlugin {
 - 结果按命令名做进程级缓存（`clearCliVersionCache` 可清空），executor 可注入便于测试；
 - 探测成功以可选字段 `PluginStatus.cliVersion` 返回，失败则字段缺省（UI 显示「未知」）。
 
-## 内置插件清单（22 个 = 首批 8 个 + 第二批 14 个，按实际实现）
+## 内置插件清单（31 个 = 首批 8 个 + 第二批 14 个 + 第三批 9 个，按实际实现）
 
-首批 8 源详表如下；第二批 14 源于 2026-09-10 接入，逐源实现说明见下方「第二批数据源」章节。
+首批 8 源详表如下；第二批 14 源于 2026-09-10 接入，逐源实现说明见下方「第二批数据源」章节；第三批 9 源于 2026-09-11 接入，见「第三批数据源」章节。
 
 | 插件 id | 数据根（可环境变量覆盖） | 扫描范围 | 解析源与关键字段 |
 |---|---|---|---|
@@ -143,6 +143,73 @@ interface MonitorPlugin {
 - **数据位置**：双位置——`%APPDATA%\Code\User\globalStorage\emptyWindowChatSessions\*.jsonl` 与 `%APPDATA%\Code\User\workspaceStorage\<hash>\chatSessions\*.jsonl`；*nix 对应 `~/.config/Code/User/` 同构路径；`COPILOT_CHAT_DIR` 覆盖（语义 = **VS Code User 目录**）
 - **格式**：JSONL chat storage v3 patch 增量流（kind=0 header / kind=1 路径赋值 / kind=2 数组追加，需顺序合并重建状态）；`input_semantics=2`
 - **关键字段**：usage 为 `requests` 条目的 `promptTokens / completionTokens`（patch 演进取终值；全量重析 + requestId 幂等去重应对行号漂移）；model = `modelId` 原样保留（`copilot/claude-haiku-4.5` 等，不走归一化前的猜测）；无 cache 桶（四桶记 0）、无 cost（费用走本地定价）；latencyMs = `elapsedMs`；格式已基于本机 2026-09 实测样本核验（404 个会话文件、171 个真实请求条目）
+
+## 第三批数据源（9 个，已实现，2026-09-11）
+
+2026-09-11 落地：`shared/app.ts` 的 `AppType` 联合、`src/main/services/cli-version.ts` 的 `CLI_VERSION_COMMANDS`、`src/renderer/src/lib/format.ts` 的 `APP_META` 各补齐 9 键；`src/main/services/db.ts` v13 迁移将 `idx_usage_records_cached_input` 部分索引 DROP 后按十源重建（原七源 + `goose`/`copilot-cli`/`trae-agent`），`src/main/services/pricing.ts` 的 `recalcCachedInputCosts` 选中 SQL 同步扩为十源；插件文件（`src/main/plugins/<id>.ts`，各配单测）与 `src/main/host.ts` 的 `BUILTIN_PLUGINS` 31 项登记完成。本轮接入前对 12 候选做联网侦察（多数源码级核实），cursor-cli/antigravity/crush 三源 NO-GO 排除（见下方「第三批侦察排除」）；**opencode 解析内核抽取为 `src/main/plugins/_lib/opencode-shared.ts`**（`createOpencodeLikePluginCore` 工厂：db/JSON 双解析器、`time_created` 水位游标、失败探测、250ms busy 短超时），opencode 主插件与同构 fork 共用。第三批 9 源同第二批：宽松解析、不产出 error 记录，未接入 T01 失败判定矩阵。semantics 取值约定同上节。9 源 semantics 分配汇总：**1**（input 含缓存总量需扣减）= goose / copilot-cli（整体）；**2**（纯新输入）= dev-eco / mimo / gptme / droid / minimax（整体）；**0**（未知）= codewhale；**trae-agent 行级混合**（provider=anthropic → 2，openai/google/azure/doubao/openrouter/ollama 等 → 1，源自各 client 映射源码）。
+
+### DevEco Code（`dev-eco`，已实现）
+
+- **数据位置**：`~/.local/share/deveco`（Windows `%USERPROFILE%\.local\share\deveco`，xdg-basedir 回退同构）；`DEVECO_DIR` 覆盖（测试钩子兼根覆盖）、`XDG_DATA_HOME` 间接生效（其下 `deveco`）、`DEVECO_DB` 整体覆盖 db 文件；候选 `deveco.db` + `deveco-beta.db` / `deveco-prod.db` 通道变体
+- **格式**：SQLite（只读，250ms busy 短超时），与 opencode.db **完全同构**（华为 opencode fork，源码级核实：message/part/session 表结构与 data JSON 逐字段一致）
+- **关键字段**：复用 `_lib/opencode-shared.ts` 内核（`createOpencodeLikePluginCore` 工厂，appType 换 `dev-eco`）；`input_semantics=2`；requestId = message.id；游标 = `time_created` 水位；条目 mtime 取主库与 `-wal` 较大值（WAL 感知）
+
+### MiMo Code（`mimo`，已实现）
+
+- **数据位置**：`~/.local/share/mimocode`（Windows 同构）；`MIMOCODE_HOME` 覆盖时布局多一层 `data/`（`$MIMOCODE_HOME/data/mimocode.db`），插件双布局探测并合并列出；`MIMOCODE_DB` 整体覆盖 db 文件；`MIMO_DIR` 覆盖数据根（测试钩子）；候选 `mimocode.db` + `mimocode-beta.db` / `mimocode-prod.db` 变体
+- **格式**：SQLite（只读，250ms busy 短超时），opencode 同构（小米 fork，源码级核实）
+- **关键字段**：同 dev-eco——复用 `_lib/opencode-shared.ts` 共享内核，`input_semantics=2`，requestId = message.id，`time_created` 水位游标，WAL mtime 感知
+
+### Goose（`goose`，已实现）
+
+- **数据位置**：`~/.local/share/goose/sessions/sessions.db`（Windows `%APPDATA%\Block\goose\data\sessions\sessions.db`）；`GOOSE_PATH_ROOT` → 其下 `data/sessions`；`GOOSE_DIR` 覆盖 sessions 目录（测试钩子）
+- **格式**：SQLite（WAL，只读，250ms busy 短超时），核心表 `usage_ledger`（schema v15+，每轮 LLM 调用一行）：`id / session_id / created_timestamp（unix 秒）/ model / input_tokens / output_tokens / total_tokens / cache_read_tokens / cache_write_tokens / cost / cost_source / is_compaction`
+- **关键字段**：**PRAGMA `table_info` 列探测防御**（8 必需列缺失即空处理、游标不动，兼容上游 schema 演进）；`input_semantics=1`（官方 rustdoc 证实 input 含缓存读写总量，计费前框架扣减）；游标 = rowid（`id`）水位；model 空兜 `'unknown'`；`is_compaction` 行照常产出（压缩亦是真实消耗）；不设 requestId（rowid 主键幂等）；旧版 per-会话 JSONL（v1.10 前）无逐轮 token，未纳入
+
+### Copilot CLI（`copilot-cli`，已实现）
+
+- **数据位置**：`~/.copilot/session-state/<session-uuid>/events.jsonl`；`COPILOT_HOME` / `COPILOT_CONFIG_DIR` 双变量探测（其下 `session-state`）、`COPILOT_DIR` 覆盖（测试钩子兼根覆盖）
+- **格式**：append-only JSONL 事件流（`{type, data, id, parentId, timestamp}`），**usage 唯一落点 `type=="session.shutdown"`** 的 `data.modelMetrics`（键 = 模型 id 原样保留含 `-1m` 后缀；usage 四桶 camelCase `inputTokens / outputTokens / cacheReadTokens / cacheWriteTokens`）
+- **关键字段**：`inputTokens` 含两缓存桶 → `input_semantics=1`；**累计快照语义**（resume 后新 shutdown 的 modelMetrics 包含历史轮次）→ 模块级 per-file **delta 状态机**（`Map<filePath, {cursorLine, Map<model, 四桶水位>}>`，上限 512 近似 LRU、游标精确衔接才复用），每次 shutdown 只产出超出上次水位的增量，杜绝 resume 双计；requestId = `<事件 id | timestamp | 行号>:<model>`；全零增量跳过不产出
+
+### gptme（`gptme`，已实现）
+
+- **数据位置**：`~/.local/share/gptme/logs/<conversation>/conversation.jsonl`；`GPTME_LOGS_HOME` 重定向；`GPTME_DIR` 覆盖（测试钩子兼根覆盖）
+- **格式**：JSONL，assistant 行 `metadata` 双形态——新版嵌套 `metadata.usage` / 旧版扁平整个 metadata，按官方聚合取法（`usage` 为非空对象则用之，否则取整个 metadata）
+- **关键字段**：`input_semantics=2`（官方注释明确 input 不含缓存，与 cache 两桶互斥）；无 requestId（行主键幂等）；`branches/*.jsonl` 不收集（防与主分支双计，仅收固定名 `conversation.jsonl`）；早期会话无 metadata 的行跳过
+
+### Trae Agent（`trae-agent`，已实现）
+
+- **数据位置**：官方把轨迹写到**运行时工作目录** `trajectories/trajectory_*.json`（无全局会话目录、无官方环境变量）；项目约定监控点 `~/.local/share/trae-agent/trajectories`，`TRAE_TRAJECTORY_DIR` 覆盖（测试钩子兼覆盖）
+- **格式**：单个 JSON 对象全量重写（非 JSONL），token 唯一来源 `llm_interactions[]`（逐次 LLM 调用 append-only；usage 取条目 `response.usage` 四桶 snake_case `input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens`）
+- **关键字段**：**数组水位游标**（fromLine 复用为已导入条数；条目数小于水位 = 文件被覆盖重写 → 重置 0 全量重析）；`input_semantics` **行级按 provider 判定**（anthropic → 2；openai/google/azure/doubao/openrouter/ollama 等 → 1），provider 条目级 → 轨迹根对象回退；`agent_steps` 含同量 usage 一律不采（防双计）；reasoning_tokens 为 output 子集不加速率；无 requestId（绝对路径 + 条目序号主键幂等）；model 条目级 → 根对象回退
+
+### CodeWhale（`codewhale`，已实现）
+
+- **数据位置**：`~/.codewhale/sessions/<sessionId>.json`；`CODEWHALE_HOME` → 其下 `sessions`；`CODEWHALE_DIR` 覆盖（测试钩子兼根覆盖）
+- **格式**：每会话一个完整 JSON（临时文件原子重命名，**整文件重写非追加**）
+- **关键字段**：会话级快照——`metadata.total_tokens` 是唯一 token 计数（口径不明 → `input_semantics=0`；分项缺失，增量 delta 记入 input 桶、output/cache 记 0）；**快照水位游标**（fromLine 复用为上次已统计 total；total 回退 = 文件被替换 → 全量重计；delta≤0 无记录仅推游标）；requestId = `<sessionId>:<total>`；metadata.id 缺失时游标原地等待回填；上游 MAX_SESSIONS=50 保留策略使历史天然不完整；model = metadata.model（缺失兜 `'unknown'`）、project = metadata.workspace、时间取 metadata.updated_at
+
+### Factory Droid（`droid`，已实现）
+
+- **数据位置**：`~/.factory/sessions/**/*.jsonl`（现行布局）+ `~/.factory/projects/**/*.jsonl`（旧布局，版本迁移过）双扫；`DROID_DIR` 覆盖数据根（测试钩子，= 数据根 `~/.factory`）
+- **格式**：JSONL 事件流（`session_start` / `message` / `compaction_state` 等类型判别），usage 在 `type=="message"` 且 `message.role=="assistant"` 的 `message.usage`（Anthropic 风格四分项 camelCase `inputTokens / outputTokens / cacheReadInputTokens / cacheCreationInputTokens`）
+- **关键字段**：`input_semantics=2`（第三方解析器一致行为佐证，中等置信推测）；**同 message.id 流式多行折叠取 output 最大**（与 claude 插件同款 foldById）；`session_start.cwd` → project（状态机每轮从文件头全量扫描提取、跨批续读可恢复）；requestId = message.id；`agent-*.jsonl` 子代理文件同格式收集；`<uuid>.settings.json` 会话级累计不采（非 `.jsonl` 天然排除，防双算）
+
+### MiniMax Code（`minimax`，已实现）
+
+- **数据位置**：`~/.minimax/sqlite.db`（legacy，表 `token_usage`）+ `~/.minimax/v2/sqlite/runtime-state.sqlite`（runtime，表 `local_runtime_token_usage`）**双库独立统计**；`MINIMAX_DIR` / `MINIMAX_DATA_DIR` / `MAVIS_DATA_DIR` 覆盖（测试钩子兼覆盖）
+- **格式**：SQLite（WAL，只读，250ms busy 短超时），两表列集相同（`id / session_id / turn_id / model / ts / input_tokens / output_tokens / reasoning_tokens / cache_read_tokens / cache_write_tokens / cost_usd`；插件必需列集为其中 9 列）
+- **关键字段**：PRAGMA `table_info` 列探测防御（缺列空处理游标不动）；游标 = rowid 水位（两库各自独立游标，按 file_path 天然隔离）；同 `turn_id` 可多行（agent 逐步一行）各自产出不折叠；`input_semantics=2`（推测，中等置信）；reasoning_tokens 为 output 子集不加速率；不设 requestId；**双库并存可能重叠**（legacy 与 runtime 对同一活动的用量无可靠判别依据，docs 层面标注风险）
+
+### 第三批侦察排除（NO-GO，2026-09-11）
+
+12 候选中 3 源经联网侦察后排除，重启条件附后：
+
+- **Cursor CLI**：`~/.cursor/chats/` 的 store.db（content-addressed blobs）与 agent-transcripts JSONL **本地均无 token 用量**（官方论坛与多个第三方逆向实现一致证实；唯一 usage 输出在 `--print --output-format stream-json` 的 stdout，不落盘）。
+- **Antigravity CLI**：会话索引/transcript JSONL 无 token；token 仅存于 `conversations/<uuid>.db` 的 `gen_metadata` **未文档化 protobuf blob**（第三方逆向口径互不一致、无稳定 schema），不满足宽松解析与可验证产出标准。
+- **Crush**：`.crush/crush.db` 的 sessions 表 token 列为「最后一次 run 快照覆盖」且请求失败时写入估算值，唯一可靠的累计字段是美元 cost，与项目「统一本地计价 + 实测与推断分离」口径冲突。
+- **重启条件**：上游将 usage 明细化落盘（cursor / antigravity）或 token 列改为逐请求累计（crush）时重评。
 
 ## 失败判定（已实现，2026-08-27，T01 矩阵 SSOT）
 

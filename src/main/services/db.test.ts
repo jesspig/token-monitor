@@ -37,12 +37,12 @@ const LEGACY_V5_SCHEMA = `
 `
 
 describe('schema 迁移', () => {
-  it('全新库迁移至最新版（v12），含部分索引；重复迁移幂等', () => {
+  it('全新库迁移至最新版（v13），含部分索引；重复迁移幂等', () => {
     const db = createDatabase(':memory:')
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(13)
       expect(columnsOf(db, 'sync_cursors')).toContain('byte_offset')
       const indexes = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_usage_records_%'")
@@ -56,14 +56,14 @@ describe('schema 迁移', () => {
           .get() as { sql: string }
       ).sql
       expect(cachedInputSql).toContain(
-        "app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')"
+        "app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix', 'goose', 'copilot-cli', 'trae-agent')"
       )
     } finally {
       db.close()
     }
   })
 
-  it('v5 存量库升级：ALTER 增列后存量行 byte_offset 为 NULL（未知语义），并补齐 v7 部分索引（v12 按新七源条件重建）', () => {
+  it('v5 存量库升级：ALTER 增列后存量行 byte_offset 为 NULL（未知语义），并补齐 v7 部分索引（v13 按新十源条件重建）', () => {
     const db = createDatabase(':memory:')
     try {
       db.exec(LEGACY_V5_SCHEMA)
@@ -75,7 +75,7 @@ describe('schema 迁移', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(13)
       const row = db.prepare('SELECT * FROM sync_cursors').get() as
         | {
             file_path: string
@@ -100,7 +100,7 @@ describe('schema 迁移', () => {
           .get() as { sql: string }
       ).sql
       expect(cachedInputSql).toContain(
-        "app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')"
+        "app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix', 'goose', 'copilot-cli', 'trae-agent')"
       )
       const hourlyIndexes = (
         db

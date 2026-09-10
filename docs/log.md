@@ -2,6 +2,10 @@
 
 > 仅保留最近 7 天。详细按小时记录见 [changelog/](changelog/)。
 
+## 2026-09-11
+
+- **第三批 9 监控数据源落地（内置插件 22 → 31）**：12 候选源 P0 联网侦察（多数经上游源码级核实），接入 9 源（dev-eco/mimo/goose/copilot-cli/gptme/trae-agent/codewhale/droid/minimax），3 源 NO-GO 排除（cursor-cli 本地无 token 落盘 / antigravity token 在未文档化 protobuf blob / crush token 列快照覆盖含估算值）；基线预登记（AppType/APP_META/CLI_VERSION_COMMANDS/renderer mock 各补 9 键）；**db v13 迁移**（`idx_usage_records_cached_input` 重建为十源部分索引，`recalcCachedInputCosts` 同步）；opencode 解析内核抽取 `_lib/opencode-shared.ts`（dev-eco/mimo 同构复用）；`BUILTIN_PLUGINS` 登记 31 项；存量测试机械对齐（host/cli-version/db/pricing-source/storage 五文件版本号与数量断言）；vitest 全量 **1061 用例**通过（Electron 内置 Node），typecheck 两段通过。详见 [changelog/2026-09-11-03](changelog/2026-09-11-03.md)。
+
 ## 2026-09-10
 
 - **图表层 ECharts 迁移与 UI/UX 系统化**：图表库由 Recharts 整体迁移至 ECharts 6.1（按需注册，`useECharts` + `chart-theme` 统一承载，分包改 `echarts|zrender → 'echarts'` chunk，recharts 卸载）；新增 QueryState 四态边界 / Toast / Toggle / useDismissable 并六页接入，空态与文案改用户视角，时间范围经 FilterContext 全局化（默认 7d、统计页获得自定义区间），DimensionTable 无障碍与分页展开、tailwind 语义设计 token 与 `formatCompact` 落地。typecheck 两段通过 / 463 用例通过，`pnpm build` 通过。详见 [changelog/2026-09-10-00](changelog/2026-09-10-00.md)。

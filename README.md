@@ -18,7 +18,7 @@
 
 ## 支持监控的 AI 编程工具
 
-目前内置支持以下 22 个工具（只要本机装了、且有会话记录，就会被自动发现）：
+目前内置支持以下 31 个工具（只要本机装了、且有会话记录，就会被自动发现）：
 
 | 工具 | 说明 |
 |---|---|
@@ -44,6 +44,15 @@
 | **Reasonix** | DeepSeek 原生的终端 AI 编程代理（开源、可长期运行） |
 | **Command Code** | 终端 AI 编程代理（持续学习你的编码习惯） |
 | **Copilot Chat** | GitHub Copilot 在 VS Code 中的聊天会话记录 |
+| **MiMo Code** | 小米的终端 AI 编程助手，OpenCode 同构会话库 |
+| **DevEco Code** | 华为 HarmonyOS 的终端 AI 编程助手，OpenCode 同构会话库 |
+| **Goose** | Block 发起的开源 agent，会话级 SQLite 账本 |
+| **Copilot CLI** | GitHub 官方独立 CLI，会话关闭时落盘用量快照 |
+| **gptme** | 开源终端 agent，逐会话 JSONL |
+| **Trae Agent** | 字节开源 CLI agent，工作目录轨迹文件 |
+| **CodeWhale** | 社区开源终端 agent，会话级 JSON 快照 |
+| **Droid** | Factory AI 的 CLI agent，JSONL 事件流 |
+| **MiniMax Code** | MiniMax 的 CLI agent，SQLite 双账表 |
 
 > 未安装的工具在「监控源」页面会显示「未安装」，不影响其他工具的正常统计。
 

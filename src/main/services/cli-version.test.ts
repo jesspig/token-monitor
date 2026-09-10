@@ -93,7 +93,7 @@ describe('detectCliVersion', () => {
 })
 
 describe('常量映射', () => {
-  it('二十二个监控对象均映射到 CLI 命令（同名直接映射，别名取实际可执行名）', () => {
+  it('三十一个监控对象均映射到 CLI 命令（同名直接映射，别名取实际可执行名）', () => {
     expect(CLI_VERSION_COMMANDS).toEqual({
       claude: 'claude',
       codex: 'codex',
@@ -116,7 +116,16 @@ describe('常量映射', () => {
       kiro: 'kiro',
       reasonix: 'reasonix',
       'command-code': 'commandcode',
-      'copilot-chat': 'copilot'
+      'copilot-chat': 'copilot',
+      'dev-eco': 'deveco',
+      mimo: 'mimo',
+      goose: 'goose',
+      'copilot-cli': 'copilot',
+      gptme: 'gptme',
+      'trae-agent': 'trae-cli',
+      codewhale: 'codewhale',
+      droid: 'droid',
+      minimax: 'mcode'
     })
   })
 

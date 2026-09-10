@@ -13,15 +13,23 @@ import { PluginRegistry } from './core/registry'
 import { claudePlugin } from './plugins/claude'
 import { clinePlugin } from './plugins/cline'
 import { codebuddyPlugin } from './plugins/codebuddy'
+import { codewhalePlugin } from './plugins/codewhale'
 import { codexPlugin } from './plugins/codex'
 import { commandCodePlugin } from './plugins/command-code'
 import { copilotChatPlugin } from './plugins/copilot-chat'
+import { copilotCliPlugin } from './plugins/copilot-cli'
+import { devEcoPlugin } from './plugins/dev-eco'
+import { droidPlugin } from './plugins/droid'
 import { dshPlugin } from './plugins/dsh'
 import { geminiPlugin } from './plugins/gemini'
+import { goosePlugin } from './plugins/goose'
+import { gptmePlugin } from './plugins/gptme'
 import { grokPlugin } from './plugins/grok'
 import { kiloCodePlugin } from './plugins/kilo-code'
 import { kimiPlugin } from './plugins/kimi'
 import { kiroPlugin } from './plugins/kiro'
+import { mimoPlugin } from './plugins/mimo'
+import { minimaxPlugin } from './plugins/minimax'
 import { opencodePlugin } from './plugins/opencode'
 import { piPlugin } from './plugins/pi'
 import { qoderPlugin } from './plugins/qoder'
@@ -29,6 +37,7 @@ import { qoderCnPlugin } from './plugins/qoder-cn'
 import { qwenPlugin } from './plugins/qwen'
 import { reasonixPlugin } from './plugins/reasonix'
 import { rooCodePlugin } from './plugins/roo-code'
+import { traeAgentPlugin } from './plugins/trae-agent'
 import { workbuddyPlugin } from './plugins/workbuddy'
 import { zcodePlugin } from './plugins/zcode'
 import { zedPlugin } from './plugins/zed'
@@ -145,7 +154,16 @@ const BUILTIN_PLUGINS: MonitorPlugin[] = [
   kiroPlugin,
   reasonixPlugin,
   commandCodePlugin,
-  copilotChatPlugin
+  copilotChatPlugin,
+  devEcoPlugin,
+  mimoPlugin,
+  goosePlugin,
+  copilotCliPlugin,
+  gptmePlugin,
+  traeAgentPlugin,
+  codewhalePlugin,
+  droidPlugin,
+  minimaxPlugin
 ]
 
 export interface HostBootstrap {

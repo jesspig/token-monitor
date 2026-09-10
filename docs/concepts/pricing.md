@@ -4,7 +4,7 @@ title: 定价与费用
 description: 模型定价表（seed/sync/user 三态分级覆盖）、models.dev 全自动同步（间隔可配，默认 5 分钟）、零成本回填与存量缓存口径重算；费用 = fresh_input × input 价 + 其余 token × 各自价格，input 按 semantics 三态扣减。
 tags: [pricing, cost, token, model, modelsdev]
 resource: src/main/services/pricing.ts
-timestamp: 2026-09-10T20:51:31+08:00
+timestamp: 2026-09-11T03:05:47+08:00
 ---
 
 # 定价与费用
@@ -38,11 +38,11 @@ timestamp: 2026-09-10T20:51:31+08:00
 | 1 | input 为含缓存读写的总量 | `max(0, input − cacheRead − cacheCreation)` |
 | 2 | input 已为纯新输入 | inputTokens |
 
-22 源实际口径（首批 8 源经 2026-08-23 上游源码逐一核实；第二批 14 源于 2026-09-10 接入，semantics 依据各自上游源码/实测核定，逐源依据见 [监控插件](monitor-plugins.md)）：
+31 源实际口径（首批 8 源经 2026-08-23 上游源码逐一核实；第二批 14 源于 2026-09-10 接入、第三批 9 源于 2026-09-11 接入，semantics 依据各自上游源码/实测核定，逐源依据见 [监控插件](monitor-plugins.md)；trae-agent 行级按 provider 判定）：
 
-- **semantics=1（input 为含缓存总量，扣 read+write，共八源）**：codex / gemini / grok / zcode（首批四源，write 桶实际恒为 0）+ workbuddy / codebuddy（`rawUsage.prompt_tokens` 含缓存命中）/ qwen（`inputTokens` 含 `cachedTokens`）/ reasonix（`prompt = cache_hit + cache_miss`）。
-- **semantics=2（纯新输入，不扣，共十一源）**：claude / opencode（上游已自行扣减缓存）/ pi / dsh（首批）+ cline / roo-code / kilo-code / kimi / zed / command-code / copilot-chat（第二批）。
-- **semantics=0（未知，全额保守计价不扣，共三源）**：qoder / qoder-cn（`prompt_tokens` 与 `cached_tokens` 包含关系存疑）/ kiro（explicit 计数恒 0 待验证）。
+- **semantics=1（input 为含缓存总量，扣 read+write，共十源整体）**：codex / gemini / grok / zcode（首批四源，write 桶实际恒为 0）+ workbuddy / codebuddy（`rawUsage.prompt_tokens` 含缓存命中）/ qwen（`inputTokens` 含 `cachedTokens`）/ reasonix（`prompt = cache_hit + cache_miss`）+ goose（官方 rustdoc 证实 input 含缓存读写总量）/ copilot-cli（`inputTokens` 含两缓存桶）；另 trae-agent 行级混合中 openai/google/azure/doubao/openrouter/ollama 等 provider 分支行同按此扣减。
+- **semantics=2（纯新输入，不扣，共十六源整体）**：claude / opencode（上游已自行扣减缓存）/ pi / dsh（首批）+ cline / roo-code / kilo-code / kimi / zed / command-code / copilot-chat（第二批）+ dev-eco / mimo（opencode 同构 fork）/ gptme / droid / minimax（第三批）；另 trae-agent 行级混合中 anthropic provider 分支行同按此口径。
+- **semantics=0（未知，全额保守计价不扣，共四源）**：qoder / qoder-cn（`prompt_tokens` 与 `cached_tokens` 包含关系存疑）/ kiro（explicit 计数恒 0 待验证）/ codewhale（会话级 `total_tokens` 口径不明）。
 
 旧公式对 semantics=1 全额计价曾造成缓存部分重复计费、费用系统性高估，已修复。
 
@@ -101,12 +101,12 @@ IPC 仅两通道：`pricing:list`（只读列表）/ `pricing:modelsdev-sync`（
 
 ## 存量缓存口径重算（已实现，recalcCachedInputCosts）
 
-`pricing.recalcCachedInputCosts(db, pricing)`：计费语义修复前 codex/gemini/grok 三源的历史明细（semantics=1）按「input 全额计价」被高估；本函数扫描 **semantics=1 七源**（`app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')`——2026-09-10 随第二批 14 数据源接入由三源扩为七源，workbuddy/codebuddy/qwen/reasonix 新增行同样需扣缓存计价；zcode 虽同为 semantics=1，但自接入起即按扣缓存口径计费，不在本候选与 v12 索引内），以新公式按**当前活定价**重算并回写，delta 增量修正对应 rollup（不变量与零成本回填一致）。候选扫描命中 v12 重建的 `idx_usage_records_cached_input` 部分索引（见 [数据模型](data-model.md)）。
+`pricing.recalcCachedInputCosts(db, pricing)`：计费语义修复前 codex/gemini/grok 三源的历史明细（semantics=1）按「input 全额计价」被高估；本函数扫描 **semantics=1 十源**（`app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix', 'goose', 'copilot-cli', 'trae-agent')`——2026-09-10 随第二批 14 数据源接入由三源扩为七源，2026-09-11 随第三批 9 数据源接入再扩为十源，新增 goose/copilot-cli/trae-agent 三源的 semantics=1 行同样需扣缓存计价；zcode 虽同为 semantics=1，但自接入起即按扣缓存口径计费，不在本候选与 v13 索引内；trae-agent 仅其 semantics=1 的非 anthropic provider 分支行入候选），以新公式按**当前活定价**重算并回写，delta 增量修正对应 rollup（不变量与零成本回填一致）。候选扫描命中 v13 重建的 `idx_usage_records_cached_input` 部分索引（见 [数据模型](data-model.md)）。
 
 - 与迁移的分工：v4 迁移只做纯 SQL 的 opencode semantics 标注修正（1→2）；费用重算需要活定价而 migrate() 为同步纯 SQL,故落地为独立函数由宿主**启动序列**异步调用一次。
 - 幂等：重算值与现值一致（delta=0）即跳过零写入,重复调用 updated=0;阶段二 UPDATE 附带 `cost_usd IS ?` 乐观守卫（NULL 安全），防覆盖并发写入。
 - rollup 行缺失时不创建（同零成本回填口径）。
-- 分批执行（2026-08-26 防阻塞第二轮，与 backfillZeroCost 同构）：rowid 游标按 `REPRICE_BATCH_SIZE = 500` 逐批扫描，每批「事务外取价计算 → 单事务原子提交」，批间 setImmediate 让出事件循环；候选查询命中 `idx_usage_records_cached_input` 部分索引（v7 建立、v12 按七源重建，见 [数据模型](data-model.md)），稳态不再全表扫描。
+- 分批执行（2026-08-26 防阻塞第二轮，与 backfillZeroCost 同构）：rowid 游标按 `REPRICE_BATCH_SIZE = 500` 逐批扫描，每批「事务外取价计算 → 单事务原子提交」，批间 setImmediate 让出事件循环；候选查询命中 `idx_usage_records_cached_input` 部分索引（v7 建立、v12 扩七源、v13 扩十源重建，见 [数据模型](data-model.md)），稳态不再全表扫描。
 
 ## 关联页面
 

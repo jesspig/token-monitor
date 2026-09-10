@@ -36,7 +36,7 @@ describe('model_pricing source 列迁移', () => {
   it('全新建库经 v1→v2 迁移后表含 source 列（NOT NULL）且新行默认 user', () => {
     const { db } = makeStorage()
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(13)
       const columns = db.pragma('table_info(model_pricing)') as {
         name: string
         notnull: number
@@ -149,7 +149,7 @@ describe('model_pricing source 列迁移', () => {
       migrate(db)
       const reopened = new SqliteStorage(db)
       try {
-        expect(db.pragma('user_version', { simple: true })).toBe(12)
+        expect(db.pragma('user_version', { simple: true })).toBe(13)
         expect(rawRow(db, 'legacy-model')).toMatchObject({
           input_per_million: 5,
           cost_multiplier: 1.5,

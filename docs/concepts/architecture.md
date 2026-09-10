@@ -4,13 +4,13 @@ title: 总体架构
 description: 插件宿主（Electron 主进程）承担全部数据逻辑，渲染进程经 preload contextBridge 白名单通信；统计查询经只读 worker 池 offload，采集插件级并发；仪表盘双图与 6 页导航常驻渲染。
 tags: [architecture, electron, main-process, renderer, ipc, plugin-host, worker-pool]
 resource: src/main/
-timestamp: 2026-09-10T20:51:43+08:00
+timestamp: 2026-09-11T03:05:47+08:00
 ---
 
 # 总体架构
 
 > [!note] 当前状态
-> **第一阶段已实现**（2026-08-20）。分层结构落地于 `src/main`（core/、plugins/、services/、ipc/、worker/、workers/、tray.ts）+ `src/preload` + `src/renderer`，与仓库实际代码一致。2026-08-22：IPC 收窄至 17 方法（定价只读化），新增 CLI 版本探测服务，schema 升级至 v3。**2026-08-26：启动拆两阶段（bootstrapHost 快速段 + startServices 阶段二），窗口创建不再被插件装载阻塞；全部 IPC handler 经 `host.ready` 门控；首轮采集错峰延迟触发**。**2026-08-27：统计查询 offload 到只读 worker 线程（`worker/queryClient.ts` + `workers/query-worker.ts`，WAL 共享 DB）；新增系统托盘后台常驻（`tray.ts`，关窗隐藏不退出、单实例锁、closeToTray 设置）；schema 升级至 v10（`usage_hourly_rollups` + 三筛选索引）**。**2026-08-28：IPC 维持 20 方法（当前契约见 `shared/ipc.ts:RendererApi`，现 21 方法 = 20 个 invoke 通道 + `onUsageUpdated` 事件订阅），统计查询通用化为 queryGroupBy；渲染层跨页状态抽为 FilterContext + NavContext；worker/queryClient 池化为 2 worker（重聚合/轻查询分流，in-flight 跨池去重，统一 pending/terminate），采集层插件级有界并发（SYNC_CONCURRENCY=4）+ dsh 目录列举异步化**。**2026-08-29：仪表盘接入趋势双图（请求趋势 Line + Token 四桶/成本堆叠 Area），独立趋势页退役，导航由 7 页缩至 6 页（`NavContext:PageKey` 移除 `trends`）；`App.tsx` 切页改为 `visitedRef` 常驻渲染+`display:none` 切换，查询缓存与渲染优化见 [数据流](data-flow.md)；schema 升级至 v11（`idx_usage_records_model_created`）**。**2026-09-10：渲染层图表库由 Recharts 整体迁移至 ECharts 6.1（按需注册），统一经 `hooks/useECharts.ts` + `components/chart-theme.ts`；新增 QueryState 四态边界 / ToastContext / Toggle / useDismissable 等共享基建，时间范围经 FilterContext 全局化（默认 7d），依赖分包 `echarts|zrender → 'echarts'` chunk**。**同日第二批 14 数据源接入**：主进程新增 14 个插件源码与 `_lib/` 共享解析内核、`BUILTIN_PLUGINS` 登记 8 → 22（见 [监控插件](monitor-plugins.md)）；`shared/app.ts` 的 `AppType`、`CLI_VERSION_COMMANDS` 等类型/常量各补 14 键；db 升级 v12 重建七源缓存口径索引、`pricing.recalcCachedInputCosts` 候选同步扩源（见 [数据模型](data-model.md) 与 [定价与费用](pricing.md)）**。
+> **第一阶段已实现**（2026-08-20）。分层结构落地于 `src/main`（core/、plugins/、services/、ipc/、worker/、workers/、tray.ts）+ `src/preload` + `src/renderer`，与仓库实际代码一致。2026-08-22：IPC 收窄至 17 方法（定价只读化），新增 CLI 版本探测服务，schema 升级至 v3。**2026-08-26：启动拆两阶段（bootstrapHost 快速段 + startServices 阶段二），窗口创建不再被插件装载阻塞；全部 IPC handler 经 `host.ready` 门控；首轮采集错峰延迟触发**。**2026-08-27：统计查询 offload 到只读 worker 线程（`worker/queryClient.ts` + `workers/query-worker.ts`，WAL 共享 DB）；新增系统托盘后台常驻（`tray.ts`，关窗隐藏不退出、单实例锁、closeToTray 设置）；schema 升级至 v10（`usage_hourly_rollups` + 三筛选索引）**。**2026-08-28：IPC 维持 20 方法（当前契约见 `shared/ipc.ts:RendererApi`，现 21 方法 = 20 个 invoke 通道 + `onUsageUpdated` 事件订阅），统计查询通用化为 queryGroupBy；渲染层跨页状态抽为 FilterContext + NavContext；worker/queryClient 池化为 2 worker（重聚合/轻查询分流，in-flight 跨池去重，统一 pending/terminate），采集层插件级有界并发（SYNC_CONCURRENCY=4）+ dsh 目录列举异步化**。**2026-08-29：仪表盘接入趋势双图（请求趋势 Line + Token 四桶/成本堆叠 Area），独立趋势页退役，导航由 7 页缩至 6 页（`NavContext:PageKey` 移除 `trends`）；`App.tsx` 切页改为 `visitedRef` 常驻渲染+`display:none` 切换，查询缓存与渲染优化见 [数据流](data-flow.md)；schema 升级至 v11（`idx_usage_records_model_created`）**。**2026-09-10：渲染层图表库由 Recharts 整体迁移至 ECharts 6.1（按需注册），统一经 `hooks/useECharts.ts` + `components/chart-theme.ts`；新增 QueryState 四态边界 / ToastContext / Toggle / useDismissable 等共享基建，时间范围经 FilterContext 全局化（默认 7d），依赖分包 `echarts|zrender → 'echarts'` chunk**。**同日第二批 14 数据源接入**：主进程新增 14 个插件源码与 `_lib/` 共享解析内核、`BUILTIN_PLUGINS` 登记 8 → 22（见 [监控插件](monitor-plugins.md)）；`shared/app.ts` 的 `AppType`、`CLI_VERSION_COMMANDS` 等类型/常量各补 14 键；db 升级 v12 重建七源缓存口径索引、`pricing.recalcCachedInputCosts` 候选同步扩源（见 [数据模型](data-model.md) 与 [定价与费用](pricing.md)）**。**2026-09-11：第三批 9 数据源接入**：主进程新增 9 个插件源码（`_lib/opencode-shared.ts` 抽取 opencode 同构内核供 dev-eco/mimo 复用）、`BUILTIN_PLUGINS` 登记 22 → 31（见 [监控插件](monitor-plugins.md)）；`shared/app.ts` 的 `AppType`、`CLI_VERSION_COMMANDS` 等类型/常量各补 9 键；db 升级 v13 再建十源缓存口径索引、`pricing.recalcCachedInputCosts` 候选同步扩源（见 [数据模型](data-model.md) 与 [定价与费用](pricing.md)）**。
 
 ## 分层结构
 
@@ -22,7 +22,7 @@ Electron 主进程（插件宿主）
 │   ├── lifecycle.ts   依赖解析与装载/卸载（可逆清理）
 │   └── event-bus.ts   类型化事件（usage-updated，200ms 防抖）
 ├── plugins/        监控插件（每个监控对象一个模块：<id>.ts）
-│   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts pi.ts zcode.ts dsh.ts … copilot-chat.ts（22 个内置插件 + `_lib/` 共享解析内核）
+│   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts pi.ts zcode.ts dsh.ts … copilot-chat.ts … minimax.ts（31 个内置插件 + `_lib/` 共享解析内核）
 ├── services/       核心服务（注册进 ctx，供插件注入）
 │   ├── storage.ts     SQLite 读写 + 日聚合 + 小时聚合物化（v10）
 │   ├── pricing.ts     定价与费用计算 + 零成本回填
@@ -32,7 +32,7 @@ Electron 主进程（插件宿主）
 │   ├── modelsdev.ts   models.dev 目录拉取与定价同步
 │   ├── budget.ts      预算状态计算（只读 rollups 算今日/本月费用与占比）
 │   ├── cli-version.ts CLI 版本探测（execFile <cli> --version，进程级缓存）
-│   ├── db.ts          建库与迁移（v1 建表 → v12 缓存口径七源索引重建，其间 v8/v9 失败列与存量回溯、v10 小时物化+筛选索引、v11 联合索引；启用 WAL）+ 只读连接工厂
+│   ├── db.ts          建库与迁移（v1 建表 → v13 缓存口径十源索引重建，其间 v8/v9 失败列与存量回溯、v10 小时物化+筛选索引、v11 联合索引、v12 七源索引；启用 WAL）+ 只读连接工厂
 │   └── retention.ts   明细保留清理
 ├── worker/        主线程侧 worker 客户端
 │   └── queryClient.ts 统计查询 RPC 客户端（2 worker 池：重聚合→pool[0]/轻查询→pool[1]；in-flight 跨池去重；统一 nextId/pending/terminate；:memory: 回退直查）
@@ -48,7 +48,7 @@ Electron 主进程（插件宿主）
  Renderer (React)：Dashboard(汇总卡+双 ECharts 趋势图：请求 Line + Token 四桶堆叠面积/成本右轴) / 日志表(跨页下钻至仪表盘) / 统计(五维 DimensionTable+ECharts 堆叠柱/donut) / 定价(只读列表+搜索+全量同步) / 监控源(CLI 版本) / 设置；图表统一经 useECharts + chart-theme，数据区四态经 QueryState，反馈经 ToastContext；跨页状态 FilterContext + NavContext（6 页，PageKey 无 trends，App 根 Provider，常驻渲染+display 切换）
 ```
 
-宿主编排分两阶段（2026-08-26，秒开优化）：**阶段一 `bootstrapHost`**（快速同步段）——建库迁移 → seed 定价（99 条主流模型，仅作离线兜底）→ 组装 ctx → 创建 settings store 与 collector，毫秒级完成；随后即注册 IPC 并 `createWindow`（`backgroundColor: '#0a0a0a'` 消除白闪），窗口不被插件装载阻塞。**阶段二 `host.startServices()`** 异步推进——registry 注册 22 个内置插件（2026-09-10 由 8 扩至 22）→ 22 插件 `Promise.all` **并行 mount**（装载时把各插件会话目录注册进 watcher，500ms 防抖触发同步）→ 注册启动钩子：延迟 30s 执行一次保留清理并经 scheduler 按 `syncIntervalMs` 同间隔周期清理（设置变更联动重启）、models.dev 首次全量定价同步延迟 10s 并按 `pricingSyncIntervalMs` 周期自动同步（无启停开关，默认 5 分钟，设置变更联动重启）、零成本回填（20s）/存量重算（30s）错峰定时器；阶段完成/失败经 `Host.ready` Promise 暴露。首轮采集在「窗口 show 且宿主就绪」后延迟 1500ms 触发（生产入口 `index.ts` 常量 `STARTUP_SYNC_DELAY_MS`）；启动失败经 `dialog.showErrorBox` 弹窗兜底。采集链路编排在 `collector.ts`。
+宿主编排分两阶段（2026-08-26，秒开优化）：**阶段一 `bootstrapHost`**（快速同步段）——建库迁移 → seed 定价（99 条主流模型，仅作离线兜底）→ 组装 ctx → 创建 settings store 与 collector，毫秒级完成；随后即注册 IPC 并 `createWindow`（`backgroundColor: '#0a0a0a'` 消除白闪），窗口不被插件装载阻塞。**阶段二 `host.startServices()`** 异步推进——registry 注册 31 个内置插件（2026-09-10 由 8 扩至 22，2026-09-11 扩至 31）→ 31 插件 `Promise.all` **并行 mount**（装载时把各插件会话目录注册进 watcher，500ms 防抖触发同步）→ 注册启动钩子：延迟 30s 执行一次保留清理并经 scheduler 按 `syncIntervalMs` 同间隔周期清理（设置变更联动重启）、models.dev 首次全量定价同步延迟 10s 并按 `pricingSyncIntervalMs` 周期自动同步（无启停开关，默认 5 分钟，设置变更联动重启）、零成本回填（20s）/存量重算（30s）错峰定时器；阶段完成/失败经 `Host.ready` Promise 暴露。首轮采集在「窗口 show 且宿主就绪」后延迟 1500ms 触发（生产入口 `index.ts` 常量 `STARTUP_SYNC_DELAY_MS`）；启动失败经 `dialog.showErrorBox` 弹窗兜底。采集链路编排在 `collector.ts`。
 
 ## 模块职责
 
