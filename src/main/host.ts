@@ -11,13 +11,27 @@ import { EventBus } from './core/event-bus'
 import { LifecycleManager, type LifecyclePlugin } from './core/lifecycle'
 import { PluginRegistry } from './core/registry'
 import { claudePlugin } from './plugins/claude'
+import { clinePlugin } from './plugins/cline'
+import { codebuddyPlugin } from './plugins/codebuddy'
 import { codexPlugin } from './plugins/codex'
+import { commandCodePlugin } from './plugins/command-code'
+import { copilotChatPlugin } from './plugins/copilot-chat'
 import { dshPlugin } from './plugins/dsh'
 import { geminiPlugin } from './plugins/gemini'
 import { grokPlugin } from './plugins/grok'
+import { kiloCodePlugin } from './plugins/kilo-code'
+import { kimiPlugin } from './plugins/kimi'
+import { kiroPlugin } from './plugins/kiro'
 import { opencodePlugin } from './plugins/opencode'
 import { piPlugin } from './plugins/pi'
+import { qoderPlugin } from './plugins/qoder'
+import { qoderCnPlugin } from './plugins/qoder-cn'
+import { qwenPlugin } from './plugins/qwen'
+import { reasonixPlugin } from './plugins/reasonix'
+import { rooCodePlugin } from './plugins/roo-code'
+import { workbuddyPlugin } from './plugins/workbuddy'
 import { zcodePlugin } from './plugins/zcode'
+import { zedPlugin } from './plugins/zed'
 import { createDatabase, migrate } from './services/db'
 import { syncPricing, type SyncResult } from './services/modelsdev'
 import {
@@ -117,7 +131,21 @@ const BUILTIN_PLUGINS: MonitorPlugin[] = [
   grokPlugin,
   piPlugin,
   zcodePlugin,
-  dshPlugin
+  dshPlugin,
+  workbuddyPlugin,
+  codebuddyPlugin,
+  clinePlugin,
+  rooCodePlugin,
+  kiloCodePlugin,
+  qwenPlugin,
+  qoderPlugin,
+  qoderCnPlugin,
+  kimiPlugin,
+  zedPlugin,
+  kiroPlugin,
+  reasonixPlugin,
+  commandCodePlugin,
+  copilotChatPlugin
 ]
 
 export interface HostBootstrap {

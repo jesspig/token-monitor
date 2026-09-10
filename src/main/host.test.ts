@@ -70,34 +70,69 @@ function writeClaudeSession(project: string, file: string, lines: string[]): str
 let tempHome = ''
 let homeSpy: MockInstance<() => string>
 
+const PLUGIN_ISOLATION_ENV_KEYS = [
+  'WORKBUDDY_DIR',
+  'CODEBUDDY_DIR',
+  'CLINE_DIR',
+  'ROO_CODE_DIR',
+  'KILO_CODE_DIR',
+  'QWEN_RUNTIME_DIR',
+  'QODER_DIR',
+  'QODER_CN_DIR',
+  'KIMI_CODE_HOME',
+  'ZED_DIR',
+  'KIRO_DIR',
+  'REASONIX_STATE_HOME',
+  'COMMANDCODE_DIR',
+  'COPILOT_CHAT_DIR'
+]
+
 beforeEach(() => {
   tempHome = mkdtempSync(path.join(os.tmpdir(), 'token-monitor-home-'))
   homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(tempHome)
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({}) })))
+  const isolatedPluginsDir = path.join(tempHome, 'isolated-plugins')
+  mkdirSync(isolatedPluginsDir, { recursive: true })
+  for (const key of PLUGIN_ISOLATION_ENV_KEYS) vi.stubEnv(key, isolatedPluginsDir)
 })
 
 afterEach(() => {
+  vi.unstubAllEnvs()
   homeSpy.mockRestore()
   rmSync(tempHome, { recursive: true, force: true })
   vi.unstubAllGlobals()
 })
 
 describe('createHost 装配', () => {
-  it('listPlugins 返回 8 个内置插件，默认全启用；claude 检测可用', async () => {
+  it('listPlugins 返回 22 个内置插件，默认全启用；claude 检测可用', async () => {
     mkdirSync(path.join(tempHome, '.claude', 'projects'), { recursive: true })
     const host = await createHost({ dataDir: ':memory:' })
     try {
       const statuses = await host.collector.getPluginStatus()
-      expect(statuses).toHaveLength(8)
+      expect(statuses).toHaveLength(22)
       expect(statuses.map((s) => s.id).sort()).toEqual([
         'claude',
+        'cline',
+        'codebuddy',
         'codex',
+        'command-code',
+        'copilot-chat',
         'dsh',
         'gemini',
         'grok',
+        'kilo-code',
+        'kimi',
+        'kiro',
         'opencode',
         'pi',
-        'zcode'
+        'qoder',
+        'qoder-cn',
+        'qwen',
+        'reasonix',
+        'roo-code',
+        'workbuddy',
+        'zcode',
+        'zed'
       ])
       for (const s of statuses) expect(s.enabled).toBe(true)
 
