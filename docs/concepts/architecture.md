@@ -4,7 +4,7 @@ title: 总体架构
 description: 插件宿主（Electron 主进程）承担全部数据逻辑，渲染进程经 preload contextBridge 白名单通信；统计查询经只读 worker 池 offload，采集插件级并发；仪表盘双图与 6 页导航常驻渲染。
 tags: [architecture, electron, main-process, renderer, ipc, plugin-host, worker-pool]
 resource: src/main/
-timestamp: 2026-09-10T01:55:26+08:00
+timestamp: 2026-09-10T05:57:12+08:00
 ---
 
 # 总体架构
@@ -22,7 +22,7 @@ Electron 主进程（插件宿主）
 │   ├── lifecycle.ts   依赖解析与装载/卸载（可逆清理）
 │   └── event-bus.ts   类型化事件（usage-updated，200ms 防抖）
 ├── plugins/        监控插件（每个监控对象一个模块：<id>.ts）
-│   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts pi.ts zcode.ts dsh.ts
+│   └── claude.ts codex.ts opencode.ts gemini.ts grok.ts pi.ts zcode.ts dsh.ts … copilot-chat.ts（22 个内置插件 + `_lib/` 共享解析内核）
 ├── services/       核心服务（注册进 ctx，供插件注入）
 │   ├── storage.ts     SQLite 读写 + 日聚合 + 小时聚合物化（v10）
 │   ├── pricing.ts     定价与费用计算 + 零成本回填
@@ -48,7 +48,7 @@ Electron 主进程（插件宿主）
  Renderer (React)：Dashboard(汇总卡+双 ECharts 趋势图：请求 Line + Token 四桶堆叠面积/成本右轴) / 日志表(跨页下钻至仪表盘) / 统计(五维 DimensionTable+ECharts 堆叠柱/donut) / 定价(只读列表+搜索+全量同步) / 监控源(CLI 版本) / 设置；图表统一经 useECharts + chart-theme，数据区四态经 QueryState，反馈经 ToastContext；跨页状态 FilterContext + NavContext（6 页，PageKey 无 trends，App 根 Provider，常驻渲染+display 切换）
 ```
 
-宿主编排分两阶段（2026-08-26，秒开优化）：**阶段一 `bootstrapHost`**（快速同步段）——建库迁移 → seed 定价（99 条主流模型，仅作离线兜底）→ 组装 ctx → 创建 settings store 与 collector，毫秒级完成；随后即注册 IPC 并 `createWindow`（`backgroundColor: '#0a0a0a'` 消除白闪），窗口不被插件装载阻塞。**阶段二 `host.startServices()`** 异步推进——registry 注册 8 个内置插件 → 8 插件 `Promise.all` **并行 mount**（装载时把各插件会话目录注册进 watcher，500ms 防抖触发同步）→ 注册启动钩子：延迟 30s 执行一次保留清理并经 scheduler 按 `syncIntervalMs` 同间隔周期清理（设置变更联动重启）、models.dev 首次全量定价同步延迟 10s 并按 `pricingSyncIntervalMs` 周期自动同步（无启停开关，默认 5 分钟，设置变更联动重启）、零成本回填（20s）/存量重算（30s）错峰定时器；阶段完成/失败经 `Host.ready` Promise 暴露。首轮采集在「窗口 show 且宿主就绪」后延迟 1500ms 触发（生产入口 `index.ts` 常量 `STARTUP_SYNC_DELAY_MS`）；启动失败经 `dialog.showErrorBox` 弹窗兜底。采集链路编排在 `collector.ts`。
+宿主编排分两阶段（2026-08-26，秒开优化）：**阶段一 `bootstrapHost`**（快速同步段）——建库迁移 → seed 定价（99 条主流模型，仅作离线兜底）→ 组装 ctx → 创建 settings store 与 collector，毫秒级完成；随后即注册 IPC 并 `createWindow`（`backgroundColor: '#0a0a0a'` 消除白闪），窗口不被插件装载阻塞。**阶段二 `host.startServices()`** 异步推进——registry 注册 22 个内置插件（2026-09-10 由 8 扩至 22）→ 22 插件 `Promise.all` **并行 mount**（装载时把各插件会话目录注册进 watcher，500ms 防抖触发同步）→ 注册启动钩子：延迟 30s 执行一次保留清理并经 scheduler 按 `syncIntervalMs` 同间隔周期清理（设置变更联动重启）、models.dev 首次全量定价同步延迟 10s 并按 `pricingSyncIntervalMs` 周期自动同步（无启停开关，默认 5 分钟，设置变更联动重启）、零成本回填（20s）/存量重算（30s）错峰定时器；阶段完成/失败经 `Host.ready` Promise 暴露。首轮采集在「窗口 show 且宿主就绪」后延迟 1500ms 触发（生产入口 `index.ts` 常量 `STARTUP_SYNC_DELAY_MS`）；启动失败经 `dialog.showErrorBox` 弹窗兜底。采集链路编排在 `collector.ts`。
 
 ## 模块职责
 

@@ -4,7 +4,7 @@ title: UI 页面规划
 description: 渲染层页面：Dashboard（汇总+双 ECharts 趋势图）、日志（跨页下钻至仪表盘）、统计（五维维度表+占比图）、定价（只读列表+搜索+全量同步）、监控源（含 CLI 版本）、设置；图表层 ECharts 6.1，QueryState 四态边界，时间范围全局化。
 tags: [ui, react, dashboard, echarts, budget, dimension-table]
 resource: src/renderer/src/
-timestamp: 2026-09-10T01:57:12+08:00
+timestamp: 2026-09-10T05:57:12+08:00
 ---
 
 # UI 页面规划
@@ -20,7 +20,7 @@ timestamp: 2026-09-10T01:57:12+08:00
 | 请求日志 | 分页表格 + 筛选（应用/模型多选/项目/时间/状态）+ 关键字搜索（输入 300ms 防抖，查询值与输入值分离，发布后回第 1 页）+ 行详情抽屉（“在仪表盘查看此模型/应用”按钮，经 FilterContext + NavContext 跳仪表盘并回填 appTypes/models 过滤，行详情 footer 仅 model 存在时渲染）；DetailDrawer/ModelFilter 接入 Escape 关闭+焦点圈（`useDismissable`），滚动锁（body overflow）仅 DetailDrawer 附带；空结果空态带「清除筛选」CTA（重置全部筛选回第 1 页）；默认时间范围 7d（FilterContext 全局）；数值列右对齐、模型列 `max-w-[180px]` truncate；自定义区间应用时重置分页；翻页/筛选切换 keepPreviousData 不闪空、刷新降透明 | ✅ `RequestLogsPage.tsx` + `FilterContext.tsx` / `NavContext.tsx` |
 | 统计 | 五维通用维度表 + 九卡网格布局：Top10（LeaderboardGrid）与费用占比 donut 取消两列并排、各自单列全宽纵向堆叠（原两列高度差悬殊致右下大片空白），每日 Token/维度表/每日费用堆叠单列全宽，成功率/缓存命中/会话成本/每百万 4 紧凑卡两列（`xl:grid-cols-2`；断点 xl≥1280px 避开历史回归区间）。图表全部 ECharts——每日 Token/每日费用堆叠柱（stack，末序列 `borderRadius [4,4,0,0]`，图例 `top: 0` 固定顶部 + `type: 'scroll'` 横向滚动），费用占比 donut（`radius 45%/70%` + `padAngle 2` + **中心 title 显示区间总费用** + label 仅 >8% 显示，图例保持底部，tooltip `trigger:'item'` + 自定 formatter）；donut 与每日 Token/每日费用堆叠柱 tooltip `trigger:'axis'` + 自定 formatter；三图数据均固定取近 30 天（`getDailyModelBreakdown` fixed30d，无维度过滤时走日预聚合快路径），不随筛选区间变化，Y 轴 `formatCompact`/`formatUsd`；`tokenStack/costStack` Map 一次遍历聚合算法不变 | ✅ `StatsPage.tsx` + `DimensionTable.tsx` + `LeaderboardGrid.tsx` + `RetentionRanking.tsx` + `useDimensionStats.ts` |
 | 定价配置 | 模型价格**只读列表**（含来源列 seed/sync/user，15/页分页 `PRICING_PAGE_SIZE`）+ 客户端模型搜索框（过滤后分页、过滤变化回首页）+「立即全量同步」按钮（同步结果改 toast 反馈，移除内联文字行）；增删改与在线目录浏览已下线 | ✅ `PricingPage.tsx` |
-| 监控源 | 各 CLI 适配器状态（已检测/未安装/**CLI 版本**/最近同步时间/错误数）；启停按钮 pending/disabled + 操作结果 toast；空态引导接入 | ✅ `SourcesPage.tsx` |
+| 监控源 | 各 CLI 适配器状态（**22 个内置插件**，2026-09-10 由 8 扩至 22，列表经 `usePlugins` 动态渲染、新增源无需页面改动；已检测/未安装/**CLI 版本**/最近同步时间/错误数）；启停按钮 pending/disabled + 操作结果 toast；空态引导接入 | ✅ `SourcesPage.tsx` |
 | 设置 | 同步间隔、数据保留策略、日/月预算字段、统计自动刷新间隔（秒）/ 价格同步间隔（分钟）、数据目录等（定价自动同步无启停开关，仅暴露同步间隔）；统计自动刷新间隔仅控制用量类图表轮询（2026-08-26 收窄）；表单回填仅首载一次，不被数据刷新覆盖编辑中输入；保存经 try/catch + toast 成功/失败反馈 + 保存按钮 pending；托盘开关 checkbox→`Toggle`（role=switch） | ✅ `SettingsPage.tsx` |
 | 设置·关闭到托盘 | `closeToTray`（默认 true）：窗口关闭时隐藏到托盘而非退出，由 `tray.ts` 与 `index.ts` 协同实现，详见 [总体架构](architecture.md) | ✅ `SettingsPage.tsx` / `src/main/tray.ts` |
 
@@ -30,7 +30,7 @@ timestamp: 2026-09-10T01:57:12+08:00
 - **时间范围全局化（2026-09-10）**：`FilterContext` 的 `range/customRange`（默认 **7d**）是时间范围唯一来源，Dashboard/统计/日志三页 local state 已删除，**切页保持**；RangeSelector 统一置于各页 PageHeader 的 action 插槽。RangeKey = 五档（`lib/range.ts` RANGE_OPTIONS：today = 本地今天 0 点到现在；24h = 最近 24 小时滚动窗口；7d / 14d / 30d 按天回溯）+ **custom 自定义档**。RangeKey → LogFilters 为纯时间戳过滤，后端无档位概念。三页均支持自定义区间（统计页自本轮起获得该能力，修正旧版「统计页仅纯五档」）。
 - 自定义档交互（`RangeSelector` 可选 props `customRange`/`onCustomRangeChange`，未传时组件为纯五档按钮组）：五档尾部「自定义」按钮开合内联面板——两个原生 `<input type="date">`（min/max 联动先后）、两值齐备且合法且 start≤end 才可「应用」（触发 `onChange('custom')`），「清除」回落 7d；点击遮罩关闭。`lib/range.ts` 的 `customRangeToMs` 把 YYYY-MM-DD 区间转为本地 [00:00, 23:59:59.999]，非法输入返回 null 由调用方兜底。
 - 趋势/仪表盘粒度分支：today 与 24h 走小时聚合，经后端 `usage:hourly-trends`（getHourlyTrends，本地时区按 (day_key, hour) 双维 GROUP BY 明细，不补零）；其余范围（含 custom）走天聚合。无前端分桶截断。小时桶含日期维度（dayKey），跨天窗口不合并同钟点——24h 滚动窗口横跨两个自然日时「昨天 9 点」与「今天 9 点」是独立桶；出现 ≥2 个不同 dayKey 时横轴标签为 'MM-DD HH:00'，单一日期维持 'HH:00'。
-- 「监控源」页展示各监控插件状态（已检测/未安装/CLI 版本/最近同步时间/错误数），支持启停插件（按钮 pending/disabled + toast 结果反馈）；CLI 版本显示 `cliVersion ?? '未知'`（探测机制见 [监控插件](monitor-plugins.md)）。
+- 「监控源」页展示各监控插件状态（22 个内置插件，列表动态渲染；已检测/未安装/CLI 版本/最近同步时间/错误数），支持启停插件（按钮 pending/disabled + toast 结果反馈）；CLI 版本显示 `cliVersion ?? '未知'`（探测机制见 [监控插件](monitor-plugins.md)）。
 - **QueryState 四态边界（2026-09-10）**：六页数据区统一经 `QueryState` 组件兜底——首载错误→整页错误卡+重试；isPending→骨架（cards/chart/table 三变体，`sk-shimmer` 动画，`prefers-reduced-motion` 降级）；空→`EmptyState`（默认文案「暂无数据」，可传 action CTA，如日志页「清除筛选」）；正常但轮询失败→amber 提示条（`role=alert`）+重试。keepPreviousData 后台刷新经 `dimWhenRefreshing` 降透明提示过渡。
 - **Toast 全局反馈（2026-09-10）**：`ToastContext` + `Toast` 组件（success/error 两型、2800ms 自动消失、上限 4 条、右下角 z-50）；设置保存、监控源启停、定价同步等写操作结果均走 toast，不再使用内联文字。
 - 日志页筛选选项来自后端 `usage:filter-options`（getFilterOptions，model/project distinct 各限 500）。
