@@ -104,25 +104,33 @@ afterEach(() => {
 })
 
 describe('createHost 装配', () => {
-  it('listPlugins 返回 22 个内置插件，默认全启用；claude 检测可用', async () => {
+  it('listPlugins 返回 31 个内置插件，默认全启用；claude 检测可用', async () => {
     mkdirSync(path.join(tempHome, '.claude', 'projects'), { recursive: true })
     const host = await createHost({ dataDir: ':memory:' })
     try {
       const statuses = await host.collector.getPluginStatus()
-      expect(statuses).toHaveLength(22)
+      expect(statuses).toHaveLength(31)
       expect(statuses.map((s) => s.id).sort()).toEqual([
         'claude',
         'cline',
         'codebuddy',
+        'codewhale',
         'codex',
         'command-code',
         'copilot-chat',
+        'copilot-cli',
+        'dev-eco',
+        'droid',
         'dsh',
         'gemini',
+        'goose',
+        'gptme',
         'grok',
         'kilo-code',
         'kimi',
         'kiro',
+        'mimo',
+        'minimax',
         'opencode',
         'pi',
         'qoder',
@@ -130,6 +138,7 @@ describe('createHost 装配', () => {
         'qwen',
         'reasonix',
         'roo-code',
+        'trae-agent',
         'workbuddy',
         'zcode',
         'zed'
