@@ -398,6 +398,7 @@ let SETTINGS: AppSettings = {
   syncIntervalMs: 5 * 60 * 1000,
   retentionDays: 30,
   dataDir: '~/.config/token-monitor',
+  traeTrajectoryRoots: [],
   dailyBudgetUsd: 10,
   monthlyBudgetUsd: 200,
   statsRefreshIntervalMs: 30_000,

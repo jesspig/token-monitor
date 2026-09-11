@@ -7,10 +7,59 @@ import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../s
 
 const TRAJECTORY_FILE_PATTERN = /^trajectory_.*\.json$/
 
+export type TrajectoryRootsSource = 'settings' | 'env' | 'default'
+
+export interface TrajectoryRootsResolution {
+  roots: string[]
+  source: TrajectoryRootsSource
+}
+
+type TrajectoryRootsProvider = () => readonly string[] | undefined
+
+function pathKey(value: string): string {
+  const normalized = path.resolve(value)
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+function canonicalPathKey(value: string): string {
+  let resolved = path.resolve(value)
+  try {
+    resolved = fs.realpathSync.native(resolved)
+  } catch {
+  }
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+export function normalizeTrajectoryRoots(roots: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const normalized: string[] = []
+  for (const value of roots) {
+    const trimmed = value.trim()
+    if (trimmed === '') continue
+    const resolved = path.resolve(trimmed)
+    const key = pathKey(resolved)
+    if (seen.has(key)) continue
+    seen.add(key)
+    normalized.push(resolved)
+  }
+  return normalized
+}
+
+export function trajectoryRootsOf(configuredRoots: readonly string[] = []): TrajectoryRootsResolution {
+  const configured = normalizeTrajectoryRoots(configuredRoots)
+  if (configured.length > 0) return { roots: configured, source: 'settings' }
+
+  const envRoot = process.env.TRAE_TRAJECTORY_DIR?.trim()
+  if (envRoot) return { roots: normalizeTrajectoryRoots([envRoot]), source: 'env' }
+
+  return {
+    roots: [path.join(os.homedir(), '.local', 'share', 'trae-agent', 'trajectories')],
+    source: 'default'
+  }
+}
+
 export function trajectoriesRootOf(): string {
-  const dir = process.env.TRAE_TRAJECTORY_DIR
-  if (dir && dir.trim() !== '') return dir.trim()
-  return path.join(os.homedir(), '.local', 'share', 'trae-agent', 'trajectories')
+  return trajectoryRootsOf().roots[0]
 }
 
 function safeReaddir(dir: string): fs.Dirent[] {
@@ -35,6 +84,14 @@ function toEntry(p: string): FileEntry {
   return { path: p, mtime }
 }
 
+function rootKind(root: string): 'directory' | 'missing' | 'file' {
+  try {
+    return fs.statSync(root).isDirectory() ? 'directory' : 'file'
+  } catch {
+    return 'missing'
+  }
+}
+
 export function listFilesFromRoot(root: string): FileEntry[] {
   const out: FileEntry[] = []
   for (const ent of safeReaddir(root)) {
@@ -45,27 +102,79 @@ export function listFilesFromRoot(root: string): FileEntry[] {
   return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 }
 
-export function detectFromRoot(root: string): Detection {
-  if (listFilesFromRoot(root).length > 0) return { available: true, sessionDir: root }
-  let dirExists = false
-  try {
-    dirExists = fs.statSync(root).isDirectory()
-  } catch {
-    dirExists = false
-  }
-  if (dirExists) {
-    return {
-      available: false,
-      reason: '轨迹目录存在但未发现 trajectory_*.json（trae-agent 尚未产生轨迹）',
-      sessionDir: root
+export function listFilesFromRoots(roots: readonly string[]): FileEntry[] {
+  const files = new Map<string, FileEntry>()
+  for (const root of normalizeTrajectoryRoots(roots)) {
+    for (const entry of listFilesFromRoot(root)) {
+      const key = canonicalPathKey(entry.path)
+      const existing = files.get(key)
+      if (!existing || entry.mtime > existing.mtime) files.set(key, entry)
     }
   }
+  return [...files.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+}
+
+function rootIssueSummary(missingCount: number, fileCount: number, emptyCount: number): string {
+  const issues: string[] = []
+  if (missingCount > 0) issues.push(String(missingCount) + ' 个路径不存在')
+  if (fileCount > 0) issues.push(String(fileCount) + ' 个路径不是目录')
+  if (emptyCount > 0) issues.push(String(emptyCount) + ' 个目录没有 trajectory_*.json')
+  return issues.join('，')
+}
+
+export function detectFromRoots(resolution: TrajectoryRootsResolution): Detection {
+  const roots = normalizeTrajectoryRoots(resolution.roots)
+  const files = listFilesFromRoots(roots)
+  let missingCount = 0
+  let fileCount = 0
+  let emptyCount = 0
+  let firstDirectory: string | undefined
+
+  for (const root of roots) {
+    const kind = rootKind(root)
+    if (kind === 'missing') {
+      missingCount += 1
+      continue
+    }
+    if (kind === 'file') {
+      fileCount += 1
+      continue
+    }
+    firstDirectory ??= root
+    if (listFilesFromRoot(root).length === 0) emptyCount += 1
+  }
+
+  const issues = rootIssueSummary(missingCount, fileCount, emptyCount)
+  if (files.length > 0) {
+    return {
+      available: true,
+      reason: issues === '' ? undefined : `已发现 ${files.length} 个 Trae Agent 轨迹文件；${issues}`,
+      sessionDir: firstDirectory ?? roots[0]
+    }
+  }
+
+  if (resolution.source === 'default') {
+    return {
+      available: false,
+      reason: missingCount > 0
+        ? '未配置 Trae Agent trajectory 根目录，旧默认候选目录也不存在；请在设置页配置，或使用 $TRAE_TRAJECTORY_DIR'
+        : '未配置 Trae Agent trajectory 根目录；旧默认候选目录存在，但未发现 trajectory_*.json',
+      sessionDir: firstDirectory ?? roots[0]
+    }
+  }
+
+  const sourceLabel = resolution.source === 'env'
+    ? '$TRAE_TRAJECTORY_DIR trajectories 根目录'
+    : '已配置的 trajectory 根目录'
   return {
     available: false,
-    reason:
-      '未找到轨迹目录 ~/.local/share/trae-agent/trajectories（trae-agent 默认把轨迹写到运行时工作目录 trajectories/，无全局会话目录，可用 $TRAE_TRAJECTORY_DIR 指定监控目录）',
-    sessionDir: root
+    reason: issues === '' ? `${sourceLabel} 中未发现 trajectory_*.json` : `${sourceLabel} 不可用：${issues}`,
+    sessionDir: firstDirectory ?? roots[0]
   }
+}
+
+export function detectFromRoot(root: string): Detection {
+  return detectFromRoots({ roots: [root], source: 'env' })
 }
 
 const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
@@ -174,24 +283,22 @@ export function parseTrajectoryFile(filePath: string, fromLine: number): ParsedR
   return { records, nextLine: interactions.length, eof: true }
 }
 
-async function detect(): Promise<Detection> {
-  return detectFromRoot(trajectoriesRootOf())
+export function createTraeAgentPlugin(getConfiguredRoots: TrajectoryRootsProvider = () => undefined): MonitorPlugin {
+  return {
+    id: 'trae-agent',
+    name: 'Trae Agent',
+    version: '1.0.0',
+    deps: ['storage', 'pricing', 'events'],
+    async detect(): Promise<Detection> {
+      return detectFromRoots(trajectoryRootsOf(getConfiguredRoots() ?? []))
+    },
+    async listFiles(): Promise<FileEntry[]> {
+      return listFilesFromRoots(trajectoryRootsOf(getConfiguredRoots() ?? []).roots)
+    },
+    async parseFile(_ctx: PluginContext, filePath: string, fromLine: number): Promise<ParsedResult> {
+      return parseTrajectoryFile(filePath, fromLine)
+    }
+  }
 }
 
-async function listFiles(): Promise<FileEntry[]> {
-  return listFilesFromRoot(trajectoriesRootOf())
-}
-
-async function parseFile(_ctx: PluginContext, filePath: string, fromLine: number): Promise<ParsedResult> {
-  return parseTrajectoryFile(filePath, fromLine)
-}
-
-export const traeAgentPlugin: MonitorPlugin = {
-  id: 'trae-agent',
-  name: 'Trae Agent',
-  version: '1.0.0',
-  deps: ['storage', 'pricing', 'events'],
-  detect,
-  listFiles,
-  parseFile
-}
+export const traeAgentPlugin = createTraeAgentPlugin()

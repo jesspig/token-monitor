@@ -2,7 +2,17 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
-import { traeAgentPlugin, detectFromRoot, listFilesFromRoot, parseTrajectoryFile, trajectoriesRootOf } from './trae-agent'
+import {
+  createTraeAgentPlugin,
+  detectFromRoot,
+  detectFromRoots,
+  listFilesFromRoot,
+  listFilesFromRoots,
+  parseTrajectoryFile,
+  traeAgentPlugin,
+  trajectoriesRootOf,
+  trajectoryRootsOf
+} from './trae-agent'
 import type { PluginContext } from '../../../shared/context'
 
 const ctx = {} as PluginContext
@@ -121,6 +131,15 @@ describe('trajectoriesRootOf 路径解析', () => {
   it('TRAE_TRAJECTORY_DIR 未设置时使用默认监控点', () => {
     expect(trajectoriesRootOf()).toBe(DEFAULT_ROOT)
   })
+
+  it('显式设置根优先于环境变量，并规范化去重', () => {
+    const configured = path.join(tmpDir, 'configured')
+    process.env.TRAE_TRAJECTORY_DIR = path.join(tmpDir, 'env')
+    expect(trajectoryRootsOf(['  ' + configured + '  ', configured + path.sep + '.'])).toEqual({
+      roots: [configured],
+      source: 'settings'
+    })
+  })
 })
 
 describe('detect', () => {
@@ -162,6 +181,34 @@ describe('detect', () => {
     const files = await traeAgentPlugin.listFiles(ctx)
     expect(files.map((f) => f.path)).toEqual([path.join(overrideDir, 'trajectory_20260911_090000.json')])
   })
+
+  it('部分根无效时继续使用有效根，并在状态中披露问题', () => {
+    writeTraj('trajectory_20260911_090100.json', mkTrajectory({}))
+    const missing = path.join(tmpDir, 'missing')
+    const res = detectFromRoots({ roots: [missing, trajDir], source: 'settings' })
+    expect(res.available).toBe(true)
+    expect(res.reason).toContain('1 个路径不存在')
+    expect(res.sessionDir).toBe(trajDir)
+  })
+
+  it('全部配置根无效时明确区分路径缺失', () => {
+    const fileRoot = path.join(tmpDir, 'not-dir')
+    fs.writeFileSync(fileRoot, 'x', 'utf8')
+    const res = detectFromRoots({
+      roots: [path.join(tmpDir, 'missing'), fileRoot],
+      source: 'settings'
+    })
+    expect(res.available).toBe(false)
+    expect(res.reason).toContain('路径不存在')
+    expect(res.reason).toContain('路径不是目录')
+  })
+
+  it('未配置且旧默认候选缺失时明确提示设置入口', () => {
+    const res = detectFromRoots({ roots: [path.join(tmpDir, 'missing-default')], source: 'default' })
+    expect(res.available).toBe(false)
+    expect(res.reason).toContain('未配置')
+    expect(res.reason).toContain('设置页')
+  })
 })
 
 describe('listFilesFromRoot', () => {
@@ -188,6 +235,40 @@ describe('listFilesFromRoot', () => {
     for (const e of entries) {
       expect(e.mtime).toBeGreaterThan(0)
     }
+  })
+
+  it('多根规范化去重，同一物理文件只返回一次', () => {
+    const first = path.join(tmpDir, 'first')
+    const second = path.join(tmpDir, 'second')
+    fs.mkdirSync(first, { recursive: true })
+    fs.mkdirSync(second, { recursive: true })
+    fs.writeFileSync(path.join(first, 'trajectory_a.json'), mkTrajectory({}), 'utf8')
+    fs.writeFileSync(path.join(second, 'trajectory_b.json'), mkTrajectory({}), 'utf8')
+
+    const files = listFilesFromRoots([first, first + path.sep + '.', second])
+    expect(files.map((entry) => path.basename(entry.path))).toEqual([
+      'trajectory_a.json',
+      'trajectory_b.json'
+    ])
+  })
+
+  it('配置提供器变化后插件立即读取最新根目录', async () => {
+    const first = path.join(tmpDir, 'first-live')
+    const second = path.join(tmpDir, 'second-live')
+    fs.mkdirSync(first, { recursive: true })
+    fs.mkdirSync(second, { recursive: true })
+    fs.writeFileSync(path.join(first, 'trajectory_first.json'), mkTrajectory({}), 'utf8')
+    fs.writeFileSync(path.join(second, 'trajectory_second.json'), mkTrajectory({}), 'utf8')
+    let roots = [first]
+    const plugin = createTraeAgentPlugin(() => roots)
+
+    expect((await plugin.listFiles(ctx)).map((entry) => path.basename(entry.path))).toEqual([
+      'trajectory_first.json'
+    ])
+    roots = [second]
+    expect((await plugin.listFiles(ctx)).map((entry) => path.basename(entry.path))).toEqual([
+      'trajectory_second.json'
+    ])
   })
 })
 
