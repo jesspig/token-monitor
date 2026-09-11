@@ -19,6 +19,8 @@ export interface UsageRecordRow {
   status: RequestStatus
   http_status: number | null
   error_message: string | null
+  request_id: string | null
+  is_replaceable_snapshot: number
   file_path: string
   line: number
   created_at: number

@@ -362,6 +362,39 @@ const MIGRATIONS: Migration[] = [
           WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix');
       `)
     }
+  },
+  {
+    version: 13,
+    up(db) {
+      db.exec(`
+        -- 扩展 cached_input 部分索引：覆盖新增 semantics=1 数据源（goose / copilot-cli / trae-agent）
+        DROP INDEX IF EXISTS idx_usage_records_cached_input;
+        CREATE INDEX IF NOT EXISTS idx_usage_records_cached_input
+          ON usage_records (input_semantics)
+          WHERE input_semantics = 1 AND app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix', 'goose', 'copilot-cli', 'trae-agent');
+      `)
+    }
+  },
+  {
+    version: 14,
+    up(db) {
+      const columns = db.pragma('table_info(usage_records)') as { name: string }[]
+      const hasRequestId = columns.some((column) => column.name === 'request_id')
+      const hasReplaceableSnapshot = columns.some(
+        (column) => column.name === 'is_replaceable_snapshot'
+      )
+      if (!hasRequestId) db.exec('ALTER TABLE usage_records ADD COLUMN request_id TEXT')
+      if (!hasReplaceableSnapshot) {
+        db.exec(
+          'ALTER TABLE usage_records ADD COLUMN is_replaceable_snapshot INTEGER NOT NULL DEFAULT 0 CHECK (is_replaceable_snapshot IN (0, 1))'
+        )
+      }
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_data_source_request_id
+          ON usage_records(data_source, request_id)
+          WHERE request_id IS NOT NULL;
+      `)
+    }
   }
 ]
 

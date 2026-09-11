@@ -13,6 +13,10 @@ import {
   type FrameScanSuccess
 } from '../workers/zstd-scan'
 
+const VERSIONED_SESSION_FILE = /^session\.v([12])\.jsonl(?:\.zstd)?$/
+const LEGACY_SESSION_FILES = new Set(['session.jsonl', 'session.jsonl.zstd'])
+const SESSION_LIKE_FILE = /^session(?:\.v\d+)?\.jsonl(?:\.[^.]+)?$/
+const VERIFIED_FORMAT_DATE = '2026-09-10'
 
 export function dataRootOf(): string {
   const override = process.env.DSH_HOME
@@ -47,12 +51,28 @@ async function toEntryAsync(p: string): Promise<FileEntry> {
   return { path: p, mtime }
 }
 
+function isIgnoredEntryName(name: string): boolean {
+  return name.startsWith('.') || name.endsWith('~') || name.endsWith('.tmp') || name.endsWith('.swp')
+}
+
 function isSessionFile(name: string): boolean {
-  return name === 'session.jsonl' || name === 'session.jsonl.zstd'
+  return LEGACY_SESSION_FILES.has(name) || VERSIONED_SESSION_FILE.test(name)
+}
+
+function isParseableSessionFile(name: string): boolean {
+  if (isIgnoredEntryName(name) || name.endsWith('.dsh')) return false
+  const versioned = /^session\.v(\d+)\.jsonl(?:\.zstd)?$/.exec(name)
+  if (versioned) return versioned[1] === '1' || versioned[1] === '2'
+  return name.endsWith('.jsonl') || name.endsWith('.jsonl.zstd')
+}
+
+function isUnsupportedSessionArtifact(name: string): boolean {
+  return name.endsWith('.dsh') || (SESSION_LIKE_FILE.test(name) && !isSessionFile(name))
 }
 
 async function collectSubtree(dir: string, out: FileEntry[]): Promise<void> {
   for (const ent of await safeReaddirAsync(dir)) {
+    if (isIgnoredEntryName(ent.name)) continue
     const p = path.join(dir, ent.name)
     if (ent.isDirectory()) {
       await collectSubtree(p, out)
@@ -62,16 +82,22 @@ async function collectSubtree(dir: string, out: FileEntry[]): Promise<void> {
   }
 }
 
-function hasSessionFile(dir: string): boolean {
+interface ArtifactScan {
+  supported: boolean
+  unsupported: Set<string>
+}
+
+function scanArtifacts(dir: string, scan: ArtifactScan): void {
   for (const ent of safeReaddir(dir)) {
+    if (isIgnoredEntryName(ent.name)) continue
     const p = path.join(dir, ent.name)
     if (ent.isDirectory()) {
-      if (hasSessionFile(p)) return true
-    } else if (ent.isFile() && isSessionFile(ent.name)) {
-      return true
+      scanArtifacts(p, scan)
+    } else if (ent.isFile()) {
+      if (isSessionFile(ent.name)) scan.supported = true
+      else if (isUnsupportedSessionArtifact(ent.name)) scan.unsupported.add(ent.name)
     }
   }
-  return false
 }
 
 export async function listFilesFromRoot(root: string): Promise<FileEntry[]> {
@@ -80,7 +106,9 @@ export async function listFilesFromRoot(root: string): Promise<FileEntry[]> {
   return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 }
 
-const SQLITE_BACKEND_HINT = 'SQLite 后端暂不支持，仅支持 JSONL（JSONL.zstd/raw）工件'
+const SUPPORTED_FORMAT_HINT = '支持 session.jsonl、session.jsonl.zstd、session.v1/v2.jsonl 及其 .zstd 形式'
+const SQLITE_BACKEND_HINT = 'SQLite 后端不在当前插件支持范围'
+const DSH_CONTAINER_FACT = `截至 ${VERIFIED_FORMAT_DATE} 的官方持久化定义未提供 .dsh 会话容器`
 
 export function detectFromRoot(root: string): Detection {
   let ok = false
@@ -96,14 +124,23 @@ export function detectFromRoot(root: string): Detection {
       sessionDir: root
     }
   }
-  if (!hasSessionFile(root)) {
+
+  const scan: ArtifactScan = { supported: false, unsupported: new Set<string>() }
+  scanArtifacts(root, scan)
+  const unsupported = [...scan.unsupported].sort()
+  const incompatibility = unsupported.length > 0
+    ? `检测到不兼容的 DSH 会话工件：${unsupported.join('、')}（${SUPPORTED_FORMAT_HINT}；${DSH_CONTAINER_FACT}）`
+    : undefined
+
+  if (!scan.supported) {
     return {
       available: false,
-      reason: `会话目录下未发现 session.jsonl / session.jsonl.zstd 工件（DeepSeek Harness 尚未产生会话；${SQLITE_BACKEND_HINT}）`,
+      reason: incompatibility ?? `会话目录下未发现受支持的 DSH 会话工件（${SUPPORTED_FORMAT_HINT}；${SQLITE_BACKEND_HINT}）`,
       sessionDir: root
     }
   }
-  return { available: true, sessionDir: root }
+
+  return { available: true, ...(incompatibility ? { reason: incompatibility } : {}), sessionDir: root }
 }
 
 const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
@@ -112,11 +149,36 @@ function truncateErrorMessage(text: string): string {
   return text.length > 500 ? text.slice(0, 500) : text
 }
 
+interface SessionState {
+  sessionId?: string
+  project?: string
+  currentModel?: string
+}
+
+function updateSessionState(row: Record<string, unknown>, session: SessionState): boolean {
+  if (row.type === 'session') {
+    if (typeof row.id === 'string' && row.id.trim() !== '') session.sessionId = row.id.trim()
+    if (typeof row.cwd === 'string' && row.cwd.trim() !== '') session.project = row.cwd
+    return true
+  }
+
+  if (row.type !== 'request/header') return false
+  const data = row.data
+  if (!data || typeof data !== 'object') return true
+  const header = (data as Record<string, unknown>).header
+  if (!header || typeof header !== 'object') return true
+  const config = (header as Record<string, unknown>).config
+  if (!config || typeof config !== 'object') return true
+  const model = (config as Record<string, unknown>).model
+  if (typeof model === 'string' && model.trim() !== '') session.currentModel = model.trim()
+  return true
+}
+
 function toRetryErrorRecord(
   row: Record<string, unknown>,
   filePath: string,
   line: number,
-  session: { sessionId?: string; project?: string; currentModel?: string }
+  session: SessionState
 ): UsageRecord | null {
   if (row.type !== 'llm/retry') return null
   const data = row.data
@@ -128,7 +190,11 @@ function toRetryErrorRecord(
 
   const codeRaw = f.code
   const code =
-    typeof codeRaw === 'string' ? codeRaw.trim() : typeof codeRaw === 'number' && Number.isFinite(codeRaw) ? String(codeRaw) : ''
+    typeof codeRaw === 'string'
+      ? codeRaw.trim()
+      : typeof codeRaw === 'number' && Number.isFinite(codeRaw)
+        ? String(codeRaw)
+        : ''
   const msgRaw = f.message ?? f.error ?? f.text
   const message = typeof msgRaw === 'string' ? msgRaw.trim() : ''
   let errorMessage: string | undefined
@@ -182,7 +248,7 @@ function toUsageRecord(
   row: Record<string, unknown>,
   filePath: string,
   line: number,
-  session: { sessionId?: string; project?: string; currentModel?: string }
+  session: SessionState
 ): UsageRecord | null {
   if (row.type !== 'assistant/message') return null
 
@@ -195,8 +261,7 @@ function toUsageRecord(
   const msg = message as Record<string, unknown>
   if (msg.role !== undefined && msg.role !== 'assistant') return null
 
-  const source =
-    msg.source && typeof msg.source === 'object' ? (msg.source as Record<string, unknown>) : undefined
+  const source = msg.source && typeof msg.source === 'object' ? (msg.source as Record<string, unknown>) : undefined
   const sourceModel = source && typeof source.model === 'string' ? source.model.trim() : ''
   const ownModel = typeof msg.model === 'string' ? msg.model.trim() : ''
   const model = sourceModel || ownModel || session.currentModel || ''
@@ -234,16 +299,11 @@ function toUsageRecord(
   }
 }
 
-interface SessionHeadState {
-  sessionId?: string
-  project?: string
-  currentModel?: string
+interface SessionHeadState extends SessionState {
   cursorLine: number
 }
 
 const SESSION_STATE_CACHE_MAX = 512
-
-
 const ZSTD_WORKER_TIMEOUT_MS = 10_000
 
 let zstdWorker: Worker | null = null
@@ -307,9 +367,7 @@ async function scanZstdFramesAsync(buf: Buffer, from: number): Promise<FrameScan
     return await new Promise<FrameScan>((resolve, reject) => {
       pendingScans.set(id, { resolve, reject })
       timer = setTimeout(() => {
-        if (pendingScans.delete(id)) {
-          reject(new Error(`zstd worker timeout (${ZSTD_WORKER_TIMEOUT_MS}ms)`))
-        }
+        if (pendingScans.delete(id)) reject(new Error(`zstd worker timeout (${ZSTD_WORKER_TIMEOUT_MS}ms)`))
       }, ZSTD_WORKER_TIMEOUT_MS)
       worker.postMessage({ id, buf, from })
     })
@@ -324,12 +382,30 @@ async function scanZstdFramesAsync(buf: Buffer, from: number): Promise<FrameScan
 
 const sessionStateCache = new Map<string, SessionHeadState>()
 
+function parseStatePrefix(lines: string[], endIndex: number, session: SessionState): void {
+  const limit = Math.min(endIndex, lines.length)
+  for (let i = 0; i < limit; i++) {
+    const raw = lines[i]
+    if (raw.trim() === '') continue
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object') updateSessionState(parsed as Record<string, unknown>, session)
+    } catch {
+    }
+  }
+}
+
 async function parseFile(ctx: PluginContext, filePath: string, fromLine: number): Promise<ParsedResult> {
+  if (!isParseableSessionFile(path.basename(filePath))) return { records: [], nextLine: fromLine, eof: true }
+
   let content = ''
   let startIndex = fromLine > 0 ? fromLine - 1 : 0
-  let firstLineNumber = startIndex + 1
+  let firstLineNumber = 1
   let incremental = false
   let consumedByteOffset: number | null = null
+  const cached = sessionStateCache.get(filePath)
+  const hasCachedState = fromLine > 1 && cached?.cursorLine === fromLine
+  let recoveredStateContent: string | null = null
 
   if (filePath.endsWith('.jsonl.zstd')) {
     let compressed: Buffer
@@ -348,14 +424,17 @@ async function parseFile(ctx: PluginContext, filePath: string, fromLine: number)
         if (partial.ok) {
           scan = partial
           incremental = true
+          if (!hasCachedState) {
+            const prefix = await scanZstdFramesAsync(compressed.subarray(0, saved), 0)
+            if (!prefix.ok) return { records: [], nextLine: fromLine, eof: true }
+            recoveredStateContent = prefix.text
+          }
         }
       }
     }
     if (scan === null) {
       const full = await scanZstdFramesAsync(compressed, 0)
-      if (!full.ok) {
-        return { records: [], nextLine: fromLine, eof: true }
-      }
+      if (!full.ok) return { records: [], nextLine: fromLine, eof: true }
       scan = full
     }
     content = scan.text
@@ -374,29 +453,29 @@ async function parseFile(ctx: PluginContext, filePath: string, fromLine: number)
 
   const lines = content.split('\n')
   const records: UsageRecord[] = []
-  let sessionId: string | undefined
-  let project: string | undefined
-  let currentModel: string | undefined
-  const cached = sessionStateCache.get(filePath)
-  if (fromLine <= 1) {
-    sessionStateCache.delete(filePath)
-  } else if (cached && cached.cursorLine === fromLine) {
-    sessionStateCache.delete(filePath)
-    sessionId = cached.sessionId
-    project = cached.project
-    currentModel = cached.currentModel
+  const session: SessionState = {}
+  if (incremental && hasCachedState && cached) {
+    session.sessionId = cached.sessionId
+    session.project = cached.project
+    session.currentModel = cached.currentModel
+  } else if (incremental && recoveredStateContent !== null) {
+    const stateLines = recoveredStateContent.split('\n')
+    parseStatePrefix(stateLines, stateLines.length, session)
+  } else {
+    parseStatePrefix(lines, startIndex, session)
   }
+
   if (incremental && content.trim() === '') {
     await ctx.storage.setCursor(filePath, fromLine, undefined, consumedByteOffset)
-    sessionStateCache.set(filePath, { sessionId, project, currentModel, cursorLine: fromLine })
+    sessionStateCache.set(filePath, { ...session, cursorLine: fromLine })
     return { records: [], nextLine: fromLine, eof: true }
   }
-  let headerSeen = false
+
   let nextLine = fromLine
   let eof = false
 
   for (let i = startIndex; i < lines.length; i++) {
-    const lineNumber = firstLineNumber + (i - startIndex)
+    const lineNumber = firstLineNumber + i
     const raw = lines[i]
     if (raw.trim() === '') {
       nextLine = lineNumber + 1
@@ -407,7 +486,7 @@ async function parseFile(ctx: PluginContext, filePath: string, fromLine: number)
     try {
       obj = JSON.parse(raw)
     } catch {
-      const onlyEmptyAfter = lines.slice(i + 1).every((l) => l === '')
+      const onlyEmptyAfter = lines.slice(i + 1).every((line) => line === '')
       if (onlyEmptyAfter) {
         nextLine = lineNumber
         eof = true
@@ -423,28 +502,11 @@ async function parseFile(ctx: PluginContext, filePath: string, fromLine: number)
     }
     const row = obj as Record<string, unknown>
 
-    if (!headerSeen && row.type === 'session') {
-      if (typeof row.id === 'string' && row.id.trim() !== '') sessionId = row.id
-      if (typeof row.cwd === 'string' && row.cwd.trim() !== '') project = row.cwd
-      headerSeen = true
-    } else if (row.type === 'request/header') {
-      const data = row.data
-      if (data && typeof data === 'object') {
-        const header = (data as Record<string, unknown>).header
-        if (header && typeof header === 'object') {
-          const config = (header as Record<string, unknown>).config
-          if (config && typeof config === 'object') {
-            const m = (config as Record<string, unknown>).model
-            if (typeof m === 'string' && m.trim() !== '') currentModel = m.trim()
-          }
-        }
-      }
-    } else {
-      const errorRecord = toRetryErrorRecord(row, filePath, lineNumber, { sessionId, project, currentModel })
-      if (errorRecord) {
-        records.push(errorRecord)
-      } else {
-        const record = toUsageRecord(row, filePath, lineNumber, { sessionId, project, currentModel })
+    if (!updateSessionState(row, session)) {
+      const errorRecord = toRetryErrorRecord(row, filePath, lineNumber, session)
+      if (errorRecord) records.push(errorRecord)
+      else {
+        const record = toUsageRecord(row, filePath, lineNumber, session)
         if (record) records.push(record)
       }
     }
@@ -457,7 +519,7 @@ async function parseFile(ctx: PluginContext, filePath: string, fromLine: number)
     await ctx.storage.setCursor(filePath, nextLine, undefined, consumedByteOffset)
   }
 
-  sessionStateCache.set(filePath, { sessionId, project, currentModel, cursorLine: nextLine })
+  sessionStateCache.set(filePath, { ...session, cursorLine: nextLine })
   if (sessionStateCache.size > SESSION_STATE_CACHE_MAX) {
     const oldest = sessionStateCache.keys().next().value
     if (oldest !== undefined) sessionStateCache.delete(oldest)
@@ -483,6 +545,8 @@ export const dshPlugin: MonitorPlugin = {
   listFiles,
   parseFile,
   dispose() {
+    sessionStateCache.clear()
+    zstdWorkerBroken = false
     void destroyZstdWorker()
   }
 }

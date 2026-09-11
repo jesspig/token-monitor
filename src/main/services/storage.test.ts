@@ -45,7 +45,7 @@ describe('数据库迁移', () => {
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
       const tables = (
         db
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
@@ -298,7 +298,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     expect(db.pragma('user_version', { simple: true })).toBe(2)
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(12)
+    expect(db.pragma('user_version', { simple: true })).toBe(14)
 
     const zeroCount = db.prepare(`SELECT COUNT(*) AS c FROM usage_records WHERE ${ZERO_COND}`).get() as { c: number }
     expect(zeroCount.c).toBe(0)
@@ -373,7 +373,7 @@ describe('v3 迁移：清理零 token 明细并重建日聚合', () => {
 
     db.pragma('user_version = 2')
     migrate(db)
-    expect(db.pragma('user_version', { simple: true })).toBe(12)
+    expect(db.pragma('user_version', { simple: true })).toBe(14)
     expect(snapshot()).toEqual(before)
   })
 })
@@ -453,7 +453,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
       const rows = db
         .prepare('SELECT id, input_semantics FROM usage_records ORDER BY id')
         .all() as { id: string; input_semantics: number }[]
@@ -468,12 +468,12 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
     }
   })
 
-  it('全新库直接建至 v12，重复迁移幂等', () => {
+  it('全新库直接建至 v14，重复迁移幂等', () => {
     const db = createDatabase(':memory:')
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
     } finally {
       db.close()
     }
@@ -495,7 +495,7 @@ describe('v4 迁移：修正 opencode 存量语义标注', () => {
 
       db.pragma('user_version = 3')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
       expect(snapshot()).toEqual(before)
     } finally {
       db.close()
@@ -529,7 +529,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
       const dsh = db
         .prepare('SELECT COUNT(*) AS c FROM sync_cursors WHERE file_path LIKE ?')
         .get('%\\.dsh\\sessions%') as { c: number }
@@ -556,7 +556,7 @@ describe('v5 迁移：清除 dsh 脏游标触发全量重析', () => {
 
       db.pragma('user_version = 4')
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
       expect(snapshot()).toEqual([])
       expect(before).toHaveLength(1)
     } finally {
@@ -664,6 +664,276 @@ describe('recordUsage 去重', () => {
     expect(row.data_source).toBe('claude')
     expect(row.request_id).toBe('msg_003')
     expect(row.semantic_id).toBe(semanticFingerprint(first))
+  })
+
+  it('可替换快照持久化身份与标记，完全相同快照重放返回 0', async () => {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
+    const snapshot = makeRecord({
+      appType: 'kiro',
+      model: 'claude-sonnet-4-5',
+      isReplaceableSnapshot: true,
+      source: { filePath: '/kiro/data.sqlite3', line: 11, requestId: 'session-1:turn:0' }
+    })
+
+    expect(await storage.recordUsage([snapshot])).toBe(1)
+    expect(await storage.recordUsage([snapshot])).toBe(0)
+
+    const row = db
+      .prepare('SELECT request_id, is_replaceable_snapshot FROM usage_records')
+      .get() as { request_id: string; is_replaceable_snapshot: number }
+    expect(row).toEqual({ request_id: 'session-1:turn:0', is_replaceable_snapshot: 1 })
+    expect((db.prepare('SELECT COUNT(*) AS count FROM usage_records').get() as { count: number }).count).toBe(1)
+  })
+
+  it('新旧双方可替换时保留主键并刷新全部字段、账本和旧新日小时桶', async () => {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
+    const firstCreatedAt = new Date(2026, 8, 10, 10, 15).getTime()
+    const nextCreatedAt = new Date(2026, 8, 11, 14, 30).getTime()
+    const first = makeRecord({
+      appType: 'kiro',
+      model: 'model-a',
+      rawModel: 'raw-a',
+      inputTokens: 1,
+      outputTokens: 2,
+      cacheReadTokens: 3,
+      cacheCreationTokens: 4,
+      inputSemantics: 0,
+      costUsd: '0.001',
+      currency: 'USD',
+      latencyMs: 100,
+      project: '/project/a',
+      sessionId: 'session-a',
+      status: 'success',
+      isReplaceableSnapshot: true,
+      createdAt: firstCreatedAt,
+      source: { filePath: '/kiro/old.sqlite3', line: 1, requestId: 'session-a:turn:0' }
+    })
+    const updated = makeRecord({
+      appType: 'kiro',
+      model: 'model-b',
+      rawModel: 'raw-b',
+      inputTokens: 9,
+      outputTokens: 8,
+      cacheReadTokens: 7,
+      cacheCreationTokens: 6,
+      inputSemantics: 2,
+      costUsd: '0.009',
+      currency: 'EUR',
+      latencyMs: 900,
+      project: '/project/b',
+      sessionId: 'session-b',
+      status: 'success',
+      httpStatus: 429,
+      errorMessage: 'rate limited',
+      isReplaceableSnapshot: true,
+      createdAt: nextCreatedAt,
+      source: { filePath: '/kiro/new.sqlite3', line: 99, requestId: 'session-a:turn:0' }
+    })
+
+    expect(await storage.recordUsage([first])).toBe(1)
+    expect(await storage.recordUsage([updated])).toBe(1)
+
+    const row = db.prepare('SELECT * FROM usage_records').get() as Record<string, unknown>
+    expect(row).toMatchObject({
+      id: 'kiro:/kiro/old.sqlite3:1',
+      data_source: 'kiro',
+      app_type: 'kiro',
+      model: 'model-b',
+      raw_model: 'raw-b',
+      input_tokens: 9,
+      output_tokens: 8,
+      cache_read_tokens: 7,
+      cache_creation_tokens: 6,
+      input_semantics: 2,
+      cost_usd: '0.009',
+      currency: 'EUR',
+      latency_ms: 900,
+      project: '/project/b',
+      session_id: 'session-b',
+      status: 'success',
+      http_status: 429,
+      error_message: 'rate limited',
+      request_id: 'session-a:turn:0',
+      is_replaceable_snapshot: 1,
+      file_path: '/kiro/new.sqlite3',
+      line: 99,
+      created_at: nextCreatedAt
+    })
+    const ledger = db.prepare('SELECT semantic_id FROM dedup_ledger').get() as { semantic_id: string }
+    expect(ledger.semantic_id).toBe(semanticFingerprint(updated))
+
+    expect(db.prepare('SELECT * FROM usage_daily_rollups WHERE model = ?').get('model-a')).toBeUndefined()
+    expect(db.prepare('SELECT * FROM usage_hourly_rollups WHERE model = ?').get('model-a')).toBeUndefined()
+    const daily = db.prepare('SELECT * FROM usage_daily_rollups WHERE model = ?').get('model-b') as UsageDailyRollupRow
+    expect(daily).toMatchObject({
+      request_count: 1,
+      success_count: 1,
+      error_count: 0,
+      input_tokens: 9,
+      output_tokens: 8,
+      cache_read_tokens: 7,
+      cache_creation_tokens: 6,
+      cost_usd: '0.009',
+      latency_ms_total: 900
+    })
+    const hourly = db.prepare('SELECT * FROM usage_hourly_rollups WHERE model = ?').get('model-b') as Record<string, unknown>
+    expect(hourly).toMatchObject({
+      hour: 14,
+      request_count: 1,
+      success_count: 1,
+      error_count: 0,
+      input_tokens: 9,
+      output_tokens: 8,
+      cache_read_tokens: 7,
+      cache_creation_tokens: 6,
+      cost_usd: '0.009',
+      latency_ms_total: 900
+    })
+  })
+
+  it('双方都误标为可替换时，只要任一状态为 error 仍保持 first-write-wins', async () => {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
+    const errorFirst = makeRecord({
+      status: 'error',
+      inputTokens: 1,
+      isReplaceableSnapshot: true,
+      source: { filePath: '/errors/first.jsonl', line: 1, requestId: 'error-first' }
+    })
+    const successLater = makeRecord({
+      status: 'success',
+      inputTokens: 9,
+      isReplaceableSnapshot: true,
+      source: { filePath: '/success/later.jsonl', line: 2, requestId: 'error-first' }
+    })
+    expect(await storage.recordUsage([errorFirst])).toBe(1)
+    expect(await storage.recordUsage([successLater])).toBe(0)
+    expect(db.prepare('SELECT status, input_tokens FROM usage_records WHERE request_id = ?').get('error-first')).toEqual({
+      status: 'error',
+      input_tokens: 1
+    })
+
+    const successFirst = makeRecord({
+      status: 'success',
+      inputTokens: 2,
+      isReplaceableSnapshot: true,
+      source: { filePath: '/success/first.jsonl', line: 3, requestId: 'success-first' }
+    })
+    const errorLater = makeRecord({
+      status: 'error',
+      inputTokens: 8,
+      isReplaceableSnapshot: true,
+      source: { filePath: '/errors/later.jsonl', line: 4, requestId: 'success-first' }
+    })
+    expect(await storage.recordUsage([successFirst])).toBe(1)
+    expect(await storage.recordUsage([errorLater])).toBe(0)
+    expect(db.prepare('SELECT status, input_tokens FROM usage_records WHERE request_id = ?').get('success-first')).toEqual({
+      status: 'success',
+      input_tokens: 2
+    })
+  })
+
+  it('不可变事件和旧 ledger 记录均保持 first-write-wins', async () => {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
+    const immutableError = makeRecord({
+      status: 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      source: { filePath: '/errors/a.jsonl', line: 1, requestId: 'shared-error' }
+    })
+    const replaceableSuccess = makeRecord({
+      isReplaceableSnapshot: true,
+      inputTokens: 999,
+      source: { filePath: '/success/a.jsonl', line: 2, requestId: 'shared-error' }
+    })
+    expect(await storage.recordUsage([immutableError])).toBe(1)
+    expect(await storage.recordUsage([replaceableSuccess])).toBe(0)
+    expect(db.prepare('SELECT status, input_tokens FROM usage_records WHERE request_id = ?').get('shared-error')).toEqual({
+      status: 'error',
+      input_tokens: 0
+    })
+
+    const replaceableFirst = makeRecord({
+      isReplaceableSnapshot: true,
+      inputTokens: 5,
+      source: { filePath: '/snapshots/a.jsonl', line: 1, requestId: 'replaceable-first' }
+    })
+    const immutableLater = makeRecord({
+      status: 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      source: { filePath: '/errors/b.jsonl', line: 2, requestId: 'replaceable-first' }
+    })
+    expect(await storage.recordUsage([replaceableFirst])).toBe(1)
+    expect(await storage.recordUsage([immutableLater])).toBe(0)
+    expect(db.prepare('SELECT status, input_tokens FROM usage_records WHERE request_id = ?').get('replaceable-first')).toEqual({
+      status: 'success',
+      input_tokens: 5
+    })
+
+    const legacy = makeRecord({ source: { filePath: '/legacy/a.jsonl', line: 3 } })
+    expect(await storage.recordUsage([legacy])).toBe(1)
+    db.prepare(
+      'INSERT INTO dedup_ledger (data_source, request_id, semantic_id, created_at) VALUES (?, ?, ?, ?)'
+    ).run('claude', 'legacy-request', semanticFingerprint(legacy), Date.now())
+    const candidate = makeRecord({
+      isReplaceableSnapshot: true,
+      source: { filePath: '/legacy/rewrite.jsonl', line: 4, requestId: 'legacy-request' }
+    })
+    expect(await storage.recordUsage([candidate])).toBe(0)
+    expect((db.prepare('SELECT COUNT(*) AS count FROM usage_records').get() as { count: number }).count).toBe(3)
+  })
+
+  it('聚合写入失败时 usage、ledger、日桶和小时桶全部回滚', async () => {
+    const db = createDatabase(':memory:')
+    migrate(db)
+    const storage = new SqliteStorage(db)
+    const first = makeRecord({
+      appType: 'kiro',
+      inputTokens: 1,
+      costUsd: '0.001',
+      isReplaceableSnapshot: true,
+      source: { filePath: '/kiro/a.sqlite3', line: 1, requestId: 'rollback-turn' }
+    })
+    const updated = makeRecord({
+      appType: 'kiro',
+      inputTokens: 9,
+      costUsd: '0.009',
+      isReplaceableSnapshot: true,
+      source: { filePath: '/kiro/b.sqlite3', line: 2, requestId: 'rollback-turn' }
+    })
+    expect(await storage.recordUsage([first])).toBe(1)
+    const originalFingerprint = semanticFingerprint(first)
+    db.exec(`
+      CREATE TRIGGER fail_daily_rollup_update
+      BEFORE UPDATE ON usage_daily_rollups
+      BEGIN
+        SELECT RAISE(ABORT, 'rollup failure');
+      END
+    `)
+
+    expect(() => storage.recordUsage([updated])).toThrow('rollup failure')
+    expect(db.prepare('SELECT input_tokens, cost_usd, file_path FROM usage_records').get()).toEqual({
+      input_tokens: 1,
+      cost_usd: '0.001',
+      file_path: '/kiro/a.sqlite3'
+    })
+    expect(db.prepare('SELECT semantic_id FROM dedup_ledger').get()).toEqual({ semantic_id: originalFingerprint })
+    expect(db.prepare('SELECT input_tokens, cost_usd FROM usage_daily_rollups').get()).toEqual({
+      input_tokens: 1,
+      cost_usd: '0.001'
+    })
+    expect(db.prepare('SELECT input_tokens, cost_usd FROM usage_hourly_rollups').get()).toEqual({
+      input_tokens: 1,
+      cost_usd: '0.001'
+    })
   })
 })
 

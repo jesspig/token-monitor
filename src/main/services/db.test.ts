@@ -36,34 +36,44 @@ const LEGACY_V5_SCHEMA = `
   )
 `
 
+function makeLegacyV13Db(): SqliteDatabase {
+  const db = createDatabase(':memory:')
+  db.exec(LEGACY_V5_SCHEMA)
+  db.pragma('user_version = 13')
+  return db
+}
+
 describe('schema 迁移', () => {
-  it('全新库迁移至最新版（v12），含部分索引；重复迁移幂等', () => {
+  it('全新库迁移至最新版（v14），含部分索引；重复迁移幂等', () => {
     const db = createDatabase(':memory:')
     try {
       migrate(db)
       migrate(db)
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
       expect(columnsOf(db, 'sync_cursors')).toContain('byte_offset')
+      expect(columnsOf(db, 'usage_records')).toContain('request_id')
+      expect(columnsOf(db, 'usage_records')).toContain('is_replaceable_snapshot')
       const indexes = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_usage_records_%'")
         .all() as { name: string }[]
       expect(indexes.map((r) => r.name)).toContain('idx_usage_records_zero_cost')
       expect(indexes.map((r) => r.name)).toContain('idx_usage_records_cached_input')
       expect(indexes.map((r) => r.name)).toContain('idx_usage_records_model_created')
+      expect(indexes.map((r) => r.name)).toContain('idx_usage_records_data_source_request_id')
       const cachedInputSql = (
         db
           .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_records_cached_input'")
           .get() as { sql: string }
       ).sql
       expect(cachedInputSql).toContain(
-        "app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')"
+        "app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix', 'goose', 'copilot-cli', 'trae-agent')"
       )
     } finally {
       db.close()
     }
   })
 
-  it('v5 存量库升级：ALTER 增列后存量行 byte_offset 为 NULL（未知语义），并补齐 v7 部分索引（v12 按新七源条件重建）', () => {
+  it('v5 存量库升级：ALTER 增列后存量行 byte_offset 为 NULL（未知语义），并补齐 v7 部分索引（v13 按新十源条件重建）', () => {
     const db = createDatabase(':memory:')
     try {
       db.exec(LEGACY_V5_SCHEMA)
@@ -75,7 +85,7 @@ describe('schema 迁移', () => {
 
       migrate(db)
 
-      expect(db.pragma('user_version', { simple: true })).toBe(12)
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
       const row = db.prepare('SELECT * FROM sync_cursors').get() as
         | {
             file_path: string
@@ -94,13 +104,14 @@ describe('schema 迁移', () => {
       expect(indexNames).toContain('idx_usage_records_project')
       expect(indexNames).toContain('idx_usage_records_session_id')
       expect(indexNames).toContain('idx_usage_records_model_created')
+      expect(indexNames).toContain('idx_usage_records_data_source_request_id')
       const cachedInputSql = (
         db
           .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_records_cached_input'")
           .get() as { sql: string }
       ).sql
       expect(cachedInputSql).toContain(
-        "app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix')"
+        "app_type IN ('codex', 'gemini', 'grok', 'workbuddy', 'codebuddy', 'qwen', 'reasonix', 'goose', 'copilot-cli', 'trae-agent')"
       )
       const hourlyIndexes = (
         db
@@ -108,6 +119,122 @@ describe('schema 迁移', () => {
           .all() as { name: string }[]
       ).map((r) => r.name)
       expect(hourlyIndexes).toContain('idx_usage_hourly_rollups_date')
+    } finally {
+      db.close()
+    }
+  })
+
+  it('v13 存量库升级至 v14：旧行保持 request_id 为 NULL 且不可替换', () => {
+    const db = makeLegacyV13Db()
+    try {
+      db.prepare(
+        `INSERT INTO usage_records (
+           id, data_source, app_type, model, file_path, line, created_at
+         ) VALUES ('legacy-1', 'claude', 'claude', 'claude-sonnet-4', '/legacy.jsonl', 1, 1)`
+      ).run()
+
+      migrate(db)
+
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
+      const columns = db.pragma('table_info(usage_records)') as {
+        name: string
+        notnull: number
+        dflt_value: string | null
+      }[]
+      expect(columns.find((column) => column.name === 'request_id')).toMatchObject({
+        notnull: 0,
+        dflt_value: null
+      })
+      expect(columns.find((column) => column.name === 'is_replaceable_snapshot')).toMatchObject({
+        notnull: 1,
+        dflt_value: '0'
+      })
+      expect(
+        db.prepare('SELECT request_id, is_replaceable_snapshot FROM usage_records').get()
+      ).toEqual({ request_id: null, is_replaceable_snapshot: 0 })
+    } finally {
+      db.close()
+    }
+  })
+
+  it('v14 创建 data_source + request_id 唯一部分索引，仅约束非 NULL request_id', () => {
+    const db = makeLegacyV13Db()
+    try {
+      migrate(db)
+
+      const index = (
+        db.pragma('index_list(usage_records)') as {
+          name: string
+          unique: number
+          partial: number
+        }[]
+      ).find((entry) => entry.name === 'idx_usage_records_data_source_request_id')
+      expect(index).toMatchObject({ unique: 1, partial: 1 })
+      expect(
+        (db.pragma('index_info(idx_usage_records_data_source_request_id)') as { name: string }[]).map(
+          (column) => column.name
+        )
+      ).toEqual(['data_source', 'request_id'])
+      const indexSql = (
+        db
+          .prepare(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_records_data_source_request_id'"
+          )
+          .get() as { sql: string }
+      ).sql
+      expect(indexSql).toContain('WHERE request_id IS NOT NULL')
+
+      const insert = db.prepare(
+        `INSERT INTO usage_records (
+           id, data_source, app_type, model, file_path, line, created_at, request_id
+         ) VALUES (?, ?, 'claude', 'claude-sonnet-4', ?, ?, 1, ?)`
+      )
+      insert.run('null-1', 'claude', '/null-1.jsonl', 1, null)
+      insert.run('null-2', 'claude', '/null-2.jsonl', 2, null)
+      insert.run('request-1', 'claude', '/request-1.jsonl', 3, 'req-1')
+      expect(() =>
+        insert.run('request-2', 'claude', '/request-2.jsonl', 4, 'req-1')
+      ).toThrow()
+      expect(() =>
+        insert.run('request-3', 'codex', '/request-3.jsonl', 5, 'req-1')
+      ).not.toThrow()
+    } finally {
+      db.close()
+    }
+  })
+
+  it('v14 回拨至 v13 后重放迁移幂等，不重复增列或改写存量行', () => {
+    const db = makeLegacyV13Db()
+    try {
+      db.prepare(
+        `INSERT INTO usage_records (
+           id, data_source, app_type, model, file_path, line, created_at
+         ) VALUES ('legacy-1', 'claude', 'claude', 'claude-sonnet-4', '/legacy.jsonl', 1, 1)`
+      ).run()
+      migrate(db)
+      db.prepare(
+        `UPDATE usage_records
+         SET request_id = 'req-1', is_replaceable_snapshot = 1
+         WHERE id = 'legacy-1'`
+      ).run()
+      const before = db.prepare('SELECT * FROM usage_records').get()
+
+      db.pragma('user_version = 13')
+      migrate(db)
+
+      expect(db.pragma('user_version', { simple: true })).toBe(14)
+      expect(columnsOf(db, 'usage_records').filter((name) => name === 'request_id')).toHaveLength(1)
+      expect(
+        columnsOf(db, 'usage_records').filter((name) => name === 'is_replaceable_snapshot')
+      ).toHaveLength(1)
+      expect(db.prepare('SELECT * FROM usage_records').get()).toEqual(before)
+      expect(
+        (
+          db.pragma('index_list(usage_records)') as {
+            name: string
+          }[]
+        ).filter((entry) => entry.name === 'idx_usage_records_data_source_request_id')
+      ).toHaveLength(1)
     } finally {
       db.close()
     }

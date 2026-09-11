@@ -1,191 +1,108 @@
 ---
 type: plugin-implementation
 title: 监控插件
-description: MonitorPlugin 统一接口与 22 个内置监控插件实现清单——首批 8 源（claude/codex/opencode/gemini/grok/pi/zcode/dsh）+ 第二批 14 源（workbuddy/codebuddy/cline/roo-code/kilo-code/qwen/qoder/qoder-cn/kimi/zed/kiro/reasonix/command-code/copilot-chat）；失败可观测性（T01 矩阵，status/errorMessage/httpStatus，覆盖首批 8 源）。
-tags: [plugin, monitor, cli, claude, codex, opencode, gemini, grok, pi, zcode, dsh, failure-observability, workbuddy, codebuddy, cline, roo-code, kilo-code, qwen, qoder, kimi, zed, kiro, reasonix, command-code, copilot-chat]
+description: MonitorPlugin 统一接口与 31 个内置监控插件的当前数据位置、格式、游标、语义身份、快照修正和兼容边界。
+tags: [plugin, monitor, cli, sqlite, jsonl, cursor, dedup, snapshot]
 resource: src/main/plugins/
-timestamp: 2026-09-10T05:57:12+08:00
+timestamp: 2026-09-11T12:03:38+08:00
 ---
 
 # 监控插件
 
 > [!note] 当前状态
-> **第一阶段 5 个内置插件已实现**（2026-08-20）：`src/main/plugins/{claude,codex,opencode,gemini,grok}.ts`，各有单测覆盖；解析格式均经联网核实。本页清单已按实际实现核对（2026-08-21）；CLI 版本探测于 2026-08-22 接入；语义请求 ID（requestId）与 opencode 语义标注修正/WAL 感知于 2026-08-23 接入；**claude 流式分片折叠与 gemini 新版 JSONL 双格式兼容于 2026-08-23 落地**（五源日志格式已按各 CLI 最新版联网复核）；**pi / zcode / dsh 三插件于 2026-08-23 接入，内置监控对象扩展至 8 个**（格式均经上游源码/社区实测核实）；**dsh 插件模型来源升级为三级 + 会话头状态缓存于 2026-08-24 落地**（经 deepseek-harness 上游源码核实：`assistant/message` 的模型身份在 `data.message.source.model` 而非顶层字段；`request/header` 仅路由/配置变化时稀疏写入——旧两级来源在增量续读时因状态丢失漏采用量，现由 per-file 缓存消除）；**2026-08-25 脏游标收尾**：初版两级来源在真实数据上全部失效（零记录产出却推进满游标），三级修复又被 mtime 短路挡住无法重析，最终由数据库 v5 迁移清除 dsh 会话文件游标触发全量重析自愈（120/120 文件、6084 条入库，见 [数据模型](data-model.md)）；**2026-08-26：dsh zstd 工件升级尾部帧级增量解压（scanZstdFrames + sync_cursors.byte_offset 字节游标），续读只解压新增帧而非整文件**；**同日防阻塞第二轮——dsh 解压下沉 worker_threads 单例线程（10s 超时销毁重建 + 异常环境恒主线程回退）、坏帧切割尝试上限 MAX_CUT_ATTEMPTS=8、pi/dsh detect 存在性短路、grok 映射 summary.json path:mtime 签名缓存**；**2026-08-27：失败请求可观测性接入（T01 矩阵，8 插件各自失败判定，status/errorMessage/httpStatus 全链路，见下方「失败判定」与 [数据模型](data-model.md) v8/v9、[同步与去重](sync-mechanism.md) 失败放行）**；**2026-09-10：第二批 14 个监控数据源接入，内置监控对象扩展至 22 个**（workbuddy/codebuddy/cline/roo-code/kilo-code/qwen/qoder/qoder-cn/kimi/zed/kiro/reasonix/command-code/copilot-chat，类型/DB 层同日预登记、v12 迁移扩展七源缓存口径索引，详见下方「第二批数据源」章节）；失败判定 T01 矩阵当前覆盖首批 8 源，新 14 源按宽松解析不产出 error 记录。
+> 当前宿主装配 **31 个内置插件**。2026-09-11 完成兼容性加固：DSH、Kilo Code、Kiro 更新到已验证的当前存储；Copilot CLI、gptme、Trae Agent 修复恢复或发现问题；Command Code、CodeWhale、OpenCode 系、Cline/Roo 更新增量和目录规则；Claude、Kiro current、Droid 接入可替换成功快照；MiniMax 接入跨库语义身份。验证基线：typecheck 两段通过、vitest **54 个测试文件 / 1166 个用例**通过、`pnpm build` 通过。
 
-## `MonitorPlugin` 接口（实现于 shared/plugin.ts）
+## `MonitorPlugin` 契约
 
-```ts
-interface MonitorPlugin {
-  id: AppType;               // AppType 联合（shared/app.ts）22 个监控对象之一
-  name: string;              // 显示名
-  version: string;           // 插件适配器版本（非被监控 CLI 的实际版本）
-  deps?: ServiceKey[];       // 依赖服务，宿主按依赖解析装载顺序
-  detect(ctx): Promise<Detection>;          // CLI 是否安装、会话目录是否存在
-  listFiles(ctx): Promise<FileEntry[]>;      // { path, mtime }
-  parseFile(ctx, path, fromLine): Promise<ParsedResult>; // 增量解析，返回新记录+新偏移
-  dispose?(ctx): void;       // 卸载时清理监听/游标
-}
-```
+`shared/plugin.ts` 定义统一接口：
 
-`ParsedResult` 含 `records`、`nextLine`（游标推进）、`eof`（是否到文件尾）。22 个内置插件的 `deps` 均为 `['storage','pricing','events']`（workbuddy/codebuddy 经 `createBuddyPlugin` 工厂、qoder/qoder-cn 经 `_lib/qoder-shared` 共享内核产出，deps 一致）。`Detection` 另含可选 `cliVersion?: string | null` 字段（dto 层预留）。
+- `id/name/version/deps`：插件身份和依赖。
+- `detect(ctx)`：探测可用性并返回可解释原因。
+- `listFiles(ctx)`：列出只读输入及 mtime。
+- `parseFile(ctx, path, fromLine)`：从持久化游标继续解析，返回 `records/nextLine/eof/nextByteOffset`。
+- `dispose(ctx)`：清理缓存、监听和其他生命周期资源。
 
-## CLI 版本探测（已实现）
+插件只经 `PluginContext` 使用宿主服务。单文件失败由采集器隔离，不阻塞同插件其他文件；临时文件、点前缀文件、`.tmp`、`.swp` 和 `~` 后缀按各源规则过滤。
 
-监控源页展示的「CLI 版本」与插件的 `version`（适配器自身版本）是两个概念：实际 CLI 版本由 `collector.getPluginStatus` 对每个插件**并行**调用 `src/main/services/cli-version.ts` 的 `detectCliVersion` 探测——
+## 当前插件清单
 
-- 执行 `execFile <cli> --version`（超时 **3000ms**；win32 先经 `where.exe` 定位可执行文件再执行），取 stdout 首个非空行；
-- 失败/超时返回 `null`，不抛错、不影响状态其余字段；
-- 结果按命令名做进程级缓存（`clearCliVersionCache` 可清空），executor 可注入便于测试；
-- 探测成功以可选字段 `PluginStatus.cliVersion` 返回，失败则字段缺省（UI 显示「未知」）。
+| 插件 | 当前数据位置与格式 | 增量、身份与关键边界 |
+|---|---|---|
+| Claude Code (`claude`) | `~/.claude/projects/**/*.jsonl` | assistant usage 使用 `message.id`；单轮与跨轮均按累计 `outputTokens` 选择最佳快照。成功且有 ID 的记录标记为可替换快照，较小旧快照不倒退；错误和无 ID 记录保持不可变。 |
+| Codex (`codex`) | Codex rollout JSONL | 读取 `event_msg.payload.info.last_token_usage`；按行增量，稳定 requestId 继续使用线程/事件字段组合。 |
+| OpenCode (`opencode`) | `opencode.db`、`opencode-prod.db`，兼容旧 `storage/message` JSON | SQLite 使用数据库指纹 + rowid 编码水位；`message.id` 为 requestId；旧时间戳游标、数据库身份变化或 rowid 回退会从头安全重读。 |
+| Gemini CLI (`gemini`) | legacy 单 JSON 与 append-only JSONL | 双格式兼容，按消息 ID 去重；尾部半行不推进。 |
+| Grok (`grok`) | `unified.jsonl` + `summary.json` | usage 行依赖会话到模型映射；每轮重建或读取映射，按行增量。 |
+| Pi (`pi`) | 会话 JSONL 树 | assistant message 四桶互斥，requestId 使用条目 ID。 |
+| Zcode (`zcode`) | `cli/db/db.sqlite` | SQLite rowid 水位并感知 WAL；requestId 使用 `model_usage.id`。 |
+| DSH (`dsh`) | `~/.dsh/sessions` 下 legacy `session.jsonl[.zstd]` 与 `session.v1/v2.jsonl[.zstd]` | zstd 使用 `byte_offset` 帧边界增量；重启时只读重放已消费前缀恢复 session/model 状态，不重产历史。未来版本、未知压缩、`.dsh` 工件和 SQLite 后端显式报告不兼容，不猜测解析。 |
+| WorkBuddy (`workbuddy`) | `~/.workbuddy/projects/**/*.jsonl` | Tencent Buddy 共享解析器；稳定请求 ID 存在时参与语义去重。 |
+| CodeBuddy (`codebuddy`) | `~/.codebuddy/projects/**/*.jsonl` | 与 WorkBuddy 共用解析内核；当前只覆盖已实现的 CLI 根。 |
+| Cline (`cline`) | VS Code Stable、VS Code Insiders、VSCodium、Cursor 的 `globalStorage/saoudrizwan.claude-dev/tasks/*/ui_messages.json` | `CLINE_DIR` 可显式覆盖；显式 requestId → 文本内 requestId → `ts` → 数组索引降级。跨编辑器同任务选择 mtime 最新副本。**Cline CLI/SDK-managed 会话未接入**，不能复用经典扩展快照解析器。 |
+| Roo Code (`roo-code`) | 上述四类编辑器的 `globalStorage/rooveterinaryinc.roo-cline/tasks/*/ui_messages.json` | `ROO_CODE_DIR` 可显式覆盖；复用 Cline 稳定身份和多根去重规则。未验证的 Roo CLI 形态不接入。 |
+| Kilo Code (`kilo-code`) | 当前 `kilo.db`；兼容旧扩展 `globalStorage/kilocode.kilo-code/tasks/*/ui_messages.json` | 当前库使用只读 SQLite、WAL mtime、rowid 水位和 `message.id`；`KILO_DATA_HOME` 支持当前数据根，`KILO_CODE_DIR` 保留旧扩展覆盖。当前库兼容时只枚举该库，避免与迁移后的旧扩展双计；当前库存在但不兼容时仍保留为显式失败输入，旧扩展文件可由单文件隔离继续解析。当前库 input/cache 包含关系未证实，`inputSemantics=0`；旧扩展保持已验证语义。 |
+| Qwen Code (`qwen`) | `$QWEN_RUNTIME_DIR` / `$QWEN_HOME` / `~/.qwen/usage/token-usage-*.jsonl` | JSONL 行增量，requestId 使用行 ID；input 含缓存总量。 |
+| Qoder (`qoder`) | `SharedClientCache/cache/db/local.db` 等候选 | SQLite `chat_message` rowid 水位；缓存包含关系未知。 |
+| Qoder CN (`qoder-cn`) | Qoder CN 多候选 `local.db` | 复用 Qoder 解析内核；缓存包含关系未知。 |
+| Kimi Code (`kimi`) | `~/.kimi-code/sessions/**/wire.jsonl` | 仅统计 `usage.record` 且 `usageScope=turn`；无稳定 ID 时依赖文件路径和行号。 |
+| Zed (`zed`) | `threads/threads.db` | 读取明文 JSON 或 zstd thread 数据；rowid + updated_at 双水位，按 thread/usage 键构造 requestId。 |
+| Kiro CLI (`kiro`) | 当前 `data.sqlite3` 的 `conversations_v2`；兼容旧 `~/.kiro/sessions/cli/*.jsonl` + sidecar JSON | 当前库每次 mtime 变化重读会话行，并以稳定 session/turn/message 身份产生**可替换成功快照**；旧 sidecar 保持不可替换。只接受显式 `input_token_count/output_token_count`，没有显式 Token 时标记不兼容并**拒绝估算**；缓存桶为 0，`inputSemantics=0`。 |
+| Reasonix (`reasonix`) | `stats/YYYY-MM-DD.jsonl` | 按行读取已实现字段；无稳定 ID 时依赖文件路径和行号。 |
+| Command Code (`command-code`) | `~/.commandcode/projects/**/*.jsonl` | 每轮只读扫描文件前缀恢复 session/project/model/parentMap/活动尾节点；前缀不产出，只有游标窗口内活动分支 usage 进入结果。 |
+| Copilot Chat (`copilot-chat`) | VS Code Stable 的全局/工作区 chatSessions JSONL | 顺序合并 patch 重建请求终值；当前只覆盖已实现目录。 |
+| DevEco Code (`dev-eco`) | `deveco.db`、`deveco-beta.db`、`deveco-prod.db` | 复用 OpenCode-like 内核：数据库指纹 + rowid 编码水位、`message.id` requestId、WAL mtime。 |
+| MiMo Code (`mimo`) | `mimocode.db`、`mimocode-beta.db`、`mimocode-prod.db`，含默认根与 `$MIMOCODE_HOME/data` | 复用 OpenCode-like 内核，游标和重建规则同 DevEco/OpenCode。 |
+| Goose (`goose`) | XDG/`GOOSE_PATH_ROOT` 下 usage 数据 | 读取已实现的 usage ledger；无稳定 ID 时保守依赖本地行身份。 |
+| Copilot CLI (`copilot-cli`) | Copilot CLI 会话 JSONL shutdown 累计指标 | 从游标前缀重建每模型、每 Token 桶历史高水位；缓存仅优化性能。累计回退不产生负数，只有超过历史高水位部分计入。 |
+| gptme (`gptme`) | 普通会话及递归 `branches/**/conversation.jsonl` | 顶层 `id` / `message_id` / `metadata.message_id` 作为跨文件身份；fork/branch 复制历史保留同 ID 时由语义去重折叠，独占后缀正常计入。缺 ID 时不使用内容哈希猜测关系。 |
+| Trae Agent (`trae-agent`) | 设置页显式配置多个 trajectory 根；兼容单根 `TRAE_TRAJECTORY_DIR` 和旧默认候选 | 多根规范化、物理路径去重并动态刷新 watcher；不扫描整个用户目录或磁盘。trajectory JSON 仍按 provider 决定 input semantics。 |
+| CodeWhale (`codewhale`) | `~/.codewhale/sessions/*.json` 的 `metadata.total_tokens` | 采用保守会话快照：首次只建基线、不回填历史；上升只计差值；下降/compaction 只重置；fork 新文件首次也只建基线。全部增量记入 input，`inputSemantics=0`，不伪造 output/cache，无法还原快照间模型切换。 |
+| Factory Droid (`droid`) | `sessions/`、`projects/` 下 JSONL，并发现 `*.settings.json` | JSONL 成功且有 `message.id` 的 usage 为可替换快照，跨轮以前缀最佳值收敛；双布局相同 ID 不双计。settings 文件只做发现、mtime 与 JSON/schema 验证，**不计算 Token、不反推费用**。 |
+| MiniMax Code (`minimax`) | legacy `sqlite.db/token_usage` 与 runtime `runtime-state.sqlite/local_runtime_token_usage` | row ID 负责单库水位和 source line；仅在 `session_id`、`turn_id`、记录 `id` 均有效时构造 `minimax:[session,turn,id]` 语义 ID，使双库迁移重叠记录收敛；缺身份时保守退回文件/行幂等。 |
 
-## 内置插件清单（22 个 = 首批 8 个 + 第二批 14 个，按实际实现）
+## OpenCode-like 编码水位
 
-首批 8 源详表如下；第二批 14 源于 2026-09-10 接入，逐源实现说明见下方「第二批数据源」章节。
+`src/main/plugins/_lib/opencode-shared.ts` 由 OpenCode、DevEco、MiMo 共用：
 
-| 插件 id | 数据根（可环境变量覆盖） | 扫描范围 | 解析源与关键字段 |
-|---|---|---|---|
-| claude | `~/.claude/projects` | 各编码项目目录直接子层 `*.jsonl` + 会话子目录内 `subagents/`、`workflows/` 子树递归 | 行 `type=="assistant"` 且含 `message.usage`：`input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens`；`input_semantics=2`（纯新输入）；requestId = `message.id`（消息 UUID，fork/compact 后同消息散落多文件时可收敛）；**同批解析按 message.id 折叠流式分片**（当前版 Claude Code 每 content block 写一行：各行共享 message.id、input/cache 计数一致而 output 随流式单调增长，逐行直录约 2.4 倍高估——折叠保留 output 最大/最后一条） |
-| codex | `~/.codex/sessions` | 全子树递归 `*.jsonl`(日期分区 `YYYY/MM/DD/` + `archived_sessions/`) | rollout JSONL 状态机解析：模型取 `turn_context.payload.model`,用量取 `event_msg(token_count).payload.info.last_token_usage`,cwd/sessionId 取 `session_meta`;`input_semantics=1`(input 含 `cached_input_tokens`,无 write 桶);**output 不加速率 reasoning_output_tokens**(经 codex-rs 源码定论:TokenUsage.output_tokens 原样取自 Responses API,官方口径已含 reasoning 子集明细,相加属双算);requestId = `<thread_id>:<行顶层timestamp>:<in>-<cached>-<out>` 组合键(token_count 无 per-event id;timestamp 用原串保证重写幂等) |
-| opencode | `~/.local/share/opencode`（`$OPENCODE_HOME`） | 双源二选一：新版 `opencode.db`(SQLite) 单条目；否则旧版 `storage/message/*.json` + `storage/session/**/*.json` | 新版读 `message` 表（join `session.directory`），游标 = `time_created` 水位，data 列 `role=="assistant"` 的 `modelID / tokens{input,output,cache.read,cache.write}`；旧版每文件一条消息 JSON 同构解析；`input_semantics=2`（上游 getUsage 已自行扣减缓存，四项互不重叠——2026-08-23 修正，存量行由 v4 迁移改标）；requestId = db 行主键 `m.id`（旧版 JSON 为 data.id）；db 条目 mtime 取主库与 `-wal` 较大值（WAL 感知）。上游 schema 复核（2026-08-23）：message/session 表结构与 data 形态稳定 |
-| gemini | `~/.gemini/tmp` | `<project_hash>/chats/` 子树：**新版 append-only JSONL**（PR #23749）任意层级收集（主会话 `session-*-*.jsonl` 在 chats 直接子层，subagent 为嵌套子目录下不带 session- 前缀的 `.jsonl`）+ legacy 单 JSON `session-*.json` 仅限 chats 直接子层 | `.jsonl` 逐行解析：首行 metadata（sessionId）建立会话状态、`$set` 更新行刷新、消息行 `type=="gemini"` 且含 model/tokens 产出（tokens 键名宽松兼容；`tokens.input=promptTokenCount` 含 cached，`input_semantics=1`）；尾部半行游标停驻重试。legacy `.json` 走原整体解析。两格式游标均为 1-based 行号增量；requestId = 消息 `id`（UUID） |
-| grok | `~/.grok`（`GROK_HOME`） | `logs/unified.jsonl` + `sessions/**/summary.json` | unified.jsonl 行 `msg=="shell.turn.inference_done"`：`ctx.prompt_tokens / completion_tokens / cached_prompt_tokens`（prompt 含缓存读，无 write 桶，`input_semantics=1`）；requestId = `<sid>:<loop_index>` 组合键（会话内推理循环序号）；模型来自 summary.json `current_model_id` 建立的 sessionId→模型映射，**loadModelMap 按清单签名短路（2026-08-26）**：以 summary.json 清单的 `path:mtime` 拼接签名为准，未变化时复用上次映射、跳过全部重读重析；新增/变更 summary.json 改变签名，当轮即重建生效 |
-| pi | `~/.pi/agent/sessions`（`$PI_CODING_AGENT_DIR` 覆盖根） | sessions 子树递归 `*.jsonl`（按工作目录编码层组织） | JSONL 树结构：首行 header `{type:'session', id, cwd}` 建立会话状态；`type==='message'` 且 `role==='assistant'` 且含 usage 的条目产出——usage 四桶 input/output/cacheRead/cacheWrite **互不重叠**，`input_semantics=2`；上游自带 usage.cost 不采用（统一本地计价）；requestId = 条目 `id`（fork 提取分支跨文件收敛）；compaction/model_change 等条目天然跳过 |
-| zcode | `~/.zcode`（`$ZCODE_STORAGE_DIR` 重定位整个根） | 单数据源 `cli/db/db.sqlite`（SQLite 只读） | schema 核实自 CLI db v0.14.8（codeburn 实测）：`model_usage LEFT JOIN session` 取 directory；**input_tokens 已含缓存读写 → `input_semantics=1`**（直接计费约 8 倍高估）；reasoning_tokens 独立列不折入 output；时间戳 epoch 毫秒，createdAt = completed_at ?? started_at；游标 = **rowid 水位**（line=rowid 单调唯一）；WAL mtime max 感知；requestId = `model_usage.id`（每请求唯一） |
-| dsh | `~/.dsh/sessions`（`$DSH_HOME` 覆盖 home） | 子树递归固定名工件 `session.jsonl.zstd` / `session.jsonl`（SQLite 后端 `.db` 暂不支持，detect reason 提示） | `.jsonl.zstd` 经 **fzstd（纯 JS zstd 解压）** 解压后逐行解析 event-sourced envelope `{type, seq, time, data}`（SESSION_FORMAT_VERSION=0 pre-release，破坏性变更时宽松解析+联网复核维护）；**zstd 尾部帧级增量解压（2026-08-26，scanZstdFrames，纯函数已提取至 src/main/workers/zstd-scan.ts）**：**解压经 worker_threads 单例 worker 执行（2026-08-26 防阻塞第二轮，入口 src/main/workers/zstd-worker.ts，构建产物 out/main/zstd-worker.js）**——懒创建；10s 超时（ZSTD_WORKER_TIMEOUT_MS）判定卡死即销毁重建并回退主线程同步 scanZstdFrames；创建失败/异常环境置 zstdWorkerBroken 标记恒走主线程回退（行为与线程化前一致）；插件 dispose 销毁 worker（vitest 无产物环境自动走同步路径）。首读从 0 起整流解压；续读（fromLine>1 且游标 `byte_offset` 为合法帧边界）仅解压新增压缩帧、片段首行全局行号 = fromLine——快路径整段交 fzstd 内建多帧循环（对帧内容伪 magic 免疫），失败（典型 = EOF 半帧正在写入）时从尾部倒序探测 magic 候选做安全切割点前缀解压（伪 magic 候选因真帧截断必然解压失败被自然排除；尝试上限 `MAX_CUT_ATTEMPTS = 8`，防最坏 O(n) 次 decompress），候选耗尽/超上限 → 真损坏游标不动；偏移非法/中途坏帧回退整块解压自愈并回填偏移；EOF 半帧只推进到最后完整帧末尾，其文本随补全后下轮产出；增量空文本短路不虚进行号。安全消费偏移经 setCursor 写回 `sync_cursors.byte_offset`（v6 列）；裸 .jsonl 无字节游标概念；`assistant/message` 且 data.usage 产出——TokenUsage disjoint 约定（inputTokens 不含缓存），`input_semantics=2`；reasoningTokens 为 output 子集不加速率；**模型三级来源：`data.message.source.model` 首选（上游 AssistantProvenance per-message 自带，473/473 实测全携带、增量续读永不丢）→ `data.message.model` 兜底（兼容上游未来恢复顶层字段，实测 0 条携带）→ 此前最近 request/header 的 `data.header.config.model` 状态机（header 仅在路由/配置变化时写入 reason ∈ initial/resume/change，远稀疏于计费条目）**；request/header 稀疏导致的增量续读状态盲区由模块级 **per-file 会话头状态缓存**消除（key=filePath，上限 512 条近似 LRU 淘汰：fromLine ≤ 1 全量重读时重置、与缓存 cursorLine 精确衔接时恢复 sessionId/project/currentModel 并于轮末连同 nextLine 写回、不衔接如文件被 truncate 时弃用重建）；requestId = `<sessionId>:<seq>`（fork seed 继承跨文件稳定）。已用真实数据端到端验证：6084/6084 全部产出、0 跳过 |
+1. 只读打开 SQLite，探测 `message/session` 必需表列。
+2. 游标编码数据库指纹与最后处理 rowid，不再使用单一 `time_created` 水位。
+3. 旧数字时间戳游标自动视为旧格式并从头重读；稳定 `message.id` 负责语义去重。
+4. schema、首条消息身份变化，或游标 rowid 大于当前最大 rowid时，从头自愈。
+5. 合法但无 usage 的行仍推进 rowid；损坏 JSON、缺表或缺列显式失败且不推进。
+6. 保留相同数据库身份和 rowid、仅原位更新旧行的情况不会重新产出；当前实现不猜测上游快照更新语义。
 
-## 第二批数据源（14 个，已实现，2026-09-10）
+## 可替换成功快照
 
-2026-09-10 预登记并同日落地：`shared/app.ts` 的 `AppType` 联合、`src/main/services/cli-version.ts` 的 `CLI_VERSION_COMMANDS`、`src/renderer/src/lib/format.ts` 的 `APP_META` 各补齐 14 键；`src/main/services/db.ts` v12 迁移将 `idx_usage_records_cached_input` 部分索引扩展至 `('codex','gemini','grok','workbuddy','codebuddy','qwen','reasonix')`，`src/main/services/pricing.ts` 的 `recalcCachedInputCosts` 选中 SQL 同步扩展；插件文件（`src/main/plugins/<id>.ts`，各配单测）与 `src/main/host.ts` 的 `BUILTIN_PLUGINS` 22 项登记完成。本节记录各源实现要点，semantics 取值：**1 = input 含缓存总量需扣减**、**2 = 纯新输入**、**0 = 未知**（与 `usage_records.input_semantics` 一致，见 [数据模型](data-model.md)）。14 源 semantics 分配汇总：**1** = workbuddy / codebuddy / qwen / reasonix；**2** = cline / roo-code / kilo-code / kimi / zed / command-code / copilot-chat；**0** = qoder / qoder-cn / kiro。
+当前仅逐源启用：
 
-### WorkBuddy（`workbuddy`，已实现）
+- Claude：成功且有 `message.id`。
+- Kiro current SQLite：具有稳定 turn 身份的当前库记录；旧 sidecar 不启用。
+- Droid：成功且有 `message.id` 的 JSONL usage；settings 不产出记录。
 
-- **数据位置**：`%USERPROFILE%\.workbuddy\projects\**\*.jsonl`；*nix `~/.workbuddy/projects/`；含 `<sessionId>/subagents/` 子目录与平铺两种布局，均扫描；`WORKBUDDY_DIR` 覆盖（语义 = **projects 目录**本身）
-- **格式**：JSONL；`input_semantics=1`（input 保留含缓存原始量，计费前扣减）
-- **关键字段**：与 CodeBuddy 共享解析内核 `src/main/plugins/_lib/tencent-buddy.ts`（`createBuddyPlugin` 工厂仅换 appType/根目录/环境变量名）；两种 usage 形态并存——`message.usage`（Anthropic 形态：`input_tokens / output_tokens / cache_read_input_tokens`）与 `function_call.providerData.rawUsage`（GLM 形态：`prompt_tokens / completion_tokens / prompt_cache_hit_tokens / prompt_cache_miss_tokens / cache_read_input_tokens / cache_creation_input_tokens / completion_thinking_tokens`）；`rawUsage.prompt_tokens` 含缓存命中量（semantics=1 依据）；同 requestId 记录按 total 大者折叠（防汇总行与明细行双计）
+标记为 `isReplaceableSnapshot` 的新旧记录必须同源、同 requestId、均为成功且均可替换，存储层才允许更新。错误记录、无稳定 ID 的记录和其他插件继续使用不可变事件语义。
 
-### CodeBuddy / CLI 与 IDE（`codebuddy`，已实现）
+## 计费语义
 
-- **数据位置**：`%USERPROFILE%\.codebuddy\projects\{project-key}\{sessionId}.jsonl`；*nix `~/.codebuddy/projects/`；布局同 WorkBuddy（`subagents/` 子目录 + 平铺）；`CODEBUDDY_DIR` 覆盖（语义 = projects 目录）；忽略 `~/.codebuddy/code-ratio/` 下的 watcher 文件
-- **格式**：JSONL；`input_semantics=1`
-- **关键字段**：与 WorkBuddy 同源格式（CLI 与 IDE 共用——IDE 经 ACP 落同一目录），共用 `_lib/tencent-buddy.ts` 内核与「同 requestId 按 total 大者折叠」去重
+`inputSemantics`：0=输入与缓存关系未知；1=input 含缓存总量，计费前扣减缓存；2=input 已是纯新输入。
 
-### Cline（`cline`，已实现）
+- 固定为 1：Codex、Gemini、Grok、Zcode、WorkBuddy、CodeBuddy、Qwen、Reasonix、Goose、Copilot CLI。
+- 固定为 2：Claude、OpenCode、Pi、DSH、Cline、Roo Code、Kimi、Zed、Command Code、Copilot Chat、DevEco、MiMo、gptme、Droid、MiniMax。
+- 固定为 0：Qoder、Qoder CN、Kiro、CodeWhale。
+- Kilo Code：当前 `kilo.db` 为 0，旧扩展记录为 2。
+- Trae Agent：按行 provider 判定；Anthropic 系为 2，已验证的 OpenAI 等 provider 分支为 1。
 
-- **数据位置**：`%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\tasks\<id>\ui_messages.json`；*nix `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/`；`CLINE_DIR` 覆盖（语义 = **完整的 globalStorage 目录**）
-- **格式**：JSON 数组，**整体重写而非追加**；`input_semantics=2`（官方源码证实 `tokensIn` 为不含缓存的独立桶，与 cacheWrites/cacheReads 互斥）
-- **关键字段**：`say:"api_req_started"` 条目的 `text` 为字符串化 JSON `{tokensIn, tokensOut, cacheWrites, cacheReads, cost}`；解析策略为**全量重析 + requestId 幂等去重**——requestId = `String(ts)`（`api_req_started` 条目 ts，整体重写下行号不稳定）；文件含未回填的占位条目（cost/字段缺失）时**游标归零等待回填**，下轮整文件重析；model 三级来源：条目 `modelInfo.modelId` → 同目录 `api_conversation_history.json` 反查 → 均无则该条目不产出
+## 容错边界
 
-### Roo Code（`roo-code`，已实现）
-
-- **数据位置**：`%APPDATA%\Code\User\globalStorage\rooveterinaryinc.roo-cline\tasks\<id>\ui_messages.json`；*nix `~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks/`；`ROO_CODE_DIR` 覆盖（语义同 CLINE_DIR）
-- **格式**：同 Cline（JSON 数组整体重写）；`input_semantics=2`
-- **关键字段**：壳复用 cline 插件导出的解析内核（`detectClineLikeTasks` / `listClineLikeTaskFiles` / `parseUiMessages` / `loadHistoryModel`），仅换 extensionId（`rooveterinaryinc.roo-cline`）与环境变量（`ROO_CODE_DIR`），解析行为与 Cline 完全一致
-
-### Kilo Code（`kilo-code`，已实现）
-
-- **数据位置**：`%APPDATA%\Code\User\globalStorage\kilocode.kilo-code\tasks\<uuid>\ui_messages.json`；*nix `~/.config/Code/User/globalStorage/kilocode.kilo-code/tasks/`；`KILO_CODE_DIR` 覆盖（语义同 CLINE_DIR）
-- **格式**：同 Cline（JSON 数组整体重写）；`input_semantics=2`
-- **关键字段**：壳复用 cline 内核（extensionId `kilocode.kilo-code`、`KILO_CODE_DIR`），与 Roo Code 同构
-
-### Qwen Code（`qwen`，已实现）
-
-- **数据位置**：`~/.qwen/usage/token-usage-<YYYY-MM>.jsonl`（Windows：`%USERPROFILE%\.qwen\usage\`），按月分文件；目录覆盖优先级 `QWEN_RUNTIME_DIR > QWEN_HOME > ~/.qwen`
-- **格式**：JSONL，逐 API 响应一行；`input_semantics=1`（源码证实 `inputTokens` 已含 `cachedTokens`，计费前扣减）
-- **关键字段**：行字段 camelCase——`schemaVersion / id(uuid) / timestamp(ISO) / sessionId / model / authType / source / inputTokens / outputTokens / cachedTokens / thoughtsTokens / totalTokens / apiDurationMs`；requestId = 行 `id`；文件产出受 `usageStatisticsEnabled` 设置门控（关闭时不落盘，detect 容忍目录缺失）
-
-### Qoder（`qoder`，已实现）
-
-- **数据位置**：多候选路径按序探测——桌面布局 `%APPDATA%\Qoder\SharedClientCache\cache\db\local.db` 与 `~/.qoder/shared_client/cache/db/local.db`（*nix 同构）；`QODER_DIR` 覆盖（覆盖根下同时探测 `SharedClientCache\cache\db` 与 `shared_client/cache/db` 两种布局）
-- **格式**：SQLite **明文**（readonly 打开），`chat_message` 表；`input_semantics=0`（官方采集器对 `prompt_tokens` 无扣减证据，与 `cached_tokens` 的包含关系存疑，无法确认前保持 0）
-- **关键字段**：`role='assistant'` 行——`token_info`（JSON 字符串：`prompt_tokens / completion_tokens / cached_tokens`）、`request_id`（requestId，并以此 JOIN `chat_record` 取 `extra.modelConfig.key`）、model 两级：`model_info.model_key` → 回退 `chat_record.extra.modelConfig.key`；`gmt_create` 毫秒时间戳；游标 = **rowid 水位**
-
-### Qoder CN（`qoder-cn`，已实现）
-
-- **数据位置**：三候选路径按序探测——`~/.qoder-cn/shared_client/cache/db/local.db`、`%APPDATA%\QoderCN\SharedClientCache\cache\db\local.db`、`%APPDATA%\Qoder CN\SharedClientCache\cache\db\local.db`；`QODER_CN_DIR` 覆盖（覆盖根下同样三布局探测）
-- **格式**：SQLite（readonly），同 Qoder（共享内核 `src/main/plugins/_lib/qoder-shared.ts`）；`input_semantics=0`
-- **关键字段**：同 Qoder（`chat_message` 表 / `token_info` / model 两级 / `gmt_create` / rowid 游标）
-
-### Kimi Code（`kimi`，已实现）
-
-- **数据位置**：`~/.kimi-code/sessions\<workspace>\<sessionId>\agents\<agent>\wire.jsonl`（Windows：`%USERPROFILE%\.kimi-code\sessions\`）；`KIMI_CODE_HOME` 覆盖
-- **格式**：JSONL；`input_semantics=2`（纯新输入，input 与 cache 桶互斥）
-- **关键字段**：仅取 `type=="usage.record"` 且 `usageScope=="turn"` 的行（`step.end` / session 汇总行排除，防双计）；usage 桶为 camelCase `inputOther / output / inputCacheRead / inputCacheCreation`（snake_case `input_other / input_cache_read / input_cache_creation` 为旧版 kimi-cli 形态，取值双名兼容）；`model / time`（毫秒）；行级无稳定 id，不设 requestId，靠 `(file_path, line)` 主键幂等
-
-### Zed（`zed`，已实现）
-
-- **数据位置**：`%LOCALAPPDATA%\Zed\threads\threads.db`（win32）；*nix `~/.local/share/zed/threads/threads.db`；`ZED_DIR` 覆盖（语义 = **数据根**，库在其下 `threads.db`）
-- **格式**：SQLite（只读），`threads.data` 列为 zstd 压缩 JSON 或明文（按魔数判定）；`input_semantics=2`（逐请求四桶互斥）
-- **关键字段**：`data` 解压后取 `request_token_usage`：`input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens`（四桶互斥，semantics=2 依据）；解压复用项目 fzstd 依赖（zstd 帧），单条解压上限 **32MB**（`MAX_THREAD_JSON_BYTES`）；仅统计 provider 为 `zed.dev` 的行（大小写不敏感；外部 provider 由各自插件统计避免双算）、排除 imported 会话；requestId = `<threadId>:<usage 键>`；**Zed 写库走 ON CONFLICT UPDATE、rowid 不变——插件用双水位游标：`line_offset` 存 rowid，`byte_offset` 复用为 updated_at 毫秒水位**（updated_at 变化的行即使 rowid 低于水位也重析， requestId 幂等去重收敛）；条目无时间戳时按 thread 级 `created_at → updated_at → JSON.updated_at` 链回退
-
-### Kiro CLI（`kiro`，已实现）
-
-> [!todo] 待验证
-> explicit 计数当前恒 0（服务端未下发），待真实数据回填验证。
-
-- **数据位置**：`%USERPROFILE%\.kiro\sessions\cli\`；*nix `~/.kiro/sessions/cli/`；`KIRO_DIR` 覆盖
-- **格式**：枚举与游标挂 `.jsonl` 转录文件（过滤 `.lock` / `.history` 附属文件），但 **`.jsonl` 行内不含 token 字段**——usage 唯一落点是伴生 `<session>.json` sidecar 的 `session_state.conversation_metadata.user_turn_metadatas[]`（`input_token_count / output_token_count / end_timestamp`）；`input_semantics=0`（来源无语义声明）
-- **关键字段**：解析读 sidecar、仅统计 explicit 实测值——**当前社区实测服务端下发恒 0，记录稀少属预期**（项目决策禁止推算，不做任何估算回退，全零 turn 不产出）；model = 会话级 `rts_model_state.model_info.model_id`（缺失时游标不动等待回填）；requestId = `<sessionId>:<turnIndex>`
-
-### Reasonix（`reasonix`，已实现）
-
-- **数据位置**：`%APPDATA%\reasonix\stats\YYYY-MM-DD.jsonl`（按天分文件）；*nix `~/.reasonix/stats/`；路径优先级 `REASONIX_STATE_HOME > REASONIX_HOME > 平台默认`（官方 CONFIG_PATHS.md v1.8.1+）
-- **格式**：JSONL；`input_semantics=1`（官方 run_metrics.go 费用公式仅对 cache_hit / cache_miss / completion 三桶计价，证实 `prompt = cache_hit + cache_miss` 为含缓存总量，计费前扣减）
-- **关键字段**：逐请求一条：`ts / model / prompt / completion / reasoning / cache_hit / cache_miss`；usage 唯一落点为 stats 文件（会话文件不带用量）；`turn:true` 行（轮汇总）跳过防双计
-
-### Command Code（`command-code`，已实现）
-
-- **数据位置**：`%USERPROFILE%\.commandcode\projects\<slug>\<session>.jsonl`；*nix `~/.commandcode/projects/`；`COMMANDCODE_DIR` 覆盖（官方无该环境变量机制，属本项目测试钩子）
-- **格式**：JSONL v3 类型化事件流；`input_semantics=2`（usage 四桶 DISJOINT）；扫描跳过 `*.checkpoints.jsonl`
-- **关键字段**：assistant 行 `usage{inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUsd}`；requestId = `<id>:<timestampMs|-1>`（tokscale 同款组合键，无时间戳时以 `-1` 哨兵）；rewind 产生树状孤儿分支——叶链回溯只保留活跃分支（断链 fail open 全保留），同 requestId 多行靠 dedup_ledger 语义去重；model 三级来源：行 `model` → `model_change` 事件回溯 → `'unknown'`
-
-### Copilot Chat（`copilot-chat`，已实现）
-
-- **数据位置**：双位置——`%APPDATA%\Code\User\globalStorage\emptyWindowChatSessions\*.jsonl` 与 `%APPDATA%\Code\User\workspaceStorage\<hash>\chatSessions\*.jsonl`；*nix 对应 `~/.config/Code/User/` 同构路径；`COPILOT_CHAT_DIR` 覆盖（语义 = **VS Code User 目录**）
-- **格式**：JSONL chat storage v3 patch 增量流（kind=0 header / kind=1 路径赋值 / kind=2 数组追加，需顺序合并重建状态）；`input_semantics=2`
-- **关键字段**：usage 为 `requests` 条目的 `promptTokens / completionTokens`（patch 演进取终值；全量重析 + requestId 幂等去重应对行号漂移）；model = `modelId` 原样保留（`copilot/claude-haiku-4.5` 等，不走归一化前的猜测）；无 cache 桶（四桶记 0）、无 cost（费用走本地定价）；latencyMs = `elapsedMs`；格式已基于本机 2026-09 实测样本核验（404 个会话文件、171 个真实请求条目）
-
-## 失败判定（已实现，2026-08-27，T01 矩阵 SSOT）
-
-> 契约 SSOT：`shared/failure.ts` 的 `isIgnoredFailureReason` / `IGNORED_FAILURE_STATUSES` / `ERROR_MESSAGE_MAX_LENGTH` 常量与 `shared/dto.ts` 的 `UsageRecord` / `RequestStatus` 类型（代码注释已于 2026-08-28 全部移除，知识库为唯一事实来源），本节为面向实现的逐插件展开；`shared/failure.ts` 的 `ERROR_MESSAGE_MAX_LENGTH=500` 与 `IGNORED_FAILURE_STATUSES=['cancelled','interrupted']` 为截断与中断忽略的唯一来源。约束：`httpStatus` / `errorMessage` 仅 `status='error'` 时有效，成功/中断为 `undefined`（存储层为 `NULL`，见 [数据模型](data-model.md) v8）；`status` 缺省视为 `'success'`。
-
-通用规则：HTTP 4xx/5xx、isApiErrorMessage、LLM failure、`status != completed/success` 即判 `error`；`cancelled` / `interrupted`（大小写不敏感，`isIgnoredFailureReason`）属用户中断，**忽略不计 error**——插件层不产出 error 记录，collector 不放行亦不入库，不触发失败告警与 rollup `error_count`。
-
-> 覆盖范围：下表 T01 矩阵当前覆盖**首批 8 源**（2026-09-10 第二批 14 源接入时未实现失败判定——新源解析为宽松兜底、不产出 error 记录，后续迭代再逐源补齐）。
-
-| 插件 | 失败触发（任一即 error，互斥于 success） | httpStatus 来源 | errorMessage 来源（截断 500） | model / tokens / 备注 |
-|---|---|---|---|---|
-| **claude** | 行顶层 `isApiErrorMessage === true`（严格相等） | `apiErrorStatus`（有限数字才写入） | 优先顶层 `content[0].text`，其次 `message.content`（数组首块 text 或字符串），`trim` 非空才采用 | model = `message.model` 否则 `<synthetic>`（合成失败模型）；tokens 四项为 0，`inputSemantics=2`；本行**与 success 互斥**，优先于 `foldById` 折叠，失败记录不参与流式折叠（避免吞并）；`requestId = message.id`/`uuid`/`id` 三级回退 |
-| **codex** | `payload.type === 'stream_error'`（`payload.type='turn_aborted'` 属 `interrupted` 忽略，返回 null） | `payload.codex_error_info.http_status_code`（兼容 `httpStatusCode`/`http_status`/`status_code` 驼峰/下划线，字符串数字亦兼容） | `payload.message`（宽松 string） | model = `state.model ?? 'unknown'`；tokens 四项 0，`semantics=1`；`requestId` 不设（codex stream_error 无稳定 id，退回主键去重）；`createdAt` 宽松：行 `timestamp` → `payload.timestamp/time` → `payload.info.time/timestamp` → `Date.now()` |
-| **gemini** | 消息 `type === 'error'`（双格式均以该标记为准：legacy 单 JSON 的 `messages[]` 与新版 append-only JSONL 的消息行） | 不设（无精确码，存 `NULL`） | `content` / `text` / `message` / `error` / `errorMessage` 宽松提取（字符串或 `{text/content}` 数组拼接，`trim` 非空，`slice(0,500)`） | model = 前一条 `gemini` 消息的 `model` 回退，否则 `'unknown'`；tokens 四项 0，`semantics=1`；`lastModel` 由全量扫描维护（窗口外亦更新，保证增量续读时 error 能回退取到最近成功模型）；`requestId = msg.id` 透传；JSONL 解析中 `error` 与 `gemini` 共享 `sessionId/lastModel` 状态机，`inRange` 控制产出与游标 |
-| **zcode** | `model_usage.status != 'completed' && error_type != null && error_type !== 'cancelled'`（精确判定，`cancelled` 忽略） | `error_code` 转数字（有限数保留，字符串数字兼容） | `error_message`（`trim` 非空，截断 500） | 行经 `SELECT m.*` 宽松兼容旧库缺列（缺字段时视为 success）；model 仍为 `model_id`；tokens 仍按原列取值（失败亦可带 token）；`semantics=1`；`requestId = model_usage.id`；`createdAt = completed_at ?? started_at ?? Date.now()` |
-| **dsh** | `type === 'llm/retry' && data.failure` 为对象存在时（`llm/retry-started` 无 failure 属忽略，会话级中断亦忽略） | 不设（无精确码） | `[code] message` 拼接（`code/message` 取 `failure.code/message|error|text`，缺失时回退 `JSON.stringify(failure)`），`slice(0,500)` | model = `failure.model` / `data.model` / 缓存 `currentModel` 三级，否则 `'unknown'`；tokens 四项 0，`semantics=2`；`requestId = <sessionId>:<seq>` 与成功路径一致；`createdAt = envelope.time` |
-| **grok** | 宽松探测：`msg=="shell.turn.inference_done"` 且存在 `error` 字段（`error/errorMessage/error_message` 任一非空）**或** `status != 'success'`（含数值 ≥400） | 宽松遍历 `row.httpStatus/http_status/http_status_code` / `ctx` 同名 / `statusCode` / 嵌套 `error` 对象内 `code/status` 等，首个有限数字 | 优先 `error`/`errorMessage` 字段（含对象内 `message/error/text/content` 或 `JSON.stringify` 回退），兜底 `status` 异常文案 | 中断忽略：任一候选文本含 `cancelled/canceled/interrupted` 即忽略（不产出，见 `isIgnoredText`）；失败时 `inputTokens/outputTokens/cacheRead` 保留原 `prompt_tokens/completion_tokens/cached_prompt_tokens`（如有）否则 0；`model` 仍取 `summary.json` 映射；`requestId = sid:loop_index` |
-| **opencode** | 宽松探测：`data.error / errorMessage / error_message` 任一非空 **或** `status/state` 非 `success/completed/ok`（含数值 ≥400） | 宽松遍历 `data.httpStatus/http_status/statusCode/code` 及 `error` 对象内 / `dbExtra`（`SELECT m.*` 附加列 `error/http_status/status_code` 等） | 同 `errorMessage` 提取规则，`status` 异常时以 `status` 文案兜底 | 中断忽略同 grok（`cancelled/interrupted` 包含即忽略）；`tokens` 保留原值（如有）否则 0；`semantics=2`；`requestId` 三级 `opts.requestId > d.id > d.message.id`；db 路径 `SELECT m.*` 兼容未来 `error` 列，`dbExtra` 收集 `error/status/http_status` 等附加字段宽松传给探测 |
-| **pi** | 宽松探测：`isError/is_error === true` **或** 存在 `error/errorMessage/error_message` **或** `status/state` 非 `success/completed/ok`（数值 ≥400） | 宽松遍历 `entry/msg` 的 `httpStatus/http_status/statusCode/code` 及嵌套 `error` 对象内 `code/status` | 同上，`status` 异常时以 `status` 文案兜底（`isError` 标记本身无文本亦查相邻文案） | 中断忽略同上；失败时 `model` 缺失则回退 `'unknown'`（成功路径要求 model 非空，失败宽松）；tokens 保留原 `usage.{input,output,cacheRead,cacheWrite}` 否则 0；`semantics=2`；`requestId = entry.id` |
-
-补充约束（首批 8 插件统一，失败判定覆盖源）：
-
-- **零 token 放行**：失败记录即使 `input/output/cacheRead/cacheCreation` 四项全 0 亦经 `collector.isAllZeroUsage` 放行入库（`status==='error'` 时 `isAllZeroUsage` 返回 `false`），成功记录仍保持全零拦截（见 [同步与去重](sync-mechanism.md) 与 [数据流](data-flow.md)）。
-- **截断位置**：插件层与 `storage.toUsageRecordRow` 双层截断 500（`ERROR_MESSAGE_MAX_LENGTH`），表格预览另截断 64，详情抽屉完整展示；`collector.truncateErrorMessage` 入库前再收敛一次。
-- **性能**：首批 8 插件失败分支均为追加的 `if` 字符串/对象字段宽松比较 + 单次 `slice(0,500)`，无正则/全表扫描，成功路径仅多一次相等比较，热点路径（JSONL 解析 / SQLite 扫描 / zstd 解压）零回退。
-
-各插件共同行为：
-
-- 文件过滤仅收 `*.jsonl` / `*.json` 候选（gemini 仅 `session-*`，grok 仅 `unified.jsonl` 与 `summary.json`，dsh 仅固定名 `session.jsonl[.zstd]`），排除临时/隐藏文件（`.tmp`、`.swp`、`.`前缀、`~`后缀）。
-- requestId 宽松采用：string 且 trim 非空才写入 `source.requestId`；任一成分缺失时不设置（退回 `(file_path, line)` 主键去重），规则见 [同步与去重](sync-mechanism.md)。
-- opencode 新版 db 源的「行号」为 `time_created` 水位派生的单调序号，跨轮去重唯一。
-- 时间戳缺失/不可解析时兜底 `Date.now()`。
-- 探测短路（2026-08-26 防阻塞第二轮）：pi / dsh 的 detect 以 `hasSessionFile` 存在性短路递归取代整树 listFilesFromRoot——找到首个会话文件即返回、不再逐文件 stat。
-
-## 容错要求
-
-- 文件被 CLI 写入中读到半行 → 丢弃末尾不完整行，游标停在最后完整行。
-- 单文件解析失败不阻塞整体同步，记录错误并跳过。
-- 对未知字段宽松解析（lenient parse），日志格式随版本演进不崩溃。
+- 尾部半行、半帧不推进到不安全位置；非尾部损坏行是否跳过由各插件已验证行为决定。
+- 外部数据库始终只读；数据库/WAL mtime 用于变更检测。
+- schema 不兼容、损坏数据库和关键字段缺失应与“没有新增记录”区分。
+- 无稳定 requestId 时不使用正文、Token 或时间近似猜测跨文件身份。
+- 无法验证的 Token 字段不做估算：Kiro 拒绝字符数/credits/context 百分比换算；Droid settings 不作为 Token 来源；CodeWhale 不拆分未知四桶。
 
 ## 关联页面
 
-- [插件体系](plugin-architecture.md) — 插件如何被宿主装载。
-- [总体架构](architecture.md) — plugins 模块归属。
-- [同步与去重](sync-mechanism.md) — 游标如何与 parseFile 协同。
+- [插件体系](plugin-architecture.md)
+- [总体架构](architecture.md)
+- [同步与去重](sync-mechanism.md)
+- [数据模型](data-model.md)
 - [返回目录](../index.md)

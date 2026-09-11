@@ -186,11 +186,12 @@ export function parseTranscriptFile(filePath: string, fromLine: number): ParsedR
   let eof = false
 
   const startIndex = fromLine > 0 ? fromLine - 1 : 0
-  for (let i = startIndex; i < lines.length; i++) {
+  for (let i = 0; i < lines.length; i++) {
     const lineNumber = i + 1
     const raw = lines[i]
+    const shouldProduce = i >= startIndex
     if (raw.trim() === '') {
-      nextLine = i === lines.length - 1 ? lineNumber : lineNumber + 1
+      if (shouldProduce) nextLine = i === lines.length - 1 ? lineNumber : lineNumber + 1
       continue
     }
 
@@ -200,15 +201,15 @@ export function parseTranscriptFile(filePath: string, fromLine: number): ParsedR
     } catch {
       const onlyEmptyAfter = lines.slice(i + 1).every((l) => l === '')
       if (onlyEmptyAfter) {
-        nextLine = lineNumber
+        if (shouldProduce) nextLine = lineNumber
         eof = true
         break
       }
-      nextLine = lineNumber + 1
+      if (shouldProduce) nextLine = lineNumber + 1
       continue
     }
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
-      nextLine = lineNumber + 1
+      if (shouldProduce) nextLine = lineNumber + 1
       continue
     }
     const row = obj as Record<string, unknown>
@@ -239,20 +240,17 @@ export function parseTranscriptFile(filePath: string, fromLine: number): ParsedR
       lastEntryId = entryId
     }
 
-    if (type === 'model_change') {
-      nextLine = lineNumber + 1
-      continue
+    if (shouldProduce && type !== 'model_change') {
+      const produced = toUsageRecord(row, {
+        filePath,
+        line: lineNumber,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(project !== undefined ? { project } : {}),
+        model: modelId ?? UNKNOWN_MODEL
+      })
+      if (produced) buffered.push(produced)
     }
-
-    const produced = toUsageRecord(row, {
-      filePath,
-      line: lineNumber,
-      ...(sessionId !== undefined ? { sessionId } : {}),
-      ...(project !== undefined ? { project } : {}),
-      model: modelId ?? UNKNOWN_MODEL
-    })
-    if (produced) buffered.push(produced)
-    nextLine = lineNumber + 1
+    if (shouldProduce) nextLine = lineNumber + 1
   }
 
   if (!eof) eof = true

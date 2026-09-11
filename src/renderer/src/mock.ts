@@ -81,7 +81,16 @@ const APP_MODELS: Record<AppType, string[]> = {
   kiro: [],
   reasonix: [],
   'command-code': [],
-  'copilot-chat': []
+  'copilot-chat': [],
+  'dev-eco': [],
+  mimo: [],
+  goose: [],
+  'copilot-cli': [],
+  gptme: [],
+  'trae-agent': [],
+  codewhale: [],
+  droid: [],
+  minimax: []
 }
 
 const APP_WEIGHTS: Array<[AppType, number]> = [
@@ -389,6 +398,7 @@ let SETTINGS: AppSettings = {
   syncIntervalMs: 5 * 60 * 1000,
   retentionDays: 30,
   dataDir: '~/.config/token-monitor',
+  traeTrajectoryRoots: [],
   dailyBudgetUsd: 10,
   monthlyBudgetUsd: 200,
   statsRefreshIntervalMs: 30_000,

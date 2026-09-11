@@ -11,11 +11,13 @@ import {
   parseJsonFile,
   statMtimeMs,
   maxMtime,
-  DB_SOURCE_SUFFIX
+  DB_SOURCE_SUFFIX,
+  CHANNEL_DB_NAMES
 } from './opencode'
 import type { PluginContext } from '../../../shared/context'
 
 const ctx = {} as PluginContext
+const DB_CURSOR_MARKER = 2 ** 52
 
 let tmpDir = ''
 
@@ -37,6 +39,7 @@ function buildOpencodeDb(
       timeCreated: number
       timeUpdated?: number
       data: unknown
+      rawData?: string
     }>
   } = {}
 ): void {
@@ -66,7 +69,7 @@ function buildOpencodeDb(
   }
   const insM = db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
   for (const m of opts.messages ?? []) {
-    insM.run(m.id, m.sessionId ?? null, m.timeCreated, m.timeUpdated ?? m.timeCreated, JSON.stringify(m.data))
+    insM.run(m.id, m.sessionId ?? null, m.timeCreated, m.timeUpdated ?? m.timeCreated, m.rawData ?? JSON.stringify(m.data))
   }
   db.close()
 }
@@ -149,6 +152,15 @@ describe('detectFromRoot 探测', () => {
     expect(res.sessionDir).toBe(root)
   })
 
+  it('存在官方 prod 渠道数据库时可用', () => {
+    const root = path.join(tmpDir, 'opencode')
+    fs.mkdirSync(root, { recursive: true })
+    buildOpencodeDb(path.join(root, CHANNEL_DB_NAMES[0]), {})
+    const res = detectFromRoot(root)
+    expect(res.available).toBe(true)
+    expect(res.sessionDir).toBe(root)
+  })
+
   it('仅有旧版 storage/message 目录（空）时也可用', () => {
     const root = path.join(tmpDir, 'opencode')
     fs.mkdirSync(path.join(root, 'storage', 'message'), { recursive: true })
@@ -182,6 +194,17 @@ describe('listFilesFromRoot 收集范围', () => {
     expect(entries).toHaveLength(1)
     expect(entries[0].path).toBe(path.join(root, DB_SOURCE_SUFFIX))
     expect(entries[0].mtime).toBeGreaterThan(0)
+  })
+
+  it('主数据库与官方 prod 渠道数据库并存时全部列出', () => {
+    const root = path.join(tmpDir, 'opencode')
+    fs.mkdirSync(root, { recursive: true })
+    const mainDb = path.join(root, DB_SOURCE_SUFFIX)
+    const prodDb = path.join(root, CHANNEL_DB_NAMES[0])
+    buildOpencodeDb(mainDb, {})
+    buildOpencodeDb(prodDb, {})
+
+    expect(listFilesFromRoot(root).map((entry) => entry.path)).toEqual([mainDb, prodDb])
   })
 
   it('无 db 时收集 storage/message/*.json + storage/session/**/*.json，忽略非候选文件', () => {
@@ -246,8 +269,8 @@ describe('listFilesFromRoot WAL 感知 mtime', () => {
   })
 })
 
-describe('parseDbFile 解析与水位游标', () => {
-  it('assistant 消息产出完整 UsageRecord，project 来自 session.directory，line=time_created', () => {
+describe('parseDbFile 解析与 rowid 水位游标', () => {
+  it('assistant 消息产出完整 UsageRecord，project 来自 session.directory，source.line 使用数据库身份与 rowid 编码', () => {
     const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
     buildOpencodeDb(dbPath, {
       sessions: [{ id: 'sess-1', directory: '/Users/a/opencode-proj' }],
@@ -271,14 +294,14 @@ describe('parseDbFile 解析与水位游标', () => {
     })
     expect(res.records[0].source).toEqual({
       filePath: DB_SOURCE_SUFFIX,
-      line: 1_700_000_000_123,
+      line: res.nextLine,
       requestId: 'm-1'
     })
-    expect(res.nextLine).toBe(1_700_000_000_123)
+    expect(res.nextLine).toBeGreaterThanOrEqual(DB_CURSOR_MARKER)
     expect(res.eof).toBe(true)
   })
 
-  it('user 行与无 tokens/无 modelID 的 assistant 行不产出记录，但水位仍推进', () => {
+  it('非 assistant 与无 usage 等合法消息不产出，但 rowid 水位继续推进', () => {
     const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
     buildOpencodeDb(dbPath, {
       sessions: [{ id: 'sess-1', directory: '/p' }],
@@ -299,74 +322,153 @@ describe('parseDbFile 解析与水位游标', () => {
         }
       ]
     })
-    const res = parseDbFile(dbPath, 0)
-    expect(res.records).toHaveLength(1)
-    expect(res.records[0].source.line).toBe(2_000)
-    expect(res.nextLine).toBe(4_000)
-    expect(res.eof).toBe(true)
-  })
-
-  it('水位游标增量：只处理 time_created > fromLine 的行，nextLine 返回本次最大 time_created', () => {
-    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
-    buildOpencodeDb(dbPath, {
-      sessions: [{ id: 'sess-1', directory: '/p' }],
-      messages: [asstMsg({ id: 'm-1', time: 1_000 }), asstMsg({ id: 'm-2', time: 2_000 })]
-    })
-    const r1 = parseDbFile(dbPath, 0)
-    expect(r1.records).toHaveLength(2)
-    expect(r1.records.map((r) => r.source.line)).toEqual([1_000, 2_000])
-    expect(r1.nextLine).toBe(2_000)
+    const first = parseDbFile(dbPath, 0)
+    expect(first.records).toHaveLength(1)
+    expect(first.records[0].source.line).toBeGreaterThanOrEqual(DB_CURSOR_MARKER)
 
     const db = new Database(dbPath)
     db.prepare(
       'INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)'
-    ).run('m-3', 'sess-1', 3_000, 3_000, JSON.stringify(asstMsg({ id: 'm-3', time: 3_000 }).data))
-    db.prepare(
-      'INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)'
-    ).run('m-4', 'sess-1', 4_000, 4_000, JSON.stringify(asstMsg({ id: 'm-4', time: 4_000 }).data))
+    ).run('a-4', 'sess-1', 5_000, 5_000, JSON.stringify(asstMsg({ id: 'a-4', time: 5_000 }).data))
     db.close()
 
-    const r2 = parseDbFile(dbPath, r1.nextLine)
-    expect(r2.records).toHaveLength(2)
-    expect(r2.records.map((r) => r.source.line).sort((a, b) => a - b)).toEqual([3_000, 4_000])
-    expect(r2.nextLine).toBe(4_000)
-    expect(r2.eof).toBe(true)
-
-    const r3 = parseDbFile(dbPath, r2.nextLine)
-    expect(r3.records).toHaveLength(0)
-    expect(r3.nextLine).toBe(4_000)
-    expect(r3.eof).toBe(true)
+    const second = parseDbFile(dbPath, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0].source.line).toBe(second.nextLine)
+    expect(second.records[0].source.requestId).toBe('a-4')
   })
 
-  it('同一毫秒多消息：line 单调递增保持去重唯一', () => {
+  it('rowid 增量可采集同时间戳晚插入消息，不受 time_created 顺序影响', () => {
+    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
+    buildOpencodeDb(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      messages: [asstMsg({ id: 'm-1', time: 2_000 }), asstMsg({ id: 'm-2', time: 1_000 })]
+    })
+    const first = parseDbFile(dbPath, 0)
+    expect(first.records[1].source.line).toBe(first.records[0].source.line + 1)
+
+    const db = new Database(dbPath)
+    db.prepare(
+      'INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)'
+    ).run('m-3', 'sess-1', 1_000, 1_000, JSON.stringify(asstMsg({ id: 'm-3', time: 1_000 }).data))
+    db.prepare(
+      'INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)'
+    ).run('m-4', 'sess-1', 500, 500, JSON.stringify(asstMsg({ id: 'm-4', time: 500 }).data))
+    db.close()
+
+    const second = parseDbFile(dbPath, first.nextLine)
+    expect(second.records[0].source.line).toBe(first.nextLine + 1)
+    expect(second.records[1].source.line).toBe(first.nextLine + 2)
+    expect(second.records.map((record) => record.source.requestId)).toEqual(['m-3', 'm-4'])
+
+    const third = parseDbFile(dbPath, second.nextLine)
+    expect(third.records).toHaveLength(0)
+    expect(third.nextLine).toBe(second.nextLine)
+  })
+
+  it('旧版 time_created 数字游标会自愈为 rowid 游标并全量重读', () => {
+    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
+    buildOpencodeDb(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      messages: [asstMsg({ id: 'm-1', time: 1_700_000_000_000 }), asstMsg({ id: 'm-2', time: 1_700_000_000_001 })]
+    })
+
+    const result = parseDbFile(dbPath, 1_700_000_000_001)
+    expect(result.records.map((record) => record.source.requestId)).toEqual(['m-1', 'm-2'])
+    expect(result.records[1].source.line).toBe(result.records[0].source.line + 1)
+    expect(result.nextLine).toBeGreaterThanOrEqual(DB_CURSOR_MARKER)
+  })
+
+  it('同一毫秒多消息的 source.line 唯一且重复全量读取保持稳定', () => {
     const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
     buildOpencodeDb(dbPath, {
       sessions: [{ id: 'sess-1', directory: '/p' }],
       messages: [asstMsg({ id: 'm-1', time: 1_000 }), asstMsg({ id: 'm-2', time: 1_000 })]
     })
-    const res = parseDbFile(dbPath, 0)
-    expect(res.records).toHaveLength(2)
-    const lines = res.records.map((r) => r.source.line)
-    expect(new Set(lines).size).toBe(2)
-    expect(lines[0]).toBeLessThan(lines[1])
-    expect(res.nextLine).toBe(1_000)
+    const first = parseDbFile(dbPath, 0)
+    const second = parseDbFile(dbPath, 0)
+    expect(first.records[1].source.line).toBe(first.records[0].source.line + 1)
+    expect(second.records.map((record) => record.source.line)).toEqual(first.records.map((record) => record.source.line))
+    expect(first.records.map((record) => record.source.requestId)).toEqual(['m-1', 'm-2'])
   })
 
-  it('db 缺失 / message 表不存在 → 空结果且游标不推进', () => {
-    const missing = path.join(tmpDir, 'nope.db')
-    const r1 = parseDbFile(missing, 0)
-    expect(r1.records).toHaveLength(0)
-    expect(r1.nextLine).toBe(0)
-    expect(r1.eof).toBe(true)
+  it('数据库重建且 rowid 回退时旧游标失效并全量读取新库', () => {
+    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
+    buildOpencodeDb(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/old' }],
+      messages: [
+        asstMsg({ id: 'old-1', time: 1_000 }),
+        asstMsg({ id: 'old-2', time: 2_000 }),
+        asstMsg({ id: 'old-3', time: 3_000 })
+      ]
+    })
+    const first = parseDbFile(dbPath, 0)
 
-    const emptyDb = path.join(tmpDir, 'empty.db')
-    const db = new Database(emptyDb)
-    db.exec('CREATE TABLE unrelated (x TEXT)')
+    fs.rmSync(dbPath)
+    buildOpencodeDb(dbPath, {
+      sessions: [{ id: 'sess-new', directory: '/new' }],
+      messages: [{ ...asstMsg({ id: 'new-1', time: 4_000 }), sessionId: 'sess-new' }]
+    })
+
+    const second = parseDbFile(dbPath, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0].source.filePath).toBe(DB_SOURCE_SUFFIX)
+    expect(second.records[0].source.requestId).toBe('new-1')
+    expect(second.records[0].source.line).toBe(second.nextLine)
+    expect(second.records[0].source.line).not.toBe(first.records[0].source.line)
+    expect(second.records[0].project).toBe('/new')
+  })
+
+  it('数据库缺失、缺表或缺必要列时抛出明确错误', () => {
+    expect(() => parseDbFile(path.join(tmpDir, 'nope.db'), 0)).toThrow('无法以只读模式打开')
+
+    const missingTable = path.join(tmpDir, 'missing-table.db')
+    const db1 = new Database(missingTable)
+    db1.exec('CREATE TABLE unrelated (x TEXT)')
+    db1.close()
+    expect(() => parseDbFile(missingTable, 42)).toThrow('缺少 message 表')
+
+    const missingColumn = path.join(tmpDir, 'missing-column.db')
+    const db2 = new Database(missingColumn)
+    db2.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER);
+    `)
+    db2.close()
+    expect(() => parseDbFile(missingColumn, 99)).toThrow('message 表缺少必要列：data')
+
+    const missingSessionColumn = path.join(tmpDir, 'missing-session-column.db')
+    const db3 = new Database(missingSessionColumn)
+    db3.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+    `)
+    db3.close()
+    expect(() => parseDbFile(missingSessionColumn, 0)).toThrow('session 表缺少必要列：directory')
+  })
+
+  it('message.data 损坏或不是对象时抛错，修复后可从原游标重新读取', () => {
+    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
+    buildOpencodeDb(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      messages: [{ ...asstMsg({ id: 'broken', time: 1_000 }), rawData: '{broken' }]
+    })
+    expect(() => parseDbFile(dbPath, 0)).toThrow('message.data 不是合法 JSON')
+
+    const db = new Database(dbPath)
+    db.prepare('UPDATE message SET data = ? WHERE id = ?').run(JSON.stringify(asstMsg({ id: 'broken', time: 1_000 }).data), 'broken')
     db.close()
-    const r2 = parseDbFile(emptyDb, 42)
-    expect(r2.records).toHaveLength(0)
-    expect(r2.nextLine).toBe(42)
-    expect(r2.eof).toBe(true)
+
+    const fixed = parseDbFile(dbPath, 0)
+    expect(fixed.records).toHaveLength(1)
+    expect(fixed.records[0].source.requestId).toBe('broken')
+
+    const nonObjectPath = path.join(tmpDir, 'non-object.db')
+    buildOpencodeDb(nonObjectPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      messages: [{ ...asstMsg({ id: 'non-object', time: 2_000 }), rawData: '[]' }]
+    })
+    expect(() => parseDbFile(nonObjectPath, 0)).toThrow('message.data 不是消息对象')
   })
 })
 
@@ -452,7 +554,7 @@ describe('语义 ID(source.requestId)透传', () => {
     expect(res.records).toHaveLength(1)
     expect(res.records[0].source).toEqual({
       filePath: DB_SOURCE_SUFFIX,
-      line: 1_000,
+      line: res.nextLine,
       requestId: 'msg-db-1'
     })
   })
@@ -485,21 +587,24 @@ describe('语义 ID(source.requestId)透传', () => {
 })
 
 describe('parseFile 双源分派', () => {
-  it('path 以 opencode.db 结尾走 db 源，否则走 JSON 源', async () => {
-    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
-    buildOpencodeDb(dbPath, {
-      sessions: [{ id: 'sess-1', directory: '/p' }],
-      messages: [asstMsg({ id: 'm-1', time: 5_000 })]
-    })
-    const r1 = await opencodePlugin.parseFile(ctx, dbPath, 0)
-    expect(r1.records).toHaveLength(1)
-    expect(r1.records[0].source.filePath).toBe(DB_SOURCE_SUFFIX)
+  it('core.dbNames 中的主库与 prod 渠道库均走数据库解析，其余文件走 JSON 解析', async () => {
+    for (const dbName of [DB_SOURCE_SUFFIX, ...CHANNEL_DB_NAMES]) {
+      const dbPath = path.join(tmpDir, dbName)
+      buildOpencodeDb(dbPath, {
+        sessions: [{ id: 'sess-1', directory: '/p' }],
+        messages: [asstMsg({ id: `m-${dbName}`, time: 5_000 })]
+      })
+      const result = await opencodePlugin.parseFile(ctx, dbPath, 0)
+      expect(result.records).toHaveLength(1)
+      expect(result.records[0].source.filePath).toBe(DB_SOURCE_SUFFIX)
+      expect(result.records[0].source.requestId).toBe(`m-${dbName}`)
+    }
 
     const jsonPath = path.join(tmpDir, 'm-1.json')
     fs.writeFileSync(jsonPath, JSON.stringify(asstMsg({ id: 'm-1', time: 6_000 }).data), 'utf8')
-    const r2 = await opencodePlugin.parseFile(ctx, jsonPath, 0)
-    expect(r2.records).toHaveLength(1)
-    expect(r2.records[0].source.filePath).toBe(jsonPath)
+    const jsonResult = await opencodePlugin.parseFile(ctx, jsonPath, 0)
+    expect(jsonResult.records).toHaveLength(1)
+    expect(jsonResult.records[0].source.filePath).toBe(jsonPath)
   })
 })
 

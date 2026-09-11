@@ -68,11 +68,16 @@ const assistantLine = (o: {
     ...(o.model !== undefined ? { model: o.model } : {})
   })
 
-const modelChangeLine = (o: { id?: string; model?: string; timestamp?: string } = {}): string =>
+const modelChangeLine = (o: {
+  id?: string
+  parentId?: string | null
+  model?: string
+  timestamp?: string
+} = {}): string =>
   JSON.stringify({
     type: 'model_change',
     id: o.id ?? 'mc-1',
-    parentId: 'a1',
+    ...(o.parentId !== undefined ? { parentId: o.parentId } : { parentId: 'a1' }),
     timestamp: o.timestamp ?? '2026-08-31T04:40:00.000Z',
     model: o.model ?? 'minimax/minimax-m3'
   })
@@ -562,6 +567,137 @@ describe('游标增量续读', () => {
     expect(res3.records[0].source.line).toBe(5)
     expect(res3.records[0].source.requestId).toBe(`a3:${Date.parse('2026-08-31T04:50:00.000Z')}`)
     expect(res3.nextLine).toBe(6)
+  })
+
+  it('重启后从前缀恢复 session、project 和模型切换，只产出游标后的记录', () => {
+    const file = path.join(tmpDir, 's.jsonl')
+    const initial = [
+      sessionHeader({ id: 'sess-restart', cwd: '/workspace/restart' }),
+      modelChangeLine({ id: 'mc-0', parentId: null, model: 'model/alpha' }),
+      userLine({ id: 'u1', parentId: 'mc-0' }),
+      assistantLine({ id: 'a1', parentId: 'u1', model: undefined as unknown as string })
+    ]
+    fs.writeFileSync(file, initial.join('\n'), 'utf8')
+    const first = parseTranscriptFile(file, 0)
+
+    fs.appendFileSync(
+      file,
+      `\n${[
+        userLine({ id: 'u2', parentId: 'a1', timestamp: T_A2 }),
+        assistantLine({ id: 'a2', parentId: 'u2', model: undefined as unknown as string, timestamp: T_A2 }),
+        modelChangeLine({ id: 'mc-1', parentId: 'a2', model: 'model/beta' }),
+        assistantLine({
+          id: 'a3',
+          parentId: 'mc-1',
+          model: undefined as unknown as string,
+          timestamp: '2026-08-31T04:42:00.000Z'
+        })
+      ].join('\n')}`,
+      'utf8'
+    )
+
+    const incremental = parseTranscriptFile(file, first.nextLine)
+    const full = parseTranscriptFile(file, 0)
+    expect([...first.records, ...incremental.records]).toEqual(full.records)
+    expect(incremental.records).toHaveLength(2)
+    expect(incremental.records.map((r) => r.model)).toEqual(['model/alpha', 'model/beta'])
+    expect(incremental.records.map((r) => r.sessionId)).toEqual(['sess-restart', 'sess-restart'])
+    expect(incremental.records.map((r) => r.project)).toEqual([
+      '/workspace/restart',
+      '/workspace/restart'
+    ])
+    expect(incremental.records.map((r) => r.source.line)).toEqual([6, 8])
+  })
+
+  it('重启增量使用完整 parentMap 和活动尾节点，结果与全量解析的新增窗口一致', () => {
+    const file = path.join(tmpDir, 's.jsonl')
+    const initial = [
+      sessionHeader({ cwd: '/workspace/fork' }),
+      userLine({ id: 'u1', parentId: null }),
+      assistantLine({ id: 'a1', parentId: 'u1', model: 'model/alpha' })
+    ]
+    fs.writeFileSync(file, initial.join('\n'), 'utf8')
+    const first = parseTranscriptFile(file, 0)
+
+    fs.appendFileSync(
+      file,
+      `\n${[
+        userLine({ id: 'orphan-user', parentId: 'a1', timestamp: T_A2 }),
+        assistantLine({ id: 'orphan-assistant', parentId: 'orphan-user', input: 9000, timestamp: T_A2 }),
+        userLine({ id: 'active-user', parentId: 'a1', timestamp: '2026-08-31T04:42:00.000Z' }),
+        assistantLine({
+          id: 'active-assistant',
+          parentId: 'active-user',
+          input: 7000,
+          timestamp: '2026-08-31T04:43:00.000Z'
+        })
+      ].join('\n')}`,
+      'utf8'
+    )
+
+    const full = parseTranscriptFile(file, 0)
+    const incremental = parseTranscriptFile(file, first.nextLine)
+    const expected = full.records.filter((record) => record.source.line >= first.nextLine)
+    expect(incremental.records).toEqual(expected)
+    expect(incremental.records.map((r) => r.source.requestId)).toEqual([
+      `active-assistant:${Date.parse('2026-08-31T04:43:00.000Z')}`
+    ])
+    expect(incremental.records[0].inputTokens).toBe(7000)
+  })
+
+  it('缺少 session 头时可从前缀行内字段恢复状态，重复增量解析保持幂等', () => {
+    const file = path.join(tmpDir, 's.jsonl')
+    const prefix = JSON.stringify({
+      type: 'message',
+      id: 'u1',
+      parentId: null,
+      sessionId: 'legacy-session',
+      cwd: '/workspace/legacy',
+      model: 'model/legacy',
+      timestamp: T_U1,
+      message: { role: 'user', content: [] }
+    })
+    fs.writeFileSync(
+      file,
+      [
+        prefix,
+        assistantLine({ id: 'a1', parentId: 'u1', model: undefined as unknown as string })
+      ].join('\n'),
+      'utf8'
+    )
+
+    const incremental = parseTranscriptFile(file, 2)
+    const repeated = parseTranscriptFile(file, 2)
+    expect(incremental).toEqual(repeated)
+    expect(incremental.records).toHaveLength(1)
+    expect(incremental.records[0]).toMatchObject({
+      sessionId: 'legacy-session',
+      project: '/workspace/legacy',
+      model: 'model/legacy'
+    })
+  })
+
+  it('前缀中间坏行单独跳过且不妨碍后续状态恢复', () => {
+    const file = path.join(tmpDir, 's.jsonl')
+    fs.writeFileSync(
+      file,
+      [
+        sessionHeader({ id: 'sess-bad-prefix', cwd: '/workspace/bad-prefix' }),
+        '{"type":"message","id":"broken"',
+        modelChangeLine({ id: 'mc-0', parentId: null, model: 'model/recovered' }),
+        assistantLine({ id: 'a1', parentId: 'mc-0', model: undefined as unknown as string })
+      ].join('\n'),
+      'utf8'
+    )
+
+    const incremental = parseTranscriptFile(file, 4)
+    expect(incremental.records).toHaveLength(1)
+    expect(incremental.records[0]).toMatchObject({
+      sessionId: 'sess-bad-prefix',
+      project: '/workspace/bad-prefix',
+      model: 'model/recovered'
+    })
+    expect(incremental.nextLine).toBe(5)
   })
 
   it('尾换行空行不越界：游标停在文件末行而非空行之后，append 回归可续读', async () => {

@@ -22,7 +22,16 @@ export const APP_META: Record<AppType, { label: string; badge: string }> = {
   kiro: { label: 'Kiro CLI', badge: 'bg-stone-500/15 text-stone-300 border-stone-500/30' },
   reasonix: { label: 'Reasonix', badge: 'bg-zinc-500/15 text-zinc-300 border-zinc-500/30' },
   'command-code': { label: 'Command Code', badge: 'bg-gray-500/15 text-gray-300 border-gray-500/30' },
-  'copilot-chat': { label: 'Copilot Chat', badge: 'bg-neutral-500/15 text-neutral-300 border-neutral-500/30' }
+  'copilot-chat': { label: 'Copilot Chat', badge: 'bg-neutral-500/15 text-neutral-300 border-neutral-500/30' },
+  'dev-eco': { label: 'DevEco Code', badge: 'bg-orange-500/15 text-orange-300 border-orange-500/30' },
+  mimo: { label: 'MiMo Code', badge: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' },
+  goose: { label: 'Goose', badge: 'bg-sky-500/15 text-sky-300 border-sky-500/30' },
+  'copilot-cli': { label: 'Copilot CLI', badge: 'bg-blue-500/15 text-blue-300 border-blue-500/30' },
+  gptme: { label: 'gptme', badge: 'bg-violet-500/15 text-violet-300 border-violet-500/30' },
+  'trae-agent': { label: 'Trae Agent', badge: 'bg-amber-500/15 text-amber-300 border-amber-500/30' },
+  codewhale: { label: 'CodeWhale', badge: 'bg-rose-500/15 text-rose-300 border-rose-500/30' },
+  droid: { label: 'Droid', badge: 'bg-teal-500/15 text-teal-300 border-teal-500/30' },
+  minimax: { label: 'MiniMax Code', badge: 'bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30' }
 }
 
 export function formatNumber(n: number, locale?: string): string {

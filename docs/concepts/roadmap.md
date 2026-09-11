@@ -1,46 +1,68 @@
 ---
 type: roadmap
 title: 里程碑与风险
-description: M1–M7 实施路线图与待研究点；插件框架先行，再铺开内置监控插件（现已 22 个）；2026-09-10 图表层 ECharts 迁移与第二批 14 数据源接入。
-tags: [roadmap, milestone, risk, planning, plugin]
-timestamp: 2026-09-10T05:57:12+08:00
+description: 当前 31 插件、schema v14 与兼容性加固完成状态，以及仍需基于证据推进的后续风险。
+tags: [roadmap, milestone, risk, plugin, schema]
+timestamp: 2026-09-11T12:03:38+08:00
 ---
 
 # 里程碑与风险
 
 > [!note] 当前状态
-> **第一阶段 M1–M6 已完成**（2026-08-20）：脚手架、插件框架内核与数据层、5 个监控插件、可视化、设置与健壮性、electron-builder 打包均已落地并通过编译/测试。M7（扩展更多监控插件 / 代理拦截 / 云账单 / 导出）待后续迭代。
+> M1–M6 已完成；M7 的“扩展更多本地监控源”已推进到 **31 个内置插件**。2026-09-11 完成本轮兼容性加固与 schema v14：当前格式、增量恢复、数据库编码水位、多根设置、requestId 明细持久化和可替换成功快照已落地。验证基线：typecheck 两段通过、vitest 54 文件 / 1166 用例通过、`pnpm build` 通过。
 
-> [!note] 截至 2026-09-10
-> 已交付 22 个内置监控插件（首批 8 + 2026-09-10 第二批 14：workbuddy/codebuddy/cline/roo-code/kilo-code/qwen/qoder/qoder-cn/kimi/zed/kiro/reasonix/command-code/copilot-chat）、统计查询卸载到只读 worker 线程、系统托盘后台常驻、仪表盘双图合并与趋势页退役、查询预聚合与联合索引 v11 及缓存口径七源索引 v12；图表层已由 Recharts 整体迁移至 ECharts 6.1（Recharts 及 d3 分组卸载，相关死代码清理），渲染层 UI/UX 系统化（QueryState 四态边界、Toast、Toggle、useDismissable、tailwind 语义设计 token、时间范围 FilterContext 全局化）；全部代码注释已于 2026-08-28 移除，`docs/` 为唯一事实来源。具体路线图与各概念实现见 [总体架构](architecture.md) / [插件体系](plugin-architecture.md) / [监控插件](monitor-plugins.md) / [数据流](data-flow.md) 等各概念页。
+## 已完成里程碑
 
-## 实施路线图
+| 里程碑 | 当前结果 |
+|---|---|
+| M1 脚手架 | Electron/electron-vite/React/TypeScript/Tailwind/better-sqlite3 打通 |
+| M2 插件框架与数据层 | registry/context/lifecycle/event-bus、六表 SQLite、schema v14、定价与游标 |
+| M3 首源闭环 | Claude 采集、计价、明细、聚合和 Dashboard 闭环 |
+| M4 内置插件扩展 | 31 个本地日志/数据库插件由宿主统一装配 |
+| M5 可视化 | Dashboard、日志、五维统计、定价、监控源、设置六页 |
+| M6 健壮性与发布 | 增量同步、失败可观测、worker 查询、托盘、构建与打包能力 |
+| M7a 兼容性加固 | DSH/Kilo/Kiro 当前格式；前缀恢复；OpenCode-like 编码水位；Trae 多根；可替换快照 |
 
-| 里程碑 | 内容 | 交付物 |
-|---|---|---|
-| **M1 脚手架** | Electron + electron-vite + React + TS + Tailwind + pnpm workspace + better-sqlite3 打通 | 可启动空壳应用 + IPC 示例 |
-| **M2 插件框架内核 + 数据层** | `core/`（registry/context/lifecycle/event-bus）+ schema/迁移/DAO/定价 seed/游标/去重表 | 插件宿主与 SQLite 模块，可单测 |
-| **M3 首个监控插件端到端** | claude 插件 + 服务 + 费用计算 + Dashboard 最小闭环（真实数据） | 第一个可用监控对象 |
-| **M4 其余内置插件** | codex / opencode / gemini / grok | 5 个内置插件全部可同步 |
-| **M5 可视化完善** | 趋势图、日志表、统计、筛选、插件启停管理、实时刷新 | 完整 Dashboard |
-| **M6 设置与健壮性** | 同步间隔、保留策略、错误上报、跨平台路径、打包 | 可发布 Beta |
-| **M7（后续）** | 扩展更多监控插件（OpenClaw / Hermes 等）/ 代理拦截 / 云账单 / 导出 | 迭代版本 |
+## 本轮完成边界
 
-**建议顺序**：先做 M2→M3 打通插件框架 + 一个监控插件的端到端闭环，验证插件化架构后再批量铺开其余插件。
+- DSH：legacy 与 v1/v2 JSONL/zstd；未来版本、`.dsh` 和 SQLite 后端显式不支持。
+- Kilo：当前 `kilo.db` + 旧扩展；当前 input/cache 关系保持未知。
+- Kiro：current `data.sqlite3` + 旧 sidecar；缺显式 Token 时拒绝估算。
+- Cline/Roo：VS Code Stable/Insiders、VSCodium、Cursor；Cline CLI/SDK-managed 会话未接入。
+- CodeWhale：保守快照，首次不回填历史，无法恢复快照间模型切换。
+- Droid：settings 只验证，不计 Token；JSONL 可替换快照收敛。
+- OpenCode/DevEco/MiMo：数据库指纹 + rowid；旧行原位更新不重产。
+- gptme：有稳定消息 ID 时处理 fork/branch 复制历史；无 ID 不猜测。
 
-## 待研究点 / 风险
+## 后续方向
 
-1. **多平台路径**：Windows / macOS / Linux 的 home 目录差异（`~`、`XDG_CONFIG_HOME` 等）。
-2. **日志格式版本漂移**：各 CLI 更新可能改 JSONL 结构 → 插件需宽松解析 + 错误兜底。
-3. **文件并发写入**：读到半行 / 临时文件（`*.jsonl.tmp`）需过滤。
-4. **数据保留**：明细无限增长 → 默认保留 N 天明细，历史走日聚合。
-5. **去重正确性**：fork/rewrite 双算与漏算的平衡，需样本验证。
-6. **插件生命周期**：热装载/卸载的时序与资源泄漏需重点验证。
-7. **OpenClaw / Hermes 日志格式（后续阶段）**：需自行调研其本地日志格式与路径，扩展时再做。
+后续工作必须先取得一手代码、数据或原始文档证据：
+
+1. Cline CLI/SDK-managed 会话的独立本地存储和 Token schema。
+2. DSH 未来版本、容器或 SQLite 后端的正式格式。
+3. Kilo current input 与缓存桶的包含关系。
+4. CodeWhale 逐 turn 权威四桶和稳定请求身份。
+5. Kiro 在不同服务版本中的显式 Token 可用性。
+6. Droid settings 是否形成稳定、跨 provider 的权威四桶契约。
+7. 各 SQLite 上游发生 schema 迁移或原位更新时的版本识别。
+8. 新监控源、数据导出和更细的兼容版本矩阵。
+
+项目定位仍是**扫描本地会话日志和数据库**，不规划代理拦截。
+
+## 风险控制
+
+- 外部数据只读，不写回 CLI 会话库。
+- schema 漂移必须显式可见，不能伪装成零新增。
+- 无法验证的 Token、requestId 或父子关系不估算、不猜测。
+- 多根目录只能显式配置或使用已验证候选，不做宽范围扫描。
+- 新旧格式并存时必须证明不会重复计数。
+- 可替换快照只对逐源明确标记的成功记录开放。
+- 文档数值必须由实际代码或实际验证结果计算。
 
 ## 关联页面
 
-- [项目总览](overview.md) — 目标与技术栈。
-- [插件体系](plugin-architecture.md) — M2 的实现对象。
-- [监控插件](monitor-plugins.md) — M3/M4 的实现对象。
+- [项目总览](overview.md)
+- [总体架构](architecture.md)
+- [监控插件](monitor-plugins.md)
+- [数据模型](data-model.md)
 - [返回目录](../index.md)
