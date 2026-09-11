@@ -208,6 +208,7 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
     cacheCreationTokens: toNum(u.cache_creation_input_tokens),
     inputSemantics: 2,
     status: 'success',
+    ...(requestId ? { isReplaceableSnapshot: true } : {}),
     createdAt: Number.isNaN(parsed) ? Date.now() : parsed,
     project: typeof row.cwd === 'string' ? row.cwd : undefined,
     sessionId: typeof row.sessionId === 'string' ? row.sessionId : undefined,
@@ -215,28 +216,48 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
   }
 }
 
-export function foldById(records: UsageRecord[]): UsageRecord[] {
+function rememberBestById(bestById: Map<string, UsageRecord>, record: UsageRecord): void {
+  if (record.status === 'error') return
+  const requestId = record.source.requestId
+  if (!requestId) return
+  const current = bestById.get(requestId)
+  if (!current || record.outputTokens >= current.outputTokens) {
+    bestById.set(requestId, record)
+  }
+}
+
+function foldByIdFromHistory(
+  records: UsageRecord[],
+  bestById: Map<string, UsageRecord>
+): UsageRecord[] {
   const out: UsageRecord[] = []
   const slots = new Map<string, number>()
-  for (const rec of records) {
-    if (rec.status === 'error') {
-      out.push(rec)
+  for (const record of records) {
+    if (record.status === 'error') {
+      out.push(record)
       continue
     }
-    const rid = rec.source.requestId
-    if (!rid) {
-      out.push(rec)
+    const requestId = record.source.requestId
+    if (!requestId) {
+      out.push(record)
       continue
     }
-    const existing = slots.get(rid)
+    const current = bestById.get(requestId)
+    if (current && record.outputTokens < current.outputTokens) continue
+    bestById.set(requestId, record)
+    const existing = slots.get(requestId)
     if (existing === undefined) {
-      slots.set(rid, out.length)
-      out.push(rec)
-    } else if (rec.outputTokens >= out[existing].outputTokens) {
-      out[existing] = rec
+      slots.set(requestId, out.length)
+      out.push(record)
+    } else {
+      out[existing] = record
     }
   }
   return out
+}
+
+export function foldById(records: UsageRecord[]): UsageRecord[] {
+  return foldByIdFromHistory(records, new Map())
 }
 
 async function parseFile(
@@ -257,6 +278,21 @@ async function parseFile(
   let eof = false
 
   const startIndex = fromLine > 0 ? fromLine - 1 : 0
+  const bestById = new Map<string, UsageRecord>()
+  for (let i = 0; i < Math.min(startIndex, lines.length); i++) {
+    const raw = lines[i]
+    if (raw.trim() === '') continue
+    let obj: unknown
+    try {
+      obj = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (toErrorRecord(obj, filePath, i + 1)) continue
+    const record = toUsageRecord(obj, filePath, i + 1)
+    if (record) rememberBestById(bestById, record)
+  }
+
   for (let i = startIndex; i < lines.length; i++) {
     const lineNumber = i + 1
     const raw = lines[i]
@@ -292,7 +328,7 @@ async function parseFile(
 
   if (!eof) eof = true
 
-  const records = foldById(buffered)
+  const records = foldByIdFromHistory(buffered, bestById)
   return { records, nextLine, eof }
 }
 

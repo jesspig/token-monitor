@@ -36,10 +36,10 @@ const DSH_TS = 1770000000000
 const SESSION_ID = 'sess-dsh-1'
 const CWD = '/home/alice/demo'
 
-const headerLine = (o: { id?: string; cwd?: string } = {}): string =>
+const headerLine = (o: { id?: string; cwd?: string; version?: number } = {}): string =>
   JSON.stringify({
     type: 'session',
-    version: 0,
+    version: o.version ?? 0,
     id: o.id ?? SESSION_ID,
     cwd: o.cwd ?? CWD,
     createdAt: DSH_TS
@@ -202,30 +202,60 @@ describe('dataRootOf 环境变量覆盖', () => {
 })
 
 describe('detectFromRoot 探测逻辑', () => {
-  it('数据根缺失时不可用，reason 含 $DSH_HOME 提示与 SQLite 后端不支持说明', () => {
+  it('数据根缺失时不可用，reason 含 $DSH_HOME 提示与 SQLite 后端范围说明', () => {
     const root = path.join(tmpDir, 'sessions')
     const res = detectFromRoot(root)
     expect(res.available).toBe(false)
     expect(res.reason).toContain('$DSH_HOME')
-    expect(res.reason).toContain('SQLite 后端暂不支持')
+    expect(res.reason).toContain('SQLite 后端不在当前插件支持范围')
     expect(res.sessionDir).toBe(root)
   })
 
-  it('数据根存在但无会话工件时不可用；有固定名工件时可用', () => {
+  it('数据根存在但无会话工件时不可用；旧格式与截至 2026-09-10 的 v1/v2 版本化格式均可用', () => {
     const root = path.join(tmpDir, 'sessions')
     fs.mkdirSync(root, { recursive: true })
     fs.writeFileSync(path.join(root, 'notes.db'), 'x')
     expect(detectFromRoot(root).available).toBe(false)
 
-    writeJsonl(path.join(root, '--home-alice-demo--', 'abc123', 'session.jsonl.zstd'), ['placeholder'])
+    writeJsonl(path.join(root, '--home-alice-demo--', 'legacy', 'session.jsonl.zstd'), ['placeholder'])
+    writeJsonl(path.join(root, '--home-alice-demo--', 'v1', 'session.v1.jsonl'), [headerLine()])
+    writeJsonl(path.join(root, '--home-alice-demo--', 'v2', 'session.v2.jsonl.zstd'), ['placeholder'])
     const res = detectFromRoot(root)
     expect(res.available).toBe(true)
     expect(res.sessionDir).toBe(root)
   })
+
+  it('只有未来版本、未知压缩或 .dsh 文件时显式报告不兼容，不伪装成未安装或无会话', () => {
+    const root = path.join(tmpDir, 'sessions')
+    fs.mkdirSync(root, { recursive: true })
+    writeJsonl(path.join(root, 'session.v3.jsonl'), [headerLine()])
+    writeJsonl(path.join(root, 'session.v2.jsonl.gz'), [headerLine()])
+    fs.writeFileSync(path.join(root, 'export.dsh'), 'not-an-official-container')
+
+    const res = detectFromRoot(root)
+    expect(res.available).toBe(false)
+    expect(res.reason).toContain('不兼容')
+    expect(res.reason).toContain('session.v3.jsonl')
+    expect(res.reason).toContain('session.v2.jsonl.gz')
+    expect(res.reason).toContain('export.dsh')
+    expect(res.reason).toContain('官方持久化定义未提供 .dsh 会话容器')
+    expect(res.reason).not.toContain('未安装')
+  })
+
+  it('支持格式与未知格式并存时保持可用，同时通过 reason 暴露不兼容工件', () => {
+    const root = path.join(tmpDir, 'sessions')
+    writeJsonl(path.join(root, 'session.v2.jsonl'), [headerLine()])
+    writeJsonl(path.join(root, 'session.v7.jsonl'), [headerLine()])
+
+    const res = detectFromRoot(root)
+    expect(res.available).toBe(true)
+    expect(res.reason).toContain('不兼容')
+    expect(res.reason).toContain('session.v7.jsonl')
+  })
 })
 
 describe('listFilesFromRoot 收集范围', () => {
-  it('递归收集 --cwd--/<id>/ 下固定名 session.jsonl 与 session.jsonl.zstd，排除其他命名；目录缺失返回空数组', async () => {
+  it('递归收集旧格式与 v1/v2 版本化 JSONL/zstd，排除未知版本、.dsh 与临时文件；目录缺失返回空数组', async () => {
     const root = path.join(tmpDir, 'sessions')
     const encodedDir = path.join(root, '--home-alice-demo--')
     const idDirA = path.join(encodedDir, 'abc12345')
@@ -235,6 +265,13 @@ describe('listFilesFromRoot 收集范围', () => {
 
     writeJsonl(path.join(idDirA, 'session.jsonl'), [headerLine()])
     fs.writeFileSync(path.join(idDirB, 'session.jsonl.zstd'), Buffer.from([0x28, 0xb5, 0x2f, 0xfd]))
+    writeJsonl(path.join(idDirA, 'session.v1.jsonl'), [headerLine()])
+    fs.writeFileSync(path.join(idDirB, 'session.v1.jsonl.zstd'), Buffer.from([0x28, 0xb5, 0x2f, 0xfd]))
+    writeJsonl(path.join(idDirA, 'session.v2.jsonl'), [headerLine()])
+    fs.writeFileSync(path.join(idDirB, 'session.v2.jsonl.zstd'), Buffer.from([0x28, 0xb5, 0x2f, 0xfd]))
+    writeJsonl(path.join(idDirA, 'session.v3.jsonl'), [headerLine()])
+    writeJsonl(path.join(idDirA, 'session.v2.jsonl.gz'), [headerLine()])
+    writeJsonl(path.join(idDirA, 'export.dsh'), ['x'])
     writeJsonl(path.join(idDirA, 'other.jsonl'), ['x'])
     writeJsonl(path.join(idDirA, 'meta.json'), ['x'])
     writeJsonl(path.join(idDirA, 'session.jsonl.tmp'), ['x'])
@@ -243,7 +280,14 @@ describe('listFilesFromRoot 收集范围', () => {
     writeJsonl(path.join(idDirA, 'sessions.db'), ['x'])
 
     const entries = await listFilesFromRoot(root)
-    expect(entries.map((e) => path.basename(e.path)).sort()).toEqual(['session.jsonl', 'session.jsonl.zstd'])
+    expect(entries.map((e) => path.basename(e.path)).sort()).toEqual([
+      'session.jsonl',
+      'session.jsonl.zstd',
+      'session.v1.jsonl',
+      'session.v1.jsonl.zstd',
+      'session.v2.jsonl',
+      'session.v2.jsonl.zstd'
+    ])
     for (const e of entries) {
       expect(e.mtime).toBeGreaterThan(0)
     }
@@ -286,6 +330,61 @@ describe('parseFile 增量解析（raw JSONL）', () => {
     })
     expect(r.source).toEqual({ filePath: file, line: 4, requestId: `${SESSION_ID}:3` })
     expect(res.nextLine).toBe(8)
+  })
+
+  it('v1/v2 版本化裸 JSONL 沿用官方 session 事件 schema，重复解析保持稳定身份与幂等输入', async () => {
+    for (const version of [1, 2]) {
+      const file = path.join(tmpDir, `session.v${version}.jsonl`)
+      writeJsonl(file, [
+        headerLine({ version }),
+        requestHeaderLine({ seq: 1, model: 'deepseek-reasoner' }),
+        assistantMessageLine({ seq: 2, time: DSH_TS + version })
+      ])
+
+      const first = await dshPlugin.parseFile(ctx, file, 0)
+      const replay = await dshPlugin.parseFile(ctx, file, 0)
+      expect(first.records).toHaveLength(1)
+      expect(first.records[0]).toMatchObject({
+        model: 'deepseek-reasoner',
+        sessionId: SESSION_ID,
+        project: CWD,
+        source: { filePath: file, line: 3, requestId: `${SESSION_ID}:2` }
+      })
+      expect(replay.records).toEqual(first.records)
+      expect(replay.nextLine).toBe(first.nextLine)
+    }
+  })
+
+  it('模拟进程重启后裸 JSONL 从行游标续读时重放前缀恢复 session/model，仅产出新增记录', async () => {
+    const file = path.join(tmpDir, 'session.v2.jsonl')
+    writeJsonl(file, [
+      headerLine({ version: 2 }),
+      requestHeaderLine({ seq: 1, model: 'deepseek-reasoner' }),
+      assistantMessageLine({ seq: 2 })
+    ])
+    const first = await dshPlugin.parseFile(ctx, file, 0)
+    fs.appendFileSync(file, `\n${userMessageLine(3)}\n${assistantMessageLine({ seq: 4 })}`, 'utf8')
+
+    dshPlugin.dispose?.(ctx)
+    const second = await dshPlugin.parseFile(ctx, file, first.nextLine)
+
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      model: 'deepseek-reasoner',
+      sessionId: SESSION_ID,
+      project: CWD,
+      source: { filePath: file, line: 5, requestId: `${SESSION_ID}:4` }
+    })
+    expect(second.records.some((record) => record.source.requestId === `${SESSION_ID}:2`)).toBe(false)
+  })
+
+  it('parseFile 对 .dsh 与未知版本文件不猜测解析，保持游标不推进', async () => {
+    for (const name of ['export.dsh', 'session.v3.jsonl', 'session.v2.jsonl.gz']) {
+      const file = path.join(tmpDir, name)
+      writeJsonl(file, [headerLine(), requestHeaderLine({ seq: 1 }), assistantMessageLine({ seq: 2 })])
+      const res = await dshPlugin.parseFile(ctx, file, 7)
+      expect(res).toEqual({ records: [], nextLine: 7, eof: true })
+    }
   })
 
   it('游标增量：fromLine 续读只产出新增 assistant/message 条目；窗口内请求头可恢复 currentModel', async () => {
@@ -476,7 +575,7 @@ describe('parseFile 模型三级来源（source.model → message.model → requ
     expect(second.eof).toBe(true)
   })
 
-  it('缓存 cursorLine 与传入 fromLine 不一致时不用缓存，状态缺失条目按现状跳过', async () => {
+  it('缓存 cursorLine 与传入 fromLine 不一致时重放前缀恢复状态，不依赖进程内缓存', async () => {
     const file = path.join(tmpDir, 'session-cursor-drift.jsonl')
     writeJsonl(file, [
       headerLine(),
@@ -487,12 +586,18 @@ describe('parseFile 模型三级来源（source.model → message.model → requ
     expect(first.nextLine).toBe(4)
 
     const resumed = await dshPlugin.parseFile(ctx, file, 3)
-    expect(resumed.records).toEqual([])
+    expect(resumed.records).toHaveLength(1)
+    expect(resumed.records[0]).toMatchObject({
+      model: 'deepseek-v4-flash',
+      sessionId: SESSION_ID,
+      project: CWD,
+      source: { line: 3, requestId: `${SESSION_ID}:2` }
+    })
     expect(resumed.nextLine).toBe(4)
     expect(resumed.eof).toBe(true)
   })
 
-  it('矩阵 c：条目前无任何 request/header 时跳过；缓存未衔接的续读同样跳过但水位照常推进', async () => {
+  it('矩阵 c：条目前无任何 request/header 时跳过；增量续读通过文件前缀恢复请求头状态', async () => {
     const file = path.join(tmpDir, 'session-no-request-header.jsonl')
     writeJsonl(file, [
       headerLine(),
@@ -509,7 +614,13 @@ describe('parseFile 模型三级来源（source.model → message.model → requ
     expect(res.eof).toBe(true)
 
     const resumed = await dshPlugin.parseFile(ctx, file, 4)
-    expect(resumed.records).toEqual([])
+    expect(resumed.records).toHaveLength(1)
+    expect(resumed.records[0]).toMatchObject({
+      model: 'deepseek-v4-flash',
+      sessionId: SESSION_ID,
+      project: CWD,
+      source: { line: 4, requestId: `${SESSION_ID}:3` }
+    })
     expect(resumed.nextLine).toBe(5)
     expect(resumed.eof).toBe(true)
   })
@@ -736,6 +847,67 @@ function makeZstdChunks(groups: string[][]): Buffer[] {
 }
 
 describe('parseFile zstd 帧级增量解压', () => {
+  it('v1/v2 版本化 .jsonl.zstd 按官方多帧 JSONL 流解析', async () => {
+    for (const version of [1, 2]) {
+      const file = path.join(tmpDir, `session.v${version}.jsonl.zstd`)
+      const [frame] = makeZstdChunks([[
+        headerLine({ version }),
+        requestHeaderLine({ seq: 1, model: 'deepseek-reasoner' }),
+        assistantMessageLine({ seq: 2 })
+      ]])
+      fs.writeFileSync(file, frame)
+
+      const res = await dshPlugin.parseFile(ctx, file, 0)
+      expect(res.records).toHaveLength(1)
+      expect(res.records[0]).toMatchObject({
+        model: 'deepseek-reasoner',
+        sessionId: SESSION_ID,
+        project: CWD,
+        source: { filePath: file, line: 3, requestId: `${SESSION_ID}:2` }
+      })
+    }
+  })
+
+  it('模拟进程重启后从 zstd 字节游标续读：重解压已消费前缀恢复状态，尾帧不漏计不重复', async () => {
+    const file = path.join(tmpDir, 'session.v2.jsonl.zstd')
+    const [firstFrame] = makeZstdChunks([[
+      headerLine({ version: 2 }),
+      requestHeaderLine({ seq: 1, model: 'deepseek-reasoner' }),
+      assistantMessageLine({ seq: 2 })
+    ]])
+    fs.writeFileSync(file, firstFrame)
+    const first = await dshPlugin.parseFile(ctx, file, 0)
+
+    const [secondFrame] = makeZstdChunks([[
+      userMessageLine(3),
+      assistantMessageLine({ seq: 4 })
+    ]])
+    fs.appendFileSync(file, secondFrame)
+    dshPlugin.dispose?.(ctx)
+
+    const { ctx: restartedCtx, cursorWrites } = makeCtxWithStorage({
+      lineOffset: first.nextLine,
+      fileMtime: 123,
+      byteOffset: firstFrame.length
+    })
+    const second = await dshPlugin.parseFile(restartedCtx, file, first.nextLine)
+
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      model: 'deepseek-reasoner',
+      sessionId: SESSION_ID,
+      project: CWD,
+      source: { filePath: file, line: 6, requestId: `${SESSION_ID}:4` }
+    })
+    expect(second.records.some((record) => record.source.requestId === `${SESSION_ID}:2`)).toBe(false)
+    expect(cursorWrites).toEqual([{
+      filePath: file,
+      line: 8,
+      mtime: undefined,
+      byteOffset: firstFrame.length + secondFrame.length
+    }])
+  })
+
   it('多帧首读：整流逐帧解压全部完整帧，游标写回安全消费的压缩字节偏移', async () => {
     const file = path.join(tmpDir, 'session-first-read.jsonl.zstd')
     const [chunkA, chunkB] = makeZstdChunks([

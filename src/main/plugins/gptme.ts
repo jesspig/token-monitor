@@ -6,6 +6,7 @@ import type { PluginContext } from '../../../shared/context'
 import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../shared/dto'
 
 const CONVERSATION_FILE = 'conversation.jsonl'
+const BRANCHES_DIR = 'branches'
 
 export function logsRootOf(): string {
   const gptmeDir = process.env.GPTME_DIR
@@ -27,30 +28,56 @@ function isJunkName(name: string): boolean {
   return name.startsWith('.') || name.endsWith('~') || name.endsWith('.tmp') || name.endsWith('.swp')
 }
 
-function toEntry(p: string): FileEntry {
+function isFile(filePath: string): boolean {
+  try {
+    return fs.statSync(filePath).isFile()
+  } catch {
+    return false
+  }
+}
+
+function toEntry(filePath: string): FileEntry {
   let mtime = 0
   try {
-    mtime = Math.round(fs.statSync(p).mtimeMs)
+    mtime = Math.round(fs.statSync(filePath).mtimeMs)
   } catch {
     mtime = 0
   }
-  return { path: p, mtime }
+  return { path: filePath, mtime }
+}
+
+function collectBranchConversations(dir: string, out: Set<string>): void {
+  if (isJunkName(path.basename(dir))) return
+  const conversation = path.join(dir, CONVERSATION_FILE)
+  if (isFile(conversation)) out.add(conversation)
+  for (const ent of safeReaddir(dir)) {
+    if (!ent.isDirectory() || isJunkName(ent.name)) continue
+    collectBranchConversations(path.join(dir, ent.name), out)
+  }
+}
+
+function branchDepth(filePath: string): number {
+  return path
+    .normalize(filePath)
+    .split(path.sep)
+    .filter((part) => part === BRANCHES_DIR).length
 }
 
 export function listFilesFromRoot(root: string): FileEntry[] {
-  const out: FileEntry[] = []
+  const files = new Set<string>()
   for (const ent of safeReaddir(root)) {
     if (!ent.isDirectory() || isJunkName(ent.name)) continue
-    const convFile = path.join(root, ent.name, CONVERSATION_FILE)
-    let isFile = false
-    try {
-      isFile = fs.statSync(convFile).isFile()
-    } catch {
-      isFile = false
+    const sessionDir = path.join(root, ent.name)
+    const conversation = path.join(sessionDir, CONVERSATION_FILE)
+    if (isFile(conversation)) files.add(conversation)
+    const branchesDir = path.join(sessionDir, BRANCHES_DIR)
+    if (safeReaddir(branchesDir).length > 0 || isFile(path.join(branchesDir, CONVERSATION_FILE))) {
+      collectBranchConversations(branchesDir, files)
     }
-    if (isFile) out.push(toEntry(convFile))
   }
-  return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  return [...files]
+    .sort((a, b) => branchDepth(a) - branchDepth(b) || (a < b ? -1 : a > b ? 1 : 0))
+    .map(toEntry)
 }
 
 export function detectFromRoot(root: string): Detection {
@@ -78,8 +105,22 @@ export function parseTsMs(v: unknown): number {
   return Date.now()
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+}
+
+export function stableMessageIdOf(obj: unknown): string | undefined {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return undefined
+  const row = obj as Record<string, unknown>
+  const direct = nonEmptyString(row.id) ?? nonEmptyString(row.message_id)
+  if (direct) return direct
+  const metadata = row.metadata
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return undefined
+  return nonEmptyString((metadata as Record<string, unknown>).message_id)
+}
+
 function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecord | null {
-  if (!obj || typeof obj !== 'object') return null
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null
   const row = obj as Record<string, unknown>
   if (row.role !== 'assistant') return null
   const meta = row.metadata
@@ -92,6 +133,7 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
       : metaObj
   const model = typeof src.model === 'string' ? src.model.trim() : ''
   if (!model) return null
+  const messageId = stableMessageIdOf(row)
   return {
     appType: 'gptme',
     model,
@@ -103,7 +145,7 @@ function toUsageRecord(obj: unknown, filePath: string, line: number): UsageRecor
     inputSemantics: 2,
     status: 'success',
     createdAt: parseTsMs(row.timestamp),
-    source: { filePath, line }
+    source: { filePath, line, ...(messageId ? { requestId: messageId } : {}) }
   }
 }
 
@@ -136,7 +178,7 @@ export function parseConversationFile(filePath: string, fromLine: number): Parse
     try {
       obj = JSON.parse(raw)
     } catch {
-      const onlyEmptyAfter = lines.slice(i + 1).every((l) => l === '')
+      const onlyEmptyAfter = lines.slice(i + 1).every((value) => value === '')
       if (onlyEmptyAfter) {
         nextLine = lineNumber
         eof = true

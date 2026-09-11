@@ -7,7 +7,8 @@ import {
   dataRootOf,
   detectFromRoot,
   listFilesFromRoot,
-  parseSessionFile
+  parseSessionFile,
+  parseSettingsSummaryFile
 } from './droid'
 import type { PluginContext } from '../../../shared/context'
 
@@ -179,7 +180,7 @@ describe('环境变量覆盖下 detect 与 listFiles 走覆盖目录', () => {
 })
 
 describe('listFilesFromRoot 双布局收集', () => {
-  it('sessions/ 与 projects/ 子树 jsonl 全收（含 agent-*.jsonl），settings.json 与临时隐藏文件排除', () => {
+  it('sessions/ 与 projects/ 子树收集 JSONL 和配套 settings，临时隐藏文件排除', () => {
     const root = path.join(tmpDir, 'factory')
     const sessions = path.join(root, 'sessions')
     fs.mkdirSync(path.join(sessions, 'projA'), { recursive: true })
@@ -203,6 +204,7 @@ describe('listFilesFromRoot 双布局收集', () => {
     expect(entries.map((e) => path.basename(e.path))).toEqual([
       'sid1.jsonl',
       'abc.jsonl',
+      'abc.settings.json',
       'agent-1.jsonl',
       'main.jsonl'
     ])
@@ -232,7 +234,8 @@ describe('parseSessionFile 正常解析与字段映射', () => {
       cacheReadTokens: 30,
       cacheCreationTokens: 20,
       inputSemantics: 2,
-      status: 'success'
+      status: 'success',
+      isReplaceableSnapshot: true
     })
     expect(r.createdAt).toBe(Date.parse('2026-09-11T08:00:00Z'))
     expect(r.project).toBe('/demo/project')
@@ -331,10 +334,130 @@ describe('同 message.id 流式分片折叠', () => {
     expect(folded.cacheCreationTokens).toBe(20)
     expect(folded.createdAt).toBe(Date.parse('2026-09-11T08:00:02Z'))
     expect(folded.source.line).toBe(3)
+    expect(folded.isReplaceableSnapshot).toBe(true)
 
     expect(res.records[1].source.requestId).toBe('m2')
     expect(res.records[1].outputTokens).toBe(7)
     expect(res.records[1].source.line).toBe(5)
+  })
+})
+
+describe('跨同步轮次可替换快照收敛', () => {
+  it('partial→final 只产出最终快照并保持相同 requestId', async () => {
+    const file = path.join(tmpDir, 'abc.jsonl')
+    fs.writeFileSync(file, [sessionStartLine(), assistantLine({ mid: 'm1', outputTokens: 10 })].join('\n'), 'utf8')
+    const first = await parseSessionFile(file, 0)
+    expect(first.records[0]).toMatchObject({ outputTokens: 10, isReplaceableSnapshot: true, source: { requestId: 'm1', line: 2 } })
+    fs.appendFileSync(file, '\n' + assistantLine({ mid: 'm1', outputTokens: 100, ts: '2026-09-11T08:00:02Z' }), 'utf8')
+    const final = await parseSessionFile(file, first.nextLine)
+    expect(final.records).toHaveLength(1)
+    expect(final.records[0]).toMatchObject({ outputTokens: 100, isReplaceableSnapshot: true, source: { requestId: 'm1', line: 3 } })
+  })
+
+  it('前缀已有更完整快照时忽略后续过期快照', async () => {
+    const file = path.join(tmpDir, 'abc.jsonl')
+    fs.writeFileSync(file, [sessionStartLine(), assistantLine({ mid: 'm1', outputTokens: 100 })].join('\n'), 'utf8')
+    const first = await parseSessionFile(file, 0)
+    fs.appendFileSync(file, '\n' + assistantLine({ mid: 'm1', outputTokens: 30 }), 'utf8')
+    const stale = await parseSessionFile(file, first.nextLine)
+    expect(stale.records).toHaveLength(0)
+  })
+
+  it('output 相同时以后出现的完整四桶快照为准', async () => {
+    const file = path.join(tmpDir, 'abc.jsonl')
+    fs.writeFileSync(file, [sessionStartLine(), assistantLine({ mid: 'm1', outputTokens: 50 })].join('\n'), 'utf8')
+    const first = await parseSessionFile(file, 0)
+    fs.appendFileSync(file, '\n' + assistantLine({ mid: 'm1', inputTokens: 140, outputTokens: 50, cacheRead: 40, cacheCreation: 25 }), 'utf8')
+    const final = await parseSessionFile(file, first.nextLine)
+    expect(final.records).toHaveLength(1)
+    expect(final.records[0]).toMatchObject({ inputTokens: 140, outputTokens: 50, cacheReadTokens: 40, cacheCreationTokens: 25, isReplaceableSnapshot: true, source: { requestId: 'm1', line: 3 } })
+  })
+
+  it('当前窗口多个新分片只返回最终胜出快照', async () => {
+    const file = path.join(tmpDir, 'abc.jsonl')
+    fs.writeFileSync(file, [sessionStartLine(), assistantLine({ mid: 'm1', outputTokens: 10 })].join('\n'), 'utf8')
+    const first = await parseSessionFile(file, 0)
+    fs.appendFileSync(file, '\n' + [30, 60, 100].map((value) => assistantLine({ mid: 'm1', outputTokens: value })).join('\n'), 'utf8')
+    const final = await parseSessionFile(file, first.nextLine)
+    expect(final.records).toHaveLength(1)
+    expect(final.records[0]).toMatchObject({ outputTokens: 100, source: { requestId: 'm1', line: 5 } })
+  })
+
+  it('一次全量与重启后的两轮增量收敛到相同最终记录', async () => {
+    const file = path.join(tmpDir, 'abc.jsonl')
+    fs.writeFileSync(file, [sessionStartLine(), assistantLine({ mid: 'm1', outputTokens: 10 })].join('\n'), 'utf8')
+    const first = await parseSessionFile(file, 0)
+    fs.appendFileSync(file, '\n' + assistantLine({ mid: 'm1', inputTokens: 150, outputTokens: 100, cacheRead: 40 }), 'utf8')
+    const incremental = await parseSessionFile(file, first.nextLine)
+    const full = await parseSessionFile(file, 0)
+    expect(incremental.records).toEqual(full.records)
+  })
+
+  it('无 message.id 的成功记录保持不可替换且不构造推测身份', async () => {
+    const file = path.join(tmpDir, 'abc.jsonl')
+    const row = JSON.parse(assistantLine()) as { message: Record<string, unknown> }
+    delete row.message.id
+    fs.writeFileSync(file, JSON.stringify(row), 'utf8')
+    const res = await parseSessionFile(file, 0)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0].source.requestId).toBeUndefined()
+    expect(res.records[0].isReplaceableSnapshot).toBeUndefined()
+  })
+})
+
+describe('settings 摘要安全发现与忽略策略', () => {
+  it('旧版、新版、过期和仅费用摘要均不作为 Token 来源', async () => {
+    const summaries = [
+      { lastTokenUsage: { inputTokens: 10, outputTokens: 5 } },
+      { lastUsageTableData: { input: 10, output: 5 }, lastCost: 0.02 },
+      { updatedAt: '2026-09-10T00:00:00Z', lastTokenUsage: { total: 99 } },
+      { provider: 'unknown-provider', lastCost: 0.5 }
+    ]
+    for (let i = 0; i < summaries.length; i++) {
+      const file = path.join(tmpDir, 'session-' + i + '.settings.json')
+      fs.writeFileSync(file, JSON.stringify(summaries[i]), 'utf8')
+      expect(await parseSettingsSummaryFile(file, 0)).toEqual({ records: [], nextLine: 1, eof: true })
+    }
+  })
+
+  it('坏 JSON 和非对象顶层显式失败', async () => {
+    const broken = path.join(tmpDir, 'broken.settings.json')
+    fs.writeFileSync(broken, '{bad', 'utf8')
+    await expect(parseSettingsSummaryFile(broken, 0)).rejects.toThrow('不是合法 JSON')
+    const array = path.join(tmpDir, 'array.settings.json')
+    fs.writeFileSync(array, '[]', 'utf8')
+    await expect(parseSettingsSummaryFile(array, 0)).rejects.toThrow('顶层必须是对象')
+  })
+
+  it('settings 缺失时保留游标且不影响 JSONL 原行为', async () => {
+    const missing = path.join(tmpDir, 'missing.settings.json')
+    expect(await parseSettingsSummaryFile(missing, 7)).toEqual({ records: [], nextLine: 7, eof: true })
+    const jsonl = path.join(tmpDir, 'session.jsonl')
+    fs.writeFileSync(jsonl, assistantLine({ mid: 'm1' }), 'utf8')
+    const res = await droidPlugin.parseFile(ctx, jsonl, 0)
+    expect(res.records).toHaveLength(1)
+  })
+
+  it('settings 通过插件入口解析且从不与 JSONL 独立累计', async () => {
+    const settings = path.join(tmpDir, 'abc.settings.json')
+    fs.writeFileSync(settings, JSON.stringify({ lastTokenUsage: { inputTokens: 100, outputTokens: 50 }, lastCost: 1 }), 'utf8')
+    expect(await droidPlugin.parseFile(ctx, settings, 0)).toEqual({ records: [], nextLine: 1, eof: true })
+  })
+
+  it('sessions 与 projects 的重复消息使用相同可替换语义身份', async () => {
+    const sessionFile = path.join(tmpDir, 'sessions', 'same.jsonl')
+    const projectFile = path.join(tmpDir, 'projects', 'same.jsonl')
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true })
+    fs.mkdirSync(path.dirname(projectFile), { recursive: true })
+    fs.writeFileSync(sessionFile, assistantLine({ mid: 'shared-message', outputTokens: 10 }), 'utf8')
+    fs.writeFileSync(projectFile, assistantLine({ mid: 'shared-message', outputTokens: 100 }), 'utf8')
+
+    const session = await parseSessionFile(sessionFile, 0)
+    const project = await parseSessionFile(projectFile, 0)
+    expect(session.records[0].source.requestId).toBe('shared-message')
+    expect(project.records[0].source.requestId).toBe('shared-message')
+    expect(session.records[0].isReplaceableSnapshot).toBe(true)
+    expect(project.records[0].isReplaceableSnapshot).toBe(true)
   })
 })
 

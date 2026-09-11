@@ -97,26 +97,20 @@ const DELTA_STATE_CACHE_MAX = 512
 
 const deltaStateCache = new Map<string, FileDeltaState>()
 
-function toShutdownRecords(
+export function clearCopilotCliDeltaStateCache(): void {
+  deltaStateCache.clear()
+}
+
+function applyShutdownWatermarks(
   row: Record<string, unknown>,
-  filePath: string,
-  lineNumber: number,
   models: Map<string, TokenWatermark>
-): UsageRecord[] {
+): Array<{ model: string; delta: TokenWatermark }> {
   const data = row.data
   if (!data || typeof data !== 'object') return []
   const metrics = (data as Record<string, unknown>).modelMetrics
   if (!metrics || typeof metrics !== 'object') return []
 
-  const requestIdBase =
-    typeof row.id === 'string' && row.id.trim() !== ''
-      ? row.id.trim()
-      : typeof row.timestamp === 'string' && row.timestamp.trim() !== ''
-        ? row.timestamp.trim()
-        : `line-${lineNumber}`
-  const createdAt = parseTsMs(row.timestamp)
-
-  const records: UsageRecord[] = []
+  const deltas: Array<{ model: string; delta: TokenWatermark }> = []
   for (const [model, entry] of Object.entries(metrics as Record<string, unknown>)) {
     if (!entry || typeof entry !== 'object') continue
     const usage = (entry as Record<string, unknown>).usage
@@ -135,8 +129,35 @@ function toShutdownRecords(
       cacheRead: Math.max(0, cum.cacheRead - prev.cacheRead),
       cacheWrite: Math.max(0, cum.cacheWrite - prev.cacheWrite)
     }
-    if (delta.input === 0 && delta.output === 0 && delta.cacheRead === 0 && delta.cacheWrite === 0) continue
-    models.set(model, cum)
+    models.set(model, {
+      input: Math.max(prev.input, cum.input),
+      output: Math.max(prev.output, cum.output),
+      cacheRead: Math.max(prev.cacheRead, cum.cacheRead),
+      cacheWrite: Math.max(prev.cacheWrite, cum.cacheWrite)
+    })
+    if (delta.input !== 0 || delta.output !== 0 || delta.cacheRead !== 0 || delta.cacheWrite !== 0) {
+      deltas.push({ model, delta })
+    }
+  }
+  return deltas
+}
+
+function toShutdownRecords(
+  row: Record<string, unknown>,
+  filePath: string,
+  lineNumber: number,
+  models: Map<string, TokenWatermark>
+): UsageRecord[] {
+  const requestIdBase =
+    typeof row.id === 'string' && row.id.trim() !== ''
+      ? row.id.trim()
+      : typeof row.timestamp === 'string' && row.timestamp.trim() !== ''
+        ? row.timestamp.trim()
+        : `line-${lineNumber}`
+  const createdAt = parseTsMs(row.timestamp)
+
+  const records: UsageRecord[] = []
+  for (const { model, delta } of applyShutdownWatermarks(row, models)) {
     records.push({
       appType: 'copilot-cli',
       model,
@@ -154,6 +175,24 @@ function toShutdownRecords(
   return records
 }
 
+function rebuildWatermarks(lines: string[], endIndex: number): Map<string, TokenWatermark> {
+  const models = new Map<string, TokenWatermark>()
+  for (let i = 0; i < endIndex; i++) {
+    const raw = lines[i]
+    if (raw.trim() === '') continue
+    let obj: unknown
+    try {
+      obj = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (!obj || typeof obj !== 'object') continue
+    const row = obj as Record<string, unknown>
+    if (row.type === 'session.shutdown') applyShutdownWatermarks(row, models)
+  }
+  return models
+}
+
 export function parseEventsFile(filePath: string, fromLine: number): ParsedResult {
   let content: string
   try {
@@ -166,14 +205,16 @@ export function parseEventsFile(filePath: string, fromLine: number): ParsedResul
   }
 
   const lines = content.split('\n')
+  const startIndex = fromLine > 0 ? fromLine - 1 : 0
   const cached = fromLine > 1 ? deltaStateCache.get(filePath) : undefined
   const models =
-    cached && cached.cursorLine === fromLine ? cached.models : new Map<string, TokenWatermark>()
+    cached && cached.cursorLine === fromLine
+      ? new Map(cached.models)
+      : rebuildWatermarks(lines, Math.min(startIndex, lines.length))
 
   const records: UsageRecord[] = []
   let nextLine = fromLine
   let eof = false
-  const startIndex = fromLine > 0 ? fromLine - 1 : 0
 
   for (let i = startIndex; i < lines.length; i++) {
     const lineNumber = i + 1

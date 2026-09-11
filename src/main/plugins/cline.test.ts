@@ -6,9 +6,11 @@ import {
   clinePlugin,
   detectClineLikeTasks,
   listClineLikeTaskFiles,
+  listClineLikeTaskFilesFromRoots,
   parseUiMessages,
   loadHistoryModel
 } from './cline'
+import { editorGlobalStorageRoots } from './_lib/cline-roots'
 import type { PluginContext } from '../../../shared/context'
 
 const ctx = {} as PluginContext
@@ -172,10 +174,10 @@ describe('parseUiMessages 解析', () => {
     })
     expect(r.costUsd).toBeUndefined()
     expect(r.createdAt).toBe(DEFAULT_TS)
-    expect(r.source).toEqual({ filePath: FAKE_FILE, line: 0, requestId: String(DEFAULT_TS) })
+    expect(r.source).toEqual({ filePath: FAKE_FILE, line: DEFAULT_TS, requestId: String(DEFAULT_TS) })
   })
 
-  it('混合 say/ask/非对象元素跳过，产出条目 source.line 等于数组 index', () => {
+  it('混合 say/ask/非对象元素跳过，产出条目 source.line 来自稳定请求身份', () => {
     const entries = [
       otherSay(),
       apiReqStarted({ ts: 1001 }),
@@ -185,7 +187,7 @@ describe('parseUiMessages 解析', () => {
       42
     ]
     const res = parseUiMessages(FAKE_FILE, JSON.stringify(entries), 'test-model')
-    expect(res.records.map((r) => r.source.line)).toEqual([1, 3])
+    expect(res.records.map((r) => r.source.line)).toEqual([1001, 1002])
     expect(res.records.map((r) => r.source.requestId)).toEqual(['1001', '1002'])
     expect(res.nextLine).toBe(6)
   })
@@ -199,7 +201,7 @@ describe('parseUiMessages 解析', () => {
     ]
     const res = parseUiMessages(FAKE_FILE, JSON.stringify(entries), 'test-model')
     expect(res.records).toHaveLength(1)
-    expect(res.records[0].source.line).toBe(3)
+    expect(res.records[0].source.line).toBe(4)
     expect(res.nextLine).toBe(0)
     expect(res.eof).toBe(true)
   })
@@ -230,7 +232,7 @@ describe('parseUiMessages 解析', () => {
 
     const second = parseUiMessages(file, fs.readFileSync(file, 'utf8'))
     expect(second.records).toHaveLength(1)
-    expect(second.records[0].source).toEqual({ filePath: file, line: 1, requestId: '777' })
+    expect(second.records[0].source).toEqual({ filePath: file, line: 777, requestId: '777' })
     expect(second.records[0].model).toBe('gpt-4o')
     expect(second.nextLine).toBe(2)
   })
@@ -245,20 +247,14 @@ describe('parseUiMessages 解析', () => {
     const b = parseUiMessages(file, raw)
     expect(b.records.map((r) => r.source)).toEqual(a.records.map((r) => r.source))
     expect(b.records.map((r) => r.source.requestId)).toEqual(['1', '2'])
-    expect(b.records.map((r) => r.source.line)).toEqual([0, 1])
+    expect(b.records.map((r) => r.source.line)).toEqual([1, 2])
     expect(b.records.map((r) => r.inputTokens)).toEqual(a.records.map((r) => r.inputTokens))
     expect(b.nextLine).toBe(a.nextLine)
   })
 
-  it('text 非 JSON（截断字符串）容错：不产出且视为占位 nextLine=0', () => {
-    const entries = [
-      apiReqStarted({ ts: 1, text: '{"tokensIn":100,"tokensOut' }),
-      apiReqStarted({ ts: 2, text: 'not json at all' })
-    ]
-    const res = parseUiMessages(FAKE_FILE, JSON.stringify(entries))
-    expect(res.records).toHaveLength(0)
-    expect(res.nextLine).toBe(0)
-    expect(res.eof).toBe(true)
+  it('text 非 JSON 时显式报错', () => {
+    const entries = [apiReqStarted({ ts: 1, text: '{"tokensIn":100,"tokensOut' })]
+    expect(() => parseUiMessages(FAKE_FILE, JSON.stringify(entries))).toThrow('api_req_started.text')
   })
 
   it('数组为空返回空结果', () => {
@@ -268,16 +264,14 @@ describe('parseUiMessages 解析', () => {
     expect(res.eof).toBe(true)
   })
 
-  it('文件整体损坏（非 JSON）返回空结果不抛错', () => {
-    const res = parseUiMessages(FAKE_FILE, '{"ts":1763726728841,type: broken')
-    expect(res.records).toHaveLength(0)
-    expect(res.eof).toBe(true)
+  it('文件整体损坏时显式报错', () => {
+    expect(() => parseUiMessages(FAKE_FILE, '{"ts":1763726728841,type: broken')).toThrow('不是合法 JSON')
   })
 
-  it('顶层非数组（对象/数字/字符串）返回空结果', () => {
-    expect(parseUiMessages(FAKE_FILE, '{"a":1}').records).toHaveLength(0)
-    expect(parseUiMessages(FAKE_FILE, '42').records).toHaveLength(0)
-    expect(parseUiMessages(FAKE_FILE, '"str"').records).toHaveLength(0)
+  it('顶层非数组时显式报 schema 不兼容', () => {
+    expect(() => parseUiMessages(FAKE_FILE, '{"a":1}')).toThrow('顶层必须是数组')
+    expect(() => parseUiMessages(FAKE_FILE, '42')).toThrow('顶层必须是数组')
+    expect(() => parseUiMessages(FAKE_FILE, '"str"')).toThrow('顶层必须是数组')
   })
 
   it('仅 tokensOut 有效时产出且 inputTokens=0', () => {
@@ -346,12 +340,16 @@ describe('loadHistoryModel 与 parseFile 集成', () => {
     await expect(loadHistoryModel(historyPath)).resolves.toBe('gpt-4o')
   })
 
-  it('loadHistoryModel 对缺失/损坏/无 modelInfo 的 history 返回 undefined', async () => {
+  it('loadHistoryModel 对缺失和无 modelInfo 返回 undefined，对损坏或未知 schema 显式报错', async () => {
     await expect(loadHistoryModel(path.join(tmpDir, 'missing.json'))).resolves.toBeUndefined()
 
     const broken = path.join(tmpDir, 'broken.json')
     fs.writeFileSync(broken, '{broken', 'utf8')
-    await expect(loadHistoryModel(broken)).resolves.toBeUndefined()
+    await expect(loadHistoryModel(broken)).rejects.toThrow('不是合法 JSON')
+
+    const incompatible = path.join(tmpDir, 'incompatible.json')
+    fs.writeFileSync(incompatible, JSON.stringify({ messages: [] }), 'utf8')
+    await expect(loadHistoryModel(incompatible)).rejects.toThrow('顶层必须是数组')
 
     const noModel = path.join(tmpDir, 'no-model.json')
     fs.writeFileSync(noModel, JSON.stringify([{ role: 'user', content: 'hi' }]), 'utf8')
@@ -365,7 +363,7 @@ describe('loadHistoryModel 与 parseFile 集成', () => {
     ])
     const res = await clinePlugin.parseFile(ctx, file, 999)
     expect(res.records).toHaveLength(2)
-    expect(res.records.map((r) => r.source.line)).toEqual([0, 1])
+    expect(res.records.map((r) => r.source.line)).toEqual([1, 2])
     expect(res.nextLine).toBe(2)
   })
 
@@ -417,5 +415,80 @@ describe('loadHistoryModel 与 parseFile 集成', () => {
     expect(r2.records[0].source.requestId).toBe('22')
     expect(r1.records[0].model).toBe('m-a')
     expect(r2.records[0].model).toBe('m-b')
+  })
+})
+
+
+describe('多客户端目录与稳定记录身份', () => {
+  it('解析 Windows、macOS 与 Linux 的 Stable、Insiders、VSCodium、Cursor globalStorage 根', () => {
+    const win = editorGlobalStorageRoots(undefined, { platform: 'win32', homeDir: tmpDir, appData: path.join(tmpDir, 'Roaming') })
+    expect(win.map((root) => path.basename(path.dirname(path.dirname(root))))).toEqual(['Code', 'Code - Insiders', 'VSCodium', 'Cursor'])
+
+    const mac = editorGlobalStorageRoots(undefined, { platform: 'darwin', homeDir: tmpDir })
+    expect(mac.map((root) => path.basename(path.dirname(path.dirname(root))))).toEqual(['Code', 'Code - Insiders', 'VSCodium', 'Cursor'])
+
+    const linux = editorGlobalStorageRoots(undefined, { platform: 'linux', homeDir: tmpDir, xdgConfigHome: path.join(tmpDir, '.config') })
+    expect(linux.map((root) => path.basename(path.dirname(path.dirname(root))))).toEqual(['Code', 'Code - Insiders', 'VSCodium', 'Cursor'])
+  })
+
+  it('多根按规范化路径去重，并以任务 ID 折叠迁移副本', () => {
+    const roots = [path.join(tmpDir, 'Code', 'User', 'globalStorage'), path.join(tmpDir, 'Cursor', 'User', 'globalStorage')]
+    const oldFile = writeUiMessages(path.join(roots[0], EXT_ID, 'tasks', 'same-task'), [apiReqStarted({ ts: 1 })])
+    const newFile = writeUiMessages(path.join(roots[1], EXT_ID, 'tasks', 'same-task'), [apiReqStarted({ ts: 1 }), apiReqStarted({ ts: 2 })])
+    const now = new Date()
+    fs.utimesSync(oldFile, new Date(now.getTime() - 1000), new Date(now.getTime() - 1000))
+    fs.utimesSync(newFile, now, now)
+
+    const files = listClineLikeTaskFilesFromRoots([roots[0], path.resolve(roots[0]), roots[1]], EXT_ID)
+    expect(files).toHaveLength(1)
+    expect(files[0].path).toBe(newFile)
+  })
+
+  it('Cline 与 Roo 扩展目录在同一组客户端根中严格隔离', () => {
+    const roots = [path.join(tmpDir, 'Code', 'User', 'globalStorage'), path.join(tmpDir, 'Cursor', 'User', 'globalStorage')]
+    writeUiMessages(path.join(roots[0], EXT_ID, 'tasks', 'cline-task'), [apiReqStarted({ ts: 1 })])
+    writeUiMessages(path.join(roots[1], ROO_EXT_ID, 'tasks', 'roo-task'), [apiReqStarted({ ts: 2 })])
+
+    const files = listClineLikeTaskFilesFromRoots(roots, EXT_ID)
+    expect(files).toHaveLength(1)
+    expect(files[0].path).toContain(EXT_ID)
+    expect(files[0].path).not.toContain(ROO_EXT_ID)
+  })
+
+  it('数组删除与重排后 requestId 和 source.line 保持稳定', () => {
+    const first = parseUiMessages(FAKE_FILE, JSON.stringify([
+      apiReqStarted({ ts: 101, modelId: 'm' }),
+      otherSay(),
+      apiReqStarted({ ts: 202, modelId: 'm' })
+    ]))
+    const second = parseUiMessages(FAKE_FILE, JSON.stringify([
+      apiReqStarted({ ts: 202, modelId: 'm' }),
+      apiReqStarted({ ts: 101, modelId: 'm' })
+    ]))
+
+    const identities = (result: typeof first) => new Map(result.records.map((record) => [record.source.requestId, record.source.line]))
+    expect(identities(second)).toEqual(identities(first))
+    expect([...identities(first).entries()]).toEqual([['101', 101], ['202', 202]])
+  })
+
+  it('显式 requestId 在缺少时间戳时提供稳定身份，缺少任何身份时才回退数组索引', () => {
+    const entries = [
+      { type: 'say', say: 'api_req_started', requestId: 'req-stable', modelInfo: { modelId: 'm' }, text: usageInfo({ tokensIn: 1, tokensOut: 1 }) },
+      { type: 'say', say: 'api_req_started', modelInfo: { modelId: 'm' }, text: usageInfo({ tokensIn: 2, tokensOut: 2 }) }
+    ]
+    const first = parseUiMessages(FAKE_FILE, JSON.stringify(entries))
+    const second = parseUiMessages(FAKE_FILE, JSON.stringify([entries[1], entries[0]]))
+    expect(first.records[0].source.requestId).toBe('req-stable')
+    expect(second.records[1].source).toEqual(first.records[0].source)
+    expect(first.records[1].source.requestId).toBeUndefined()
+  })
+
+  it('单个损坏文件失败可见且不影响其他文件继续解析', async () => {
+    const broken = writeUiMessages(path.join(tmpDir, 'broken-task'), [])
+    fs.writeFileSync(broken, '{broken', 'utf8')
+    const good = writeUiMessages(path.join(tmpDir, 'good-task'), [apiReqStarted({ ts: 9, modelId: 'm' })])
+
+    await expect(clinePlugin.parseFile(ctx, broken, 0)).rejects.toThrow('不是合法 JSON')
+    await expect(clinePlugin.parseFile(ctx, good, 0)).resolves.toMatchObject({ nextLine: 1 })
   })
 })

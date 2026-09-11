@@ -37,10 +37,16 @@ function toEntry(p: string): FileEntry {
   return { path: p, mtime }
 }
 
+function isTemporaryOrHidden(name: string): boolean {
+  return name.startsWith('.') || /(?:\.tmp|\.swp|~)$/i.test(name)
+}
+
 function isSessionFile(name: string): boolean {
-  if (!name.endsWith('.jsonl')) return false
-  if (name.startsWith('.')) return false
-  return !/(?:\.tmp|\.swp|~)$/i.test(name)
+  return name.endsWith('.jsonl') && !isTemporaryOrHidden(name)
+}
+
+function isSettingsFile(name: string): boolean {
+  return name.endsWith('.settings.json') && !isTemporaryOrHidden(name)
 }
 
 function collectSubtree(dir: string, out: FileEntry[]): void {
@@ -48,17 +54,35 @@ function collectSubtree(dir: string, out: FileEntry[]): void {
     const p = path.join(dir, ent.name)
     if (ent.isDirectory()) {
       collectSubtree(p, out)
-    } else if (ent.isFile() && isSessionFile(ent.name)) {
+    } else if (ent.isFile() && (isSessionFile(ent.name) || isSettingsFile(ent.name))) {
       out.push(toEntry(p))
     }
   }
 }
 
+function physicalPathKey(filePath: string): string {
+  let resolved = path.resolve(filePath)
+  try {
+    resolved = fs.realpathSync.native(resolved)
+  } catch {
+    resolved = path.resolve(filePath)
+  }
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
 export function listFilesFromRoot(root: string): FileEntry[] {
-  const out: FileEntry[] = []
-  collectSubtree(path.join(root, 'sessions'), out)
-  collectSubtree(path.join(root, 'projects'), out)
-  return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  const collected: FileEntry[] = []
+  collectSubtree(path.join(root, 'sessions'), collected)
+  collectSubtree(path.join(root, 'projects'), collected)
+
+  const unique = new Map<string, FileEntry>()
+  for (const entry of collected) {
+    const key = physicalPathKey(entry.path)
+    const current = unique.get(key)
+    if (!current || entry.mtime > current.mtime) unique.set(key, entry)
+  }
+
+  return [...unique.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 }
 
 export function detectFromRoot(root: string): Detection {
@@ -135,10 +159,15 @@ function toUsageRecord(
     cacheCreationTokens: toNum(u.cacheCreationInputTokens),
     inputSemantics: 2,
     status: 'success',
+    ...(requestId ? { isReplaceableSnapshot: true } : {}),
     createdAt: parseTsMs(row.timestamp),
     ...(project !== undefined ? { project } : {}),
     source: { filePath, line, ...(requestId ? { requestId } : {}) }
   }
+}
+
+function snapshotWins(candidate: UsageRecord, current: UsageRecord): boolean {
+  return candidate.outputTokens >= current.outputTokens
 }
 
 export function foldById(records: UsageRecord[]): UsageRecord[] {
@@ -154,11 +183,36 @@ export function foldById(records: UsageRecord[]): UsageRecord[] {
     if (existing === undefined) {
       slots.set(rid, out.length)
       out.push(rec)
-    } else if (rec.outputTokens >= out[existing].outputTokens) {
+    } else if (snapshotWins(rec, out[existing])) {
       out[existing] = rec
     }
   }
   return out
+}
+
+export async function parseSettingsSummaryFile(
+  filePath: string,
+  fromLine: number
+): Promise<ParsedResult> {
+  let content: string
+  try {
+    content = await fs.promises.readFile(filePath, 'utf8')
+  } catch {
+    return { records: [], nextLine: fromLine, eof: true }
+  }
+
+  let summary: unknown
+  try {
+    summary = JSON.parse(content)
+  } catch {
+    throw new Error('Droid 会话摘要不是合法 JSON')
+  }
+
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
+    throw new Error('Droid 会话摘要顶层必须是对象')
+  }
+
+  return { records: [], nextLine: 1, eof: true }
 }
 
 export async function parseSessionFile(
@@ -174,6 +228,8 @@ export async function parseSessionFile(
 
   const lines = content.split('\n')
   const buffered: UsageRecord[] = []
+  const slots = new Map<string, number>()
+  const bestById = new Map<string, UsageRecord>()
   let nextLine = fromLine
   let project: string | undefined
 
@@ -198,7 +254,7 @@ export async function parseSessionFile(
 
     if (broken) {
       if (i < startIndex) continue
-      const onlyEmptyAfter = lines.slice(i + 1).every((l) => l === '')
+      const onlyEmptyAfter = lines.slice(i + 1).every((line) => line === '')
       if (onlyEmptyAfter) {
         nextLine = lineNumber
         break
@@ -212,14 +268,32 @@ export async function parseSessionFile(
       if (cwd !== undefined) project = cwd
     }
 
-    if (i < startIndex) continue
-
     const record = toUsageRecord(obj, filePath, lineNumber, project)
-    if (record) buffered.push(record)
-    nextLine = lineNumber + 1
+    if (record) {
+      const requestId = record.source.requestId
+      if (!requestId) {
+        if (i >= startIndex) buffered.push(record)
+      } else {
+        const currentBest = bestById.get(requestId)
+        if (!currentBest || snapshotWins(record, currentBest)) {
+          bestById.set(requestId, record)
+          if (i >= startIndex) {
+            const slot = slots.get(requestId)
+            if (slot === undefined) {
+              slots.set(requestId, buffered.length)
+              buffered.push(record)
+            } else {
+              buffered[slot] = record
+            }
+          }
+        }
+      }
+    }
+
+    if (i >= startIndex) nextLine = lineNumber + 1
   }
 
-  return { records: foldById(buffered), nextLine, eof: true }
+  return { records: buffered, nextLine, eof: true }
 }
 
 async function detect(): Promise<Detection> {
@@ -235,6 +309,9 @@ async function parseFile(
   filePath: string,
   fromLine: number
 ): Promise<ParsedResult> {
+  if (isSettingsFile(path.basename(filePath))) {
+    return parseSettingsSummaryFile(filePath, fromLine)
+  }
   return parseSessionFile(filePath, fromLine)
 }
 

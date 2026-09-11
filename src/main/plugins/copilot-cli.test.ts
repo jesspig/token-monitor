@@ -2,7 +2,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
-import { copilotCliPlugin, detectFromRoot, listFilesFromRoot, parseTsMs, sessionStateRootOf } from './copilot-cli'
+import {
+  clearCopilotCliDeltaStateCache,
+  copilotCliPlugin,
+  detectFromRoot,
+  listFilesFromRoot,
+  parseTsMs,
+  sessionStateRootOf
+} from './copilot-cli'
 import type { PluginContext } from '../../../shared/context'
 
 const ctx = {} as PluginContext
@@ -54,6 +61,7 @@ const envKeys = ['COPILOT_DIR', 'COPILOT_HOME', 'COPILOT_CONFIG_DIR'] as const
 const savedEnv: Record<string, string | undefined> = {}
 
 beforeEach(() => {
+  clearCopilotCliDeltaStateCache()
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-cli-plugin-'))
   for (const k of envKeys) {
     savedEnv[k] = process.env[k]
@@ -335,6 +343,58 @@ describe('delta 增量状态机', () => {
     expect(r2.eof).toBe(true)
   })
 
+  it('缓存清空后从文件前缀重建多模型基线，仅产出游标后的真实增量', async () => {
+    const l1 = shutdownOf(
+      { a: B(100, 20, 30, 40), b: B(50, 10, 5, 0) },
+      { id: 'evt-1', timestamp: '2026-05-07T10:00:00Z' }
+    )
+    const file = writeEvents('sess-restart', [l1])
+    const r1 = await copilotCliPlugin.parseFile(ctx, file, 0)
+
+    const l2 = shutdownOf(
+      { a: B(160, 25, 50, 40), b: B(80, 18, 5, 7) },
+      { id: 'evt-2', timestamp: '2026-05-07T11:00:00Z' }
+    )
+    fs.writeFileSync(file, [l1, l2].join('\n'), 'utf8')
+    clearCopilotCliDeltaStateCache()
+
+    const r2 = await copilotCliPlugin.parseFile(ctx, file, r1.nextLine)
+    expect(r2.records.map((record) => [
+      record.model,
+      record.inputTokens,
+      record.outputTokens,
+      record.cacheReadTokens,
+      record.cacheCreationTokens
+    ])).toEqual([
+      ['a', 60, 5, 20, 0],
+      ['b', 30, 8, 0, 7]
+    ])
+    expect(r2.records.map((record) => record.source.line)).toEqual([2, 2])
+
+    const r3 = await copilotCliPlugin.parseFile(ctx, file, r2.nextLine)
+    expect(r3.records).toHaveLength(0)
+    expect(r3.nextLine).toBe(r2.nextLine)
+  })
+
+  it('缓存条目被容量淘汰后仍从前缀恢复基线', async () => {
+    const l1 = shutdownOf({ m: B(100, 20) }, { id: 'evt-1', timestamp: '2026-05-07T10:00:00Z' })
+    const file = writeEvents('sess-evicted', [l1])
+    const r1 = await copilotCliPlugin.parseFile(ctx, file, 0)
+
+    for (let i = 0; i < 512; i++) {
+      const filler = writeEvents(`filler-${i}`, [shutdownOf({ m: B(i + 1) }, { id: `filler-${i}` })])
+      await copilotCliPlugin.parseFile(ctx, filler, 0)
+    }
+
+    const l2 = shutdownOf({ m: B(145, 32) }, { id: 'evt-2', timestamp: '2026-05-07T11:00:00Z' })
+    fs.writeFileSync(file, [l1, l2].join('\n'), 'utf8')
+    const r2 = await copilotCliPlugin.parseFile(ctx, file, r1.nextLine)
+
+    expect(r2.records).toHaveLength(1)
+    expect(r2.records[0]).toMatchObject({ inputTokens: 45, outputTokens: 12 })
+    expect(r2.records[0].source.requestId).toBe('evt-2:m')
+  })
+
   it('累计值变小（异常）不产出负数：缩水与恢复至旧水位以下均不产出，超过旧水位按旧水位算增量', async () => {
     const l1 = shutdownOf({ m: B(1000, 100) }, { id: 'evt-1', timestamp: '2026-05-07T10:00:00Z' })
     const l2 = shutdownOf({ m: B(500, 50) }, { id: 'evt-2', timestamp: '2026-05-07T11:00:00Z' })
@@ -346,18 +406,50 @@ describe('delta 增量状态机', () => {
     expect(r1.records.map((r) => r.inputTokens)).toEqual([1000])
 
     fs.writeFileSync(file, [l1, l2].join('\n'), 'utf8')
+    clearCopilotCliDeltaStateCache()
     const r2 = await copilotCliPlugin.parseFile(ctx, file, r1.nextLine)
     expect(r2.records).toHaveLength(0)
     expect(r2.nextLine).toBe(3)
 
     fs.writeFileSync(file, [l1, l2, l3].join('\n'), 'utf8')
+    clearCopilotCliDeltaStateCache()
     const r3 = await copilotCliPlugin.parseFile(ctx, file, r2.nextLine)
     expect(r3.records).toHaveLength(0)
     expect(r3.nextLine).toBe(4)
 
     fs.writeFileSync(file, [l1, l2, l3, l4].join('\n'), 'utf8')
+    clearCopilotCliDeltaStateCache()
     const r4 = await copilotCliPlugin.parseFile(ctx, file, r3.nextLine)
     expect(r4.records.map((r) => r.inputTokens)).toEqual([200])
+  })
+
+  it('单个桶回退时保留该桶历史高水位，其他增长桶仍正常产出', async () => {
+    const l1 = shutdownOf({ m: B(100, 100, 30, 40) }, { id: 'evt-1' })
+    const l2 = shutdownOf({ m: B(80, 150, 20, 60) }, { id: 'evt-2' })
+    const l3 = shutdownOf({ m: B(110, 160, 35, 65) }, { id: 'evt-3' })
+    const file = writeEvents('sess-mixed-rollback', [l1, l2])
+
+    const r1 = await copilotCliPlugin.parseFile(ctx, file, 0)
+    expect(r1.records.map((record) => [
+      record.inputTokens,
+      record.outputTokens,
+      record.cacheReadTokens,
+      record.cacheCreationTokens
+    ])).toEqual([
+      [100, 100, 30, 40],
+      [0, 50, 0, 20]
+    ])
+
+    fs.writeFileSync(file, [l1, l2, l3].join('\n'), 'utf8')
+    clearCopilotCliDeltaStateCache()
+    const r2 = await copilotCliPlugin.parseFile(ctx, file, r1.nextLine)
+    expect(r2.records).toHaveLength(1)
+    expect(r2.records[0]).toMatchObject({
+      inputTokens: 10,
+      outputTokens: 10,
+      cacheReadTokens: 5,
+      cacheCreationTokens: 5
+    })
   })
 
   it('同事件内四桶 delta 全 0 的模型不产出，其余模型照常', async () => {
@@ -428,6 +520,7 @@ describe('parseEventsFile 游标增量与容错', () => {
 
     const l2 = shutdownOf({ m: B(250, 30) }, { id: 'evt-2', timestamp: '2026-05-07T11:00:00Z' })
     fs.writeFileSync(file, [l1, l2].join('\n'), 'utf8')
+    clearCopilotCliDeltaStateCache()
     const r2 = await copilotCliPlugin.parseFile(ctx, file, r1.nextLine)
     expect(r2.records).toHaveLength(1)
     expect(r2.records[0].source).toEqual({ filePath: file, line: 2, requestId: 'evt-2:m' })
