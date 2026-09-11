@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { isAbsolute, join, resolve } from 'node:path'
 import type { PluginContext, StorageService } from '../../shared/context'
 import type { Detection } from '../../shared/dto'
 import type { MonitorPlugin } from '../../shared/plugin'
@@ -37,7 +37,7 @@ import { qoderCnPlugin } from './plugins/qoder-cn'
 import { qwenPlugin } from './plugins/qwen'
 import { reasonixPlugin } from './plugins/reasonix'
 import { rooCodePlugin } from './plugins/roo-code'
-import { traeAgentPlugin } from './plugins/trae-agent'
+import { createTraeAgentPlugin, trajectoryRootsOf } from './plugins/trae-agent'
 import { workbuddyPlugin } from './plugins/workbuddy'
 import { zcodePlugin } from './plugins/zcode'
 import { zedPlugin } from './plugins/zed'
@@ -67,6 +67,49 @@ const RETENTION_SWEEP_PHASE_OFFSET_RATIO = 0.5
 const STARTUP_PRICING_SYNC_DELAY_MS = 10_000
 const STARTUP_ZERO_COST_BACKFILL_DELAY_MS = 20_000
 const STARTUP_RECALC_COSTS_DELAY_MS = 30_000
+
+function normalizedPathKey(value: string): string {
+  return process.platform === 'win32' ? value.toLowerCase() : value
+}
+
+export function normalizeTraeTrajectoryRoots(
+  value: unknown,
+  requireExistingDirectories = false
+): string[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new Error('Trae Agent 轨迹根目录必须是路径数组')
+
+  const roots: string[] = []
+  const seen = new Set<string>()
+  for (let index = 0; index < value.length; index++) {
+    const candidate = value[index]
+    if (typeof candidate !== 'string') {
+      throw new Error('Trae Agent 第 ' + (index + 1) + ' 个轨迹根目录不是有效路径')
+    }
+    const trimmed = candidate.trim()
+    if (trimmed === '') continue
+    if (!isAbsolute(trimmed)) {
+      throw new Error('Trae Agent 第 ' + (index + 1) + ' 个轨迹根目录必须使用绝对路径')
+    }
+    const normalized = resolve(trimmed)
+    const key = normalizedPathKey(normalized)
+    if (seen.has(key)) continue
+    if (requireExistingDirectories) {
+      let isDirectory = false
+      try {
+        isDirectory = statSync(normalized).isDirectory()
+      } catch {
+        throw new Error('Trae Agent 第 ' + (index + 1) + ' 个轨迹根目录不存在')
+      }
+      if (!isDirectory) {
+        throw new Error('Trae Agent 第 ' + (index + 1) + ' 个轨迹根路径不是目录')
+      }
+    }
+    seen.add(key)
+    roots.push(normalized)
+  }
+  return roots
+}
 
 export interface HostOptions {
   dataDir?: string
@@ -104,6 +147,7 @@ function createSettingsStore(
     syncIntervalMs: syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS,
     retentionDays: DEFAULT_RETENTION_DAYS,
     dataDir: dir,
+    traeTrajectoryRoots: [],
     statsRefreshIntervalMs: DEFAULT_STATS_REFRESH_INTERVAL_MS,
     pricingSyncIntervalMs: DEFAULT_PRICING_SYNC_INTERVAL_MS,
     closeToTray: true
@@ -111,60 +155,81 @@ function createSettingsStore(
   if (file) {
     try {
       const saved = JSON.parse(readFileSync(file, 'utf8')) as Partial<AppSettings>
-      current = { ...current, ...saved, dataDir: dir }
+      let traeTrajectoryRoots: string[] = []
+      try {
+        traeTrajectoryRoots = normalizeTraeTrajectoryRoots(saved.traeTrajectoryRoots)
+      } catch {
+      }
+      current = { ...current, ...saved, traeTrajectoryRoots, dataDir: dir }
     } catch {
     }
   }
 
   return {
-    get: () => ({ ...current }),
+    get: () => ({
+      ...current,
+      traeTrajectoryRoots: current.traeTrajectoryRoots
+        ? [...current.traeTrajectoryRoots]
+        : undefined
+    }),
     update(patch) {
-      current = { ...current, ...patch, dataDir: dir }
+      const nextPatch = { ...patch }
+      if (Object.prototype.hasOwnProperty.call(patch, 'traeTrajectoryRoots')) {
+        nextPatch.traeTrajectoryRoots = normalizeTraeTrajectoryRoots(
+          patch.traeTrajectoryRoots,
+          true
+        )
+      }
+      const next = { ...current, ...nextPatch, dataDir: dir }
       if (file) {
         try {
           mkdirSync(dataDir, { recursive: true })
-          writeFileSync(file, JSON.stringify(current, null, 2), 'utf8')
+          writeFileSync(file, JSON.stringify(next, null, 2), 'utf8')
         } catch (err) {
           console.error('[host] 设置持久化失败:', err)
+          throw new Error('设置持久化失败')
         }
       }
+      current = next
     }
   }
 }
 
-const BUILTIN_PLUGINS: MonitorPlugin[] = [
-  claudePlugin,
-  codexPlugin,
-  opencodePlugin,
-  geminiPlugin,
-  grokPlugin,
-  piPlugin,
-  zcodePlugin,
-  dshPlugin,
-  workbuddyPlugin,
-  codebuddyPlugin,
-  clinePlugin,
-  rooCodePlugin,
-  kiloCodePlugin,
-  qwenPlugin,
-  qoderPlugin,
-  qoderCnPlugin,
-  kimiPlugin,
-  zedPlugin,
-  kiroPlugin,
-  reasonixPlugin,
-  commandCodePlugin,
-  copilotChatPlugin,
-  devEcoPlugin,
-  mimoPlugin,
-  goosePlugin,
-  copilotCliPlugin,
-  gptmePlugin,
-  traeAgentPlugin,
-  codewhalePlugin,
-  droidPlugin,
-  minimaxPlugin
-]
+function createBuiltinPlugins(getTraeTrajectoryRoots: () => readonly string[]): MonitorPlugin[] {
+  return [
+    claudePlugin,
+    codexPlugin,
+    opencodePlugin,
+    geminiPlugin,
+    grokPlugin,
+    piPlugin,
+    zcodePlugin,
+    dshPlugin,
+    workbuddyPlugin,
+    codebuddyPlugin,
+    clinePlugin,
+    rooCodePlugin,
+    kiloCodePlugin,
+    qwenPlugin,
+    qoderPlugin,
+    qoderCnPlugin,
+    kimiPlugin,
+    zedPlugin,
+    kiroPlugin,
+    reasonixPlugin,
+    commandCodePlugin,
+    copilotChatPlugin,
+    devEcoPlugin,
+    mimoPlugin,
+    goosePlugin,
+    copilotCliPlugin,
+    gptmePlugin,
+    createTraeAgentPlugin(getTraeTrajectoryRoots),
+    codewhalePlugin,
+    droidPlugin,
+    minimaxPlugin
+  ]
+}
 
 export interface HostBootstrap {
   host: Host
@@ -182,23 +247,53 @@ export async function bootstrapHost(options: HostOptions = {}): Promise<HostBoot
   await seedPricing(storage)
   const pricing = new PricingServiceImpl(storage)
 
+  const settings = createSettingsStore(dataDir, options.syncIntervalMs)
+  const builtinPlugins = createBuiltinPlugins(
+    () => settings.get().traeTrajectoryRoots ?? []
+  )
+
   const events = new EventBus()
   const scheduler = schedulerService
   const watcher = watcherService
   const ctx = createPluginContext({ storage, pricing, events, scheduler, watcher })
 
-  const settings = createSettingsStore(dataDir, options.syncIntervalMs)
-
   const registry = new PluginRegistry()
   const lifecycle = new LifecycleManager()
 
-  const collector = createCollector(ctx, BUILTIN_PLUGINS, {
+  const collector = createCollector(ctx, builtinPlugins, {
     isEnabled: (id) => registry.isEnabled(id)
   })
 
-  const plugins: LifecyclePlugin[] = BUILTIN_PLUGINS.map((p) => ({
+  let stopTraeWatcher: (() => void) | null = null
+
+  function refreshTraeWatcher(pctx: PluginContext): void {
+    stopTraeWatcher?.()
+    stopTraeWatcher = null
+    const roots = trajectoryRootsOf(settings.get().traeTrajectoryRoots ?? []).roots.filter((root) => {
+      try {
+        return statSync(root).isDirectory()
+      } catch {
+        return false
+      }
+    })
+    if (roots.length === 0) return
+    stopTraeWatcher = pctx.watcher.registerWatcher(
+      roots,
+      () => void collector.syncPlugin('trae-agent'),
+      { debounceMs: 500 }
+    )
+  }
+
+  const plugins: LifecyclePlugin[] = builtinPlugins.map((p) => ({
     ...p,
     onMount: async (pctx): Promise<(() => void) | undefined> => {
+      if (p.id === 'trae-agent') {
+        refreshTraeWatcher(pctx)
+        return () => {
+          stopTraeWatcher?.()
+          stopTraeWatcher = null
+        }
+      }
       let det: Detection
       try {
         det = await p.detect(pctx)
@@ -364,6 +459,10 @@ export async function bootstrapHost(options: HostOptions = {}): Promise<HostBoot
       if (nextPricingSyncIntervalMs !== currentPricingSyncIntervalMs) {
         currentPricingSyncIntervalMs = nextPricingSyncIntervalMs
         startPricingAutoSync()
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, 'traeTrajectoryRoots')) {
+        collector.invalidateStatusCache()
+        if (lifecycle.isMounted('trae-agent')) refreshTraeWatcher(ctx)
       }
     },
     getBudgetStatus() {

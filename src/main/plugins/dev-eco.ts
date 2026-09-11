@@ -10,10 +10,12 @@ export { statMtimeMs, maxMtime } from './_lib/opencode-shared'
 
 export const DB_SOURCE_SUFFIX = 'deveco.db'
 
+export const CHANNEL_DB_NAMES = ['deveco-beta.db', 'deveco-prod.db']
+
 const core = createOpencodeLikePluginCore({
   appType: 'dev-eco',
   dbName: DB_SOURCE_SUFFIX,
-  channelVariants: ['deveco-beta.db', 'deveco-prod.db'],
+  channelVariants: CHANNEL_DB_NAMES,
   detectMissingRootReason: () =>
     '未找到数据根（默认 ~/.local/share/deveco，可用 $DEVECO_DIR、$XDG_DATA_HOME 或 $DEVECO_DB 覆盖）',
   detectUnavailableReason: () => '数据根下未发现 deveco.db（DevEco Code 未安装或尚未产生会话）'

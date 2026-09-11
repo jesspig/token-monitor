@@ -21,6 +21,7 @@ import {
 import type { PluginContext } from '../../../shared/context'
 
 const ctx = {} as PluginContext
+const DB_CURSOR_MARKER = 2 ** 52
 
 let tmpDir = ''
 let savedEnv: Record<string, string | undefined> = {}
@@ -55,6 +56,7 @@ function buildMimocodeDb(
       timeCreated: number
       timeUpdated?: number
       data: unknown
+      rawData?: string
     }>
   } = {}
 ): void {
@@ -85,7 +87,7 @@ function buildMimocodeDb(
   }
   const insM = db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
   for (const m of opts.messages ?? []) {
-    insM.run(m.id, m.sessionId ?? null, m.timeCreated, m.timeUpdated ?? m.timeCreated, JSON.stringify(m.data))
+    insM.run(m.id, m.sessionId ?? null, m.timeCreated, m.timeUpdated ?? m.timeCreated, m.rawData ?? JSON.stringify(m.data))
   }
   db.close()
 }
@@ -276,8 +278,8 @@ describe('listFilesFromLayouts 收集与 WAL mtime', () => {
   })
 })
 
-describe('parseDbFile / parseFile 正常映射', () => {
-  it('assistant 消息产出完整 UsageRecord：四桶 tokens、semantics=2、requestId=message.id、project=session.directory', async () => {
+describe('parseDbFile / parseFile 的 rowid 游标与映射', () => {
+  it('assistant 消息保持四桶、semantics=2、稳定 requestId 与项目映射', async () => {
     const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
     buildMimocodeDb(dbPath, {
       sessions: [{ id: 'sess-1', directory: '/work/mimo-proj' }],
@@ -301,14 +303,27 @@ describe('parseDbFile / parseFile 正常映射', () => {
     })
     expect(res.records[0].source).toEqual({
       filePath: DB_SOURCE_SUFFIX,
-      line: 1_700_000_000_123,
+      line: res.nextLine,
       requestId: 'msg-1'
     })
-    expect(res.nextLine).toBe(1_700_000_000_123)
+    expect(res.nextLine).toBeGreaterThanOrEqual(DB_CURSOR_MARKER)
     expect(res.eof).toBe(true)
   })
 
-  it('非 assistant 行与缺 modelID/tokens 的行不产出记录，水位仍推进', () => {
+  it('主库、beta 与 prod 数据库均复用相同解析器', async () => {
+    for (const dbName of [DB_SOURCE_SUFFIX, ...CHANNEL_DB_NAMES]) {
+      const dbPath = path.join(tmpDir, dbName)
+      buildMimocodeDb(dbPath, {
+        sessions: [{ id: 'sess-1', directory: '/p' }],
+        messages: [asstMsg({ id: `m-${dbName}`, time: 1_000 })]
+      })
+      const res = await mimoPlugin.parseFile(ctx, dbPath, 0)
+      expect(res.records[0].source.filePath).toBe(DB_SOURCE_SUFFIX)
+      expect(res.records[0].source.requestId).toBe(`m-${dbName}`)
+    }
+  })
+
+  it('合法无用量消息不产出，但 rowid 水位继续推进', () => {
     const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
     buildMimocodeDb(dbPath, {
       sessions: [{ id: 'sess-1', directory: '/p' }],
@@ -329,85 +344,106 @@ describe('parseDbFile / parseFile 正常映射', () => {
         }
       ]
     })
-    const res = parseDbFile(dbPath, 0)
-    expect(res.records).toHaveLength(1)
-    expect(res.records[0].source.line).toBe(2_000)
-    expect(res.records[0].source.requestId).toBe('a-1')
-    expect(res.nextLine).toBe(4_000)
-    expect(res.eof).toBe(true)
+    const first = parseDbFile(dbPath, 0)
+    expect(first.records).toHaveLength(1)
+    expect(first.records[0].source.requestId).toBe('a-1')
+    expect(first.nextLine).toBeGreaterThan(first.records[0].source.line)
+    expect(parseDbFile(dbPath, first.nextLine).records).toHaveLength(0)
   })
 
-  it('水位游标增量续读：只处理 time_created > fromLine 的行，nextLine 返回本次最大 time_created', () => {
+  it('rowid 增量采集同时间戳晚插入和时间倒序消息', () => {
     const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
     buildMimocodeDb(dbPath, {
       sessions: [{ id: 'sess-1', directory: '/p' }],
-      messages: [asstMsg({ id: 'm-1', time: 1_000 }), asstMsg({ id: 'm-2', time: 2_000 })]
+      messages: [asstMsg({ id: 'm-1', time: 2_000 }), asstMsg({ id: 'm-2', time: 1_000 })]
     })
-    const r1 = parseDbFile(dbPath, 0)
-    expect(r1.records).toHaveLength(2)
-    expect(r1.records.map((r) => r.source.requestId)).toEqual(['m-1', 'm-2'])
-    expect(r1.nextLine).toBe(2_000)
+    const first = parseDbFile(dbPath, 0)
 
     const db = new Database(dbPath)
-    const ins = db.prepare(
+    const insert = db.prepare(
       'INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)'
     )
-    ins.run('m-3', 'sess-1', 3_000, 3_000, JSON.stringify(asstMsg({ id: 'm-3', time: 3_000 }).data))
-    ins.run('m-4', 'sess-1', 4_000, 4_000, JSON.stringify(asstMsg({ id: 'm-4', time: 4_000 }).data))
+    insert.run('m-3', 'sess-1', 1_000, 1_000, JSON.stringify(asstMsg({ id: 'm-3', time: 1_000 }).data))
+    insert.run('m-4', 'sess-1', 500, 500, JSON.stringify(asstMsg({ id: 'm-4', time: 500 }).data))
     db.close()
 
-    const r2 = parseDbFile(dbPath, r1.nextLine)
-    expect(r2.records).toHaveLength(2)
-    expect(r2.records.map((r) => r.source.requestId).sort()).toEqual(['m-3', 'm-4'])
-    expect(r2.nextLine).toBe(4_000)
-    expect(r2.eof).toBe(true)
-
-    const r3 = parseDbFile(dbPath, r2.nextLine)
-    expect(r3.records).toHaveLength(0)
-    expect(r3.nextLine).toBe(4_000)
-    expect(r3.eof).toBe(true)
+    const second = parseDbFile(dbPath, first.nextLine)
+    expect(second.records.map((record) => record.source.requestId)).toEqual(['m-3', 'm-4'])
+    expect(second.records.map((record) => record.source.line)).toEqual([first.nextLine + 1, first.nextLine + 2])
+    expect(parseDbFile(dbPath, second.nextLine).records).toHaveLength(0)
   })
 
-  it('同一毫秒多消息：line 单调递增保持去重唯一', () => {
+  it('旧 time_created 数字游标自愈为编码 rowid 游标并全量重读', () => {
+    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
+    buildMimocodeDb(dbPath, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      messages: [asstMsg({ id: 'm-1', time: 1_700_000_000_000 }), asstMsg({ id: 'm-2', time: 1_700_000_000_001 })]
+    })
+    const res = parseDbFile(dbPath, 1_700_000_000_001)
+    expect(res.records.map((record) => record.source.requestId)).toEqual(['m-1', 'm-2'])
+    expect(res.nextLine).toBeGreaterThanOrEqual(DB_CURSOR_MARKER)
+  })
+
+  it('数据库重建且 rowid 回退时旧游标失效并读取新库', () => {
+    const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
+    buildMimocodeDb(dbPath, {
+      sessions: [{ id: 'old-session', directory: '/old' }],
+      messages: [
+        { ...asstMsg({ id: 'old-1', time: 1_000 }), sessionId: 'old-session' },
+        { ...asstMsg({ id: 'old-2', time: 2_000 }), sessionId: 'old-session' }
+      ]
+    })
+    const first = parseDbFile(dbPath, 0)
+
+    fs.rmSync(dbPath)
+    buildMimocodeDb(dbPath, {
+      sessions: [{ id: 'new-session', directory: '/new' }],
+      messages: [{ ...asstMsg({ id: 'new-1', time: 3_000 }), sessionId: 'new-session' }]
+    })
+    const second = parseDbFile(dbPath, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0].source.requestId).toBe('new-1')
+    expect(second.records[0].project).toBe('/new')
+    expect(second.records[0].source.line).not.toBe(first.records[0].source.line)
+  })
+
+  it('重复全量读取保持 source.line 与 requestId 稳定', () => {
     const dbPath = path.join(tmpDir, DB_SOURCE_SUFFIX)
     buildMimocodeDb(dbPath, {
       sessions: [{ id: 'sess-1', directory: '/p' }],
       messages: [asstMsg({ id: 'm-1', time: 1_000 }), asstMsg({ id: 'm-2', time: 1_000 })]
     })
-    const res = parseDbFile(dbPath, 0)
-    expect(res.records).toHaveLength(2)
-    const lines = res.records.map((r) => r.source.line)
-    expect(new Set(lines).size).toBe(2)
-    expect(lines[0]).toBeLessThan(lines[1])
-    expect(res.nextLine).toBe(1_000)
+    const first = parseDbFile(dbPath, 0)
+    const second = parseDbFile(dbPath, 0)
+    expect(second.records.map((record) => record.source)).toEqual(first.records.map((record) => record.source))
   })
 })
 
-describe('损坏与缺失容错', () => {
-  it('垃圾字节 db：空结果且游标不推进', () => {
-    const dbPath = path.join(tmpDir, 'broken.db')
-    fs.writeFileSync(dbPath, 'definitely not a sqlite database', 'utf8')
-    const res = parseDbFile(dbPath, 123)
-    expect(res.records).toHaveLength(0)
-    expect(res.nextLine).toBe(123)
-    expect(res.eof).toBe(true)
-  })
+describe('数据库错误可见性', () => {
+  it('数据库缺失、损坏、缺表、缺列和损坏消息均抛出明确错误', () => {
+    expect(() => parseDbFile(path.join(tmpDir, 'missing.db'), 0)).toThrow('无法以只读模式打开')
 
-  it('db 文件缺失：空结果且游标归零', () => {
-    const res = parseDbFile(path.join(tmpDir, 'nope.db'), 0)
-    expect(res.records).toHaveLength(0)
-    expect(res.nextLine).toBe(0)
-    expect(res.eof).toBe(true)
-  })
+    const brokenDb = path.join(tmpDir, 'broken.db')
+    fs.writeFileSync(brokenDb, 'not sqlite', 'utf8')
+    expect(() => parseDbFile(brokenDb, 0)).toThrow()
 
-  it('无 message 表的 db：空结果且游标不推进', () => {
-    const dbPath = path.join(tmpDir, 'empty.db')
-    const db = new Database(dbPath)
-    db.exec('CREATE TABLE unrelated (x TEXT)')
-    db.close()
-    const res = parseDbFile(dbPath, 42)
-    expect(res.records).toHaveLength(0)
-    expect(res.nextLine).toBe(42)
-    expect(res.eof).toBe(true)
+    const missingTable = path.join(tmpDir, 'missing-table.db')
+    const db1 = new Database(missingTable)
+    db1.exec('CREATE TABLE unrelated (x TEXT)')
+    db1.close()
+    expect(() => parseDbFile(missingTable, 0)).toThrow('缺少 message 表')
+
+    const missingColumn = path.join(tmpDir, 'missing-column.db')
+    const db2 = new Database(missingColumn)
+    db2.exec('CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT); CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER);')
+    db2.close()
+    expect(() => parseDbFile(missingColumn, 0)).toThrow('message 表缺少必要列：data')
+
+    const invalidJson = path.join(tmpDir, 'invalid-json.db')
+    buildMimocodeDb(invalidJson, {
+      sessions: [{ id: 'sess-1', directory: '/p' }],
+      messages: [{ ...asstMsg({ id: 'broken-json', time: 1_000 }), rawData: '{broken' }]
+    })
+    expect(() => parseDbFile(invalidJson, 0)).toThrow('message.data 不是合法 JSON')
   })
 })

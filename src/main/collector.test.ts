@@ -292,4 +292,31 @@ describe('syncPlugin 定向同步', () => {
     expect(second.addedRecords).toBe(0)
     expect(ctx.events.emit).toHaveBeenCalledTimes(1)
   })
+
+  it('存储返回有效快照更新 1 时继续推送事件，相同快照返回 0 时不推送', async () => {
+    const { ctx } = makeCtx()
+    const record = makeRecord({
+      isReplaceableSnapshot: true,
+      source: { filePath: FAKE_FILE, line: 1, requestId: 'snapshot-1' }
+    })
+    vi.mocked(ctx.storage.recordUsage)
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(0)
+    const collector = createCollector(ctx, [makePlugin([record])])
+
+    const inserted = await collector.syncPlugin('opencode')
+    const updated = await collector.syncPlugin('opencode')
+    const replayed = await collector.syncPlugin('opencode')
+
+    expect(inserted.addedRecords).toBe(1)
+    expect(updated.addedRecords).toBe(1)
+    expect(replayed.addedRecords).toBe(0)
+    expect(ctx.events.emit).toHaveBeenCalledTimes(2)
+    expect(ctx.events.emit).toHaveBeenNthCalledWith(
+      2,
+      'usage-updated',
+      expect.objectContaining({ addedRecords: 1 })
+    )
+  })
 })

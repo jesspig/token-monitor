@@ -241,16 +241,20 @@ describe('parseFile 增量解析', () => {
           sessionId: 'sess-1',
           cwd: '/Users/a/b',
           message: { role: 'assistant', id: 42, model: 'claude-sonnet-4-5', usage: { input_tokens: 1, output_tokens: 1 } }
-        })
+        }),
+        assistantLine({ uuid: 'a-4', id: '   ', timestamp: '2026-08-19T10:00:20+08:00' })
       ].join('\n'),
       'utf8'
     )
     const res = await claudePlugin.parseFile(ctx, file, 0)
-    expect(res.records).toHaveLength(3)
+    expect(res.records).toHaveLength(4)
     expect(res.records[0].source).toEqual({ filePath: file, line: 1, requestId: 'msg_01ABC' })
-    expect(res.records[1].source.requestId).toBeUndefined()
-    expect('requestId' in res.records[1].source).toBe(false)
-    expect(res.records[2].source.requestId).toBeUndefined()
+    expect(res.records[0].isReplaceableSnapshot).toBe(true)
+    for (const record of res.records.slice(1)) {
+      expect(record.source.requestId).toBeUndefined()
+      expect(record.isReplaceableSnapshot).toBeUndefined()
+      expect('requestId' in record.source).toBe(false)
+    }
   })
 })
 
@@ -323,6 +327,7 @@ describe('失败请求可观测（isApiErrorMessage === true）', () => {
       errorMessage: 'API Error: 429 Too Many Requests'
     })
     expect(r.source).toEqual({ filePath: file, line: 1, requestId: 'msg_err_1' })
+    expect(r.isReplaceableSnapshot).toBeUndefined()
     expect(r.createdAt).toBe(Date.parse('2026-08-19T10:00:20+08:00'))
     expect(r.project).toBe('/Users/a/b')
     expect(r.sessionId).toBe('sess-1')
@@ -476,7 +481,9 @@ describe('失败请求可观测（isApiErrorMessage === true）', () => {
     const err = res.records.find((r) => r.status === 'error')!
     expect(succ.outputTokens).toBe(50)
     expect(succ.source.requestId).toBe('shared_id')
+    expect(succ.isReplaceableSnapshot).toBe(true)
     expect(err.source.requestId).toBe('shared_id')
+    expect(err.isReplaceableSnapshot).toBeUndefined()
     expect(err.httpStatus).toBe(500)
   })
 
@@ -540,6 +547,7 @@ describe('流式分片按 message.id 折叠', () => {
     expect(r.model).toBe('claude-sonnet-4-5')
     expect(r.createdAt).toBe(Date.parse('2026-08-19T10:00:03+08:00'))
     expect(r.source).toEqual({ filePath: file, line: 4, requestId: 'msg_fold' })
+    expect(r.isReplaceableSnapshot).toBe(true)
   })
 
   it('乱序防御：output 序列 100/30 时保留首条更大的记录', () => {
@@ -586,6 +594,265 @@ describe('流式分片按 message.id 折叠', () => {
   })
 })
 
+describe('跨同步轮次的可替换快照收敛', () => {
+  it('首轮中间快照、次轮最终快照使用相同 requestId 并产出胜出真实行', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(
+      file,
+      [userLine(), assistantLine({ id: 'msg_cross', output: 10, timestamp: '2026-08-19T10:00:01+08:00' })].join('\n'),
+      'utf8'
+    )
+
+    const first = await claudePlugin.parseFile(ctx, file, 0)
+    expect(first.records).toHaveLength(1)
+    expect(first.records[0]).toMatchObject({
+      outputTokens: 10,
+      isReplaceableSnapshot: true,
+      source: { filePath: file, line: 2, requestId: 'msg_cross' }
+    })
+
+    fs.appendFileSync(
+      file,
+      `\n${assistantLine({ id: 'msg_cross', output: 100, timestamp: '2026-08-19T10:00:02+08:00' })}`,
+      'utf8'
+    )
+    const second = await claudePlugin.parseFile({} as PluginContext, file, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      outputTokens: 100,
+      isReplaceableSnapshot: true,
+      createdAt: Date.parse('2026-08-19T10:00:02+08:00'),
+      source: { filePath: file, line: 3, requestId: 'msg_cross' }
+    })
+  })
+
+  it('游标前已有更大 output 时，当前窗口较小过期快照不产出', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(
+      file,
+      assistantLine({ id: 'msg_stale', output: 100, timestamp: '2026-08-19T10:00:01+08:00' }),
+      'utf8'
+    )
+    const first = await claudePlugin.parseFile(ctx, file, 0)
+    fs.appendFileSync(
+      file,
+      `\n${assistantLine({ id: 'msg_stale', output: 30, timestamp: '2026-08-19T10:00:02+08:00' })}`,
+      'utf8'
+    )
+
+    const second = await claudePlugin.parseFile(ctx, file, first.nextLine)
+    expect(second.records).toEqual([])
+    expect(second.nextLine).toBe(3)
+  })
+
+  it('output 相同但后出现时使用当前窗口完整字段并更新 source.line', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(
+      file,
+      assistantLine({
+        id: 'msg_equal',
+        input: 100,
+        output: 50,
+        cacheRead: 10,
+        cacheCreation: 20,
+        timestamp: '2026-08-19T10:00:01+08:00'
+      }),
+      'utf8'
+    )
+    const first = await claudePlugin.parseFile(ctx, file, 0)
+    fs.appendFileSync(
+      file,
+      `\n${assistantLine({
+        id: 'msg_equal',
+        input: 200,
+        output: 50,
+        cacheRead: 30,
+        cacheCreation: 40,
+        timestamp: '2026-08-19T10:00:02+08:00'
+      })}`,
+      'utf8'
+    )
+
+    const second = await claudePlugin.parseFile(ctx, file, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      inputTokens: 200,
+      outputTokens: 50,
+      cacheReadTokens: 30,
+      cacheCreationTokens: 40,
+      isReplaceableSnapshot: true,
+      createdAt: Date.parse('2026-08-19T10:00:02+08:00'),
+      source: { filePath: file, line: 2, requestId: 'msg_equal' }
+    })
+  })
+
+  it('当前窗口同 ID 多行只产出相对历史最终胜出的一条', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(
+      file,
+      assistantLine({ id: 'msg_window', output: 10, timestamp: '2026-08-19T10:00:01+08:00' }),
+      'utf8'
+    )
+    const first = await claudePlugin.parseFile(ctx, file, 0)
+    fs.appendFileSync(
+      file,
+      [
+        assistantLine({ id: 'msg_window', output: 5, timestamp: '2026-08-19T10:00:02+08:00' }),
+        assistantLine({ id: 'msg_window', output: 30, timestamp: '2026-08-19T10:00:03+08:00' }),
+        assistantLine({ id: 'msg_window', output: 20, timestamp: '2026-08-19T10:00:04+08:00' }),
+        assistantLine({ id: 'msg_window', output: 100, timestamp: '2026-08-19T10:00:05+08:00' })
+      ].map((line) => `\n${line}`).join(''),
+      'utf8'
+    )
+
+    const second = await claudePlugin.parseFile(ctx, file, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      outputTokens: 100,
+      isReplaceableSnapshot: true,
+      source: { filePath: file, line: 5, requestId: 'msg_window' }
+    })
+  })
+
+  it('一次全量与多轮重启增量的最终胜出快照一致', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    const partial = assistantLine({
+      id: 'msg_restart',
+      input: 100,
+      output: 10,
+      cacheRead: 5,
+      cacheCreation: 7,
+      timestamp: '2026-08-19T10:00:01+08:00'
+    })
+    const final = assistantLine({
+      id: 'msg_restart',
+      input: 120,
+      output: 100,
+      cacheRead: 15,
+      cacheCreation: 17,
+      timestamp: '2026-08-19T10:00:02+08:00'
+    })
+    fs.writeFileSync(file, partial, 'utf8')
+    const first = await claudePlugin.parseFile(ctx, file, 0)
+    fs.appendFileSync(file, `\n${final}`, 'utf8')
+
+    const incremental = await claudePlugin.parseFile({} as PluginContext, file, first.nextLine)
+    const full = await claudePlugin.parseFile({} as PluginContext, file, 0)
+    expect(incremental.records).toHaveLength(1)
+    expect(full.records).toHaveLength(1)
+    expect(incremental.records[0]).toEqual(full.records[0])
+  })
+
+  it('游标前错误、无 ID 成功和损坏行只参与跳过，不泄漏到当前窗口', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    const prefixError = JSON.stringify({
+      type: 'assistant',
+      uuid: 'prefix-error',
+      timestamp: '2026-08-19T10:00:01+08:00',
+      sessionId: 'sess-1',
+      cwd: '/Users/a/b',
+      isApiErrorMessage: true,
+      apiErrorStatus: 500,
+      message: {
+        role: 'assistant',
+        id: 'msg_prefix_error',
+        model: 'claude-sonnet-4-5',
+        content: [{ type: 'text', text: 'failed' }],
+        usage: { input_tokens: 0, output_tokens: 0 }
+      }
+    })
+    fs.writeFileSync(
+      file,
+      [
+        prefixError,
+        assistantLine({ output: 20, timestamp: '2026-08-19T10:00:02+08:00' }),
+        '{broken prefix',
+        assistantLine({ id: 'msg_prefix', output: 10, timestamp: '2026-08-19T10:00:03+08:00' })
+      ].join('\n'),
+      'utf8'
+    )
+    const first = await claudePlugin.parseFile(ctx, file, 0)
+    fs.appendFileSync(
+      file,
+      `\n${assistantLine({ id: 'msg_prefix', output: 100, timestamp: '2026-08-19T10:00:04+08:00' })}`,
+      'utf8'
+    )
+
+    const second = await claudePlugin.parseFile(ctx, file, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      outputTokens: 100,
+      isReplaceableSnapshot: true,
+      source: { filePath: file, line: 5, requestId: 'msg_prefix' }
+    })
+  })
+
+  it('尾部半行补全后从停驻游标产出最终胜出快照', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    const partial = assistantLine({ id: 'msg_half', output: 10, timestamp: '2026-08-19T10:00:01+08:00' })
+    const final = assistantLine({ id: 'msg_half', output: 100, timestamp: '2026-08-19T10:00:02+08:00' })
+    fs.writeFileSync(file, `${partial}\n${final.slice(0, -12)}`, 'utf8')
+
+    const first = await claudePlugin.parseFile(ctx, file, 0)
+    expect(first.records).toHaveLength(1)
+    expect(first.nextLine).toBe(2)
+
+    fs.writeFileSync(file, `${partial}\n${final}`, 'utf8')
+    const second = await claudePlugin.parseFile({} as PluginContext, file, first.nextLine)
+    expect(second.records).toHaveLength(1)
+    expect(second.records[0]).toMatchObject({
+      outputTokens: 100,
+      isReplaceableSnapshot: true,
+      source: { filePath: file, line: 2, requestId: 'msg_half' }
+    })
+  })
+
+  it('错误和无 ID 成功在增量窗口保持不可替换且逐条产出', async () => {
+    const file = path.join(tmpDir, 'main.jsonl')
+    fs.writeFileSync(
+      file,
+      assistantLine({ id: 'msg_history', output: 50, timestamp: '2026-08-19T10:00:01+08:00' }),
+      'utf8'
+    )
+    const first = await claudePlugin.parseFile(ctx, file, 0)
+    const error = JSON.stringify({
+      type: 'assistant',
+      uuid: 'err-incremental',
+      timestamp: '2026-08-19T10:00:02+08:00',
+      sessionId: 'sess-1',
+      cwd: '/Users/a/b',
+      isApiErrorMessage: true,
+      apiErrorStatus: 500,
+      message: {
+        role: 'assistant',
+        id: 'msg_history',
+        model: 'claude-sonnet-4-5',
+        content: [{ type: 'text', text: 'failed' }],
+        usage: { input_tokens: 0, output_tokens: 0 }
+      }
+    })
+    fs.appendFileSync(
+      file,
+      `\n${error}\n${assistantLine({ output: 25, timestamp: '2026-08-19T10:00:03+08:00' })}`,
+      'utf8'
+    )
+
+    const second = await claudePlugin.parseFile(ctx, file, first.nextLine)
+    expect(second.records).toHaveLength(2)
+    expect(second.records[0]).toMatchObject({
+      status: 'error',
+      source: { filePath: file, line: 2, requestId: 'msg_history' }
+    })
+    expect(second.records[0].isReplaceableSnapshot).toBeUndefined()
+    expect(second.records[1]).toMatchObject({
+      status: 'success',
+      outputTokens: 25,
+      source: { filePath: file, line: 3 }
+    })
+    expect(second.records[1].source.requestId).toBeUndefined()
+    expect(second.records[1].isReplaceableSnapshot).toBeUndefined()
+  })
+})
 describe('listFilesFromRoot 收集范围', () => {
   it('只收集项目目录直接子层 + subagents/workflows 子树内的 *.jsonl', () => {
     const root = path.join(tmpDir, 'projects')

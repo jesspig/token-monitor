@@ -216,19 +216,23 @@ function insert(db: SqliteDatabase, overrides: Partial<UsageRecordRow> = {}): st
     created_at: new Date('2026-08-18T10:00:00+08:00').getTime(),
     ...overrides,
     http_status: overrides.http_status ?? null,
-    error_message: overrides.error_message ?? null
+    error_message: overrides.error_message ?? null,
+    request_id: overrides.request_id ?? null,
+    is_replaceable_snapshot: overrides.is_replaceable_snapshot ?? 0
   }
   db.prepare(
     `INSERT INTO usage_records (
         id, data_source, app_type, model, raw_model,
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
         input_semantics, cost_usd, currency, latency_ms, project, session_id,
-        status, http_status, error_message, file_path, line, created_at
+        status, http_status, error_message, request_id, is_replaceable_snapshot,
+        file_path, line, created_at
       ) VALUES (
         @id, @data_source, @app_type, @model, @raw_model,
         @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens,
         @input_semantics, @cost_usd, @currency, @latency_ms, @project, @session_id,
-        @status, @http_status, @error_message, @file_path, @line, @created_at
+        @status, @http_status, @error_message, @request_id, @is_replaceable_snapshot,
+        @file_path, @line, @created_at
       )`
   ).run(row)
   return row.id

@@ -117,6 +117,21 @@ interface UsageRow {
 
 const toNum = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
 
+const toTrimmedString = (v: unknown): string | undefined => {
+  if (typeof v !== 'string') return undefined
+  const trimmed = v.trim()
+  return trimmed !== '' ? trimmed : undefined
+}
+
+function requestIdOf(
+  sessionId: string | undefined,
+  turnId: string | undefined,
+  rowId: number | null
+): string | undefined {
+  if (!sessionId || !turnId || rowId === null || !Number.isSafeInteger(rowId) || rowId <= 0) return undefined
+  return `minimax:${JSON.stringify([sessionId, turnId, rowId])}`
+}
+
 export function parseTsMs(v: unknown): number {
   if (typeof v === 'number' && Number.isFinite(v) && v > 0) {
     return v >= 1_000_000_000_000 ? v : v * 1000
@@ -131,7 +146,9 @@ export function parseTsMs(v: unknown): number {
 export function toUsageRecord(row: UsageRow, opts: { filePath: string; line: number }): UsageRecord {
   const trimmedModel = typeof row.model === 'string' ? row.model.trim() : ''
   const model = trimmedModel !== '' ? trimmedModel : 'unknown'
-  const sessionId = typeof row.session_id === 'string' && row.session_id.trim() !== '' ? row.session_id : undefined
+  const sessionId = toTrimmedString(row.session_id)
+  const turnId = toTrimmedString(row.turn_id)
+  const requestId = requestIdOf(sessionId, turnId, row.id)
   return {
     appType: 'minimax',
     model,
@@ -144,7 +161,7 @@ export function toUsageRecord(row: UsageRow, opts: { filePath: string; line: num
     status: 'success',
     createdAt: parseTsMs(row.ts),
     sessionId,
-    source: { filePath: opts.filePath, line: opts.line }
+    source: { filePath: opts.filePath, line: opts.line, ...(requestId ? { requestId } : {}) }
   }
 }
 

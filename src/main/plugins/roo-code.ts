@@ -1,30 +1,21 @@
-import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
 import type { MonitorPlugin } from '../../../shared/plugin'
 import type { PluginContext } from '../../../shared/context'
 import type { ParsedResult, UsageRecord } from '../../../shared/dto'
 import {
-  detectClineLikeTasks,
-  listClineLikeTaskFiles,
+  detectClineLikeTasksFromRoots,
+  listClineLikeTaskFilesFromRoots,
   parseUiMessages,
   loadHistoryModel
 } from './cline'
+import { editorGlobalStorageRoots } from './_lib/cline-roots'
 
 const EXTENSION_ID = 'rooveterinaryinc.roo-cline'
 const HISTORY_FILE = 'api_conversation_history.json'
 
-function globalStorageRoot(): string {
-  const override = process.env.ROO_CODE_DIR
-  if (override && override.trim() !== '') return override.trim()
-  if (process.platform === 'win32') {
-    const appData = process.env.APPDATA
-    if (appData) return path.join(appData, 'Code', 'User', 'globalStorage')
-  }
-  if (process.platform === 'darwin') {
-    return path.join(os.homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage')
-  }
-  return path.join(os.homedir(), '.config', 'Code', 'User', 'globalStorage')
+export function rooCodeGlobalStorageRoots(): string[] {
+  return editorGlobalStorageRoots(process.env.ROO_CODE_DIR)
 }
 
 async function parseFile(
@@ -40,7 +31,7 @@ async function parseFile(
   }
   const fallbackModel = await loadHistoryModel(path.join(path.dirname(filePath), HISTORY_FILE))
   const parsed = parseUiMessages(filePath, raw, fallbackModel)
-  const records: UsageRecord[] = parsed.records.map((r) => ({ ...r, appType: 'roo-code' }))
+  const records: UsageRecord[] = parsed.records.map((record) => ({ ...record, appType: 'roo-code' }))
   return { records, nextLine: parsed.nextLine, eof: parsed.eof }
 }
 
@@ -49,7 +40,7 @@ export const rooCodePlugin: MonitorPlugin = {
   name: 'Roo Code',
   version: '1.0.0',
   deps: ['storage', 'pricing', 'events'],
-  detect: async () => detectClineLikeTasks(globalStorageRoot(), EXTENSION_ID),
-  listFiles: async () => listClineLikeTaskFiles(globalStorageRoot(), EXTENSION_ID),
+  detect: async () => detectClineLikeTasksFromRoots(rooCodeGlobalStorageRoots(), EXTENSION_ID),
+  listFiles: async () => listClineLikeTaskFilesFromRoots(rooCodeGlobalStorageRoots(), EXTENSION_ID),
   parseFile
 }

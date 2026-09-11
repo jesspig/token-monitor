@@ -82,8 +82,8 @@ interface UsageSeed {
 
 function seedValues(s: UsageSeed): unknown[] {
   return [
-    s.sessionId ?? 'sess-1',
-    s.turnId ?? 'turn-1',
+    s.sessionId === undefined ? 'sess-1' : s.sessionId,
+    s.turnId === undefined ? 'turn-1' : s.turnId,
     s.model === undefined ? 'minimax/MiniMax-M3' : s.model,
     s.ts === undefined ? 1_780_000_000 : s.ts,
     s.inputTokens === undefined ? 100 : s.inputTokens,
@@ -282,7 +282,7 @@ describe('列探测', () => {
 })
 
 describe('parseDbFile 正常解析', () => {
-  it('标准行映射：四桶、semantics=2、秒→毫秒、source.line=id 且无 requestId（reasoning 不计入）', () => {
+  it('标准行映射：四桶、semantics=2、秒→毫秒，并使用 session/turn/id 稳定身份（reasoning 不计入）', () => {
     const dbPath = buildDb(tmpDir, 'legacy')
     insertRow(dbPath, 'legacy', {
       sessionId: 'sess-abc',
@@ -311,8 +311,11 @@ describe('parseDbFile 正常解析', () => {
       sessionId: 'sess-abc',
       createdAt: 1_780_000_000_000
     })
-    expect(r.source).toEqual({ filePath: dbPath, line: 1 })
-    expect('requestId' in r.source).toBe(false)
+    expect(r.source).toEqual({
+      filePath: dbPath,
+      line: 1,
+      requestId: 'minimax:["sess-abc","turn-1",1]'
+    })
   })
 
   it('model 空串/NULL/空白记 unknown，行不跳过', () => {
@@ -328,7 +331,7 @@ describe('parseDbFile 正常解析', () => {
     expect(res.nextLine).toBe(3)
   })
 
-  it('同一 turn_id 多行各自独立产出，不求和不折叠', () => {
+  it('同一 session/turn 多行使用各自 id，保持独立 requestId', () => {
     const dbPath = buildDb(tmpDir, 'legacy')
     insertRow(dbPath, 'legacy', { turnId: 'turn-same', inputTokens: 10, outputTokens: 5 })
     insertRow(dbPath, 'legacy', { turnId: 'turn-same', inputTokens: 30, outputTokens: 7 })
@@ -337,21 +340,95 @@ describe('parseDbFile 正常解析', () => {
     expect(res.records.map((r) => r.inputTokens)).toEqual([10, 30])
     expect(res.records.map((r) => r.outputTokens)).toEqual([5, 7])
     expect(res.records.map((r) => r.source.line)).toEqual([1, 2])
+    expect(res.records.map((r) => r.source.requestId)).toEqual([
+      'minimax:["sess-1","turn-same",1]',
+      'minimax:["sess-1","turn-same",2]'
+    ])
   })
 
-  it('双库并存各自独立统计，互不串扰', () => {
+  it('双库不重叠 turn 使用不同 requestId，互不误合并', () => {
     const legacyPath = buildDb(tmpDir, 'legacy')
     const runtimePath = buildDb(tmpDir, 'runtime')
-    insertRow(legacyPath, 'legacy', { sessionId: 'sess-l', model: 'minimax/MiniMax-M3' })
-    insertRow(runtimePath, 'runtime', { sessionId: 'sess-r', model: 'minimax/MiniMax-M2' })
+    insertRow(legacyPath, 'legacy', { sessionId: 'sess-l', turnId: 'turn-shared', model: 'minimax/MiniMax-M3' })
+    insertRow(runtimePath, 'runtime', { sessionId: 'sess-r', turnId: 'turn-shared', model: 'minimax/MiniMax-M2' })
     const r1 = parseDbFile(legacyPath, 0)
     const r2 = parseDbFile(runtimePath, 0)
     expect(r1.records).toHaveLength(1)
     expect(r1.records[0]).toMatchObject({ sessionId: 'sess-l', model: 'minimax/MiniMax-M3' })
-    expect(r1.records[0].source.filePath).toBe(legacyPath)
+    expect(r1.records[0].source).toEqual({
+      filePath: legacyPath,
+      line: 1,
+      requestId: 'minimax:["sess-l","turn-shared",1]'
+    })
     expect(r2.records).toHaveLength(1)
     expect(r2.records[0]).toMatchObject({ sessionId: 'sess-r', model: 'minimax/MiniMax-M2' })
-    expect(r2.records[0].source.filePath).toBe(runtimePath)
+    expect(r2.records[0].source).toEqual({
+      filePath: runtimePath,
+      line: 1,
+      requestId: 'minimax:["sess-r","turn-shared",1]'
+    })
+  })
+
+  it('双库重叠的相同 session/turn/id 产生相同 requestId', () => {
+    const legacyPath = buildDb(tmpDir, 'legacy')
+    const runtimePath = buildDb(tmpDir, 'runtime')
+    insertRow(legacyPath, 'legacy', { sessionId: 'sess-shared', turnId: 'turn-shared' })
+    insertRow(runtimePath, 'runtime', { sessionId: 'sess-shared', turnId: 'turn-shared' })
+
+    const legacy = parseDbFile(legacyPath, 0).records[0]
+    const runtime = parseDbFile(runtimePath, 0).records[0]
+
+    expect(legacy.source.filePath).toBe(legacyPath)
+    expect(runtime.source.filePath).toBe(runtimePath)
+    expect(legacy.source.line).toBe(1)
+    expect(runtime.source.line).toBe(1)
+    expect(legacy.source.requestId).toBe('minimax:["sess-shared","turn-shared",1]')
+    expect(runtime.source.requestId).toBe(legacy.source.requestId)
+  })
+
+  it('双库相同 session/turn 但 id 不同时不合并', () => {
+    const legacyPath = buildDb(tmpDir, 'legacy')
+    const runtimePath = buildDb(tmpDir, 'runtime')
+    insertRow(legacyPath, 'legacy', { sessionId: 'sess-shared', turnId: 'turn-shared' })
+    insertRow(runtimePath, 'runtime', { sessionId: 'sess-other', turnId: 'turn-other' })
+    insertRow(runtimePath, 'runtime', { sessionId: 'sess-shared', turnId: 'turn-shared' })
+
+    const legacy = parseDbFile(legacyPath, 0).records[0]
+    const runtime = parseDbFile(runtimePath, 0).records[1]
+
+    expect(legacy.source.requestId).toBe('minimax:["sess-shared","turn-shared",1]')
+    expect(runtime.source.requestId).toBe('minimax:["sess-shared","turn-shared",2]')
+    expect(runtime.source.requestId).not.toBe(legacy.source.requestId)
+  })
+
+  it('缺失或空白 session_id/turn_id 时保守不写 requestId', () => {
+    const dbPath = buildDb(tmpDir, 'legacy')
+    insertRow(dbPath, 'legacy', { sessionId: null, turnId: 'turn-1' })
+    insertRow(dbPath, 'legacy', { sessionId: 'sess-1', turnId: null })
+    insertRow(dbPath, 'legacy', { sessionId: '   ', turnId: 'turn-3' })
+    insertRow(dbPath, 'legacy', { sessionId: 'sess-4', turnId: '   ' })
+
+    const res = parseDbFile(dbPath, 0)
+
+    expect(res.records).toHaveLength(4)
+    expect(res.records.map((r) => r.source.line)).toEqual([1, 2, 3, 4])
+    for (const record of res.records) expect('requestId' in record.source).toBe(false)
+  })
+
+  it('相同数据库稳定重放保持 requestId 与 source.line 不变', () => {
+    const dbPath = buildDb(tmpDir, 'runtime')
+    insertRow(dbPath, 'runtime', { sessionId: ' sess-stable ', turnId: ' turn-stable ' })
+
+    const first = parseDbFile(dbPath, 0).records[0]
+    const replay = parseDbFile(dbPath, 0).records[0]
+
+    expect(first.source).toEqual({
+      filePath: dbPath,
+      line: 1,
+      requestId: 'minimax:["sess-stable","turn-stable",1]'
+    })
+    expect(replay.source).toEqual(first.source)
+    expect(first.sessionId).toBe('sess-stable')
   })
 
   it('数值列 NULL/异常兜 0，semantics 仍为 2', () => {
@@ -521,7 +598,28 @@ describe('toUsageRecord 与 parseTsMs 宽松解析', () => {
     }
   })
 
-  it('toUsageRecord：sessionId NULL 不产出该值，line 取 rowid，无 requestId', () => {
+  it('toUsageRecord：session/turn 完整但 id 无效时不写 requestId', () => {
+    const rec = toUsageRecord(
+      {
+        id: null,
+        session_id: 'sess-1',
+        turn_id: 'turn-1',
+        model: 'minimax/MiniMax-M3',
+        ts: 1_780_000_000,
+        input_tokens: 10,
+        output_tokens: 4,
+        cache_read_tokens: 6,
+        cache_write_tokens: 2
+      },
+      { filePath: 'runtime-state.sqlite', line: 9 }
+    )
+
+    expect(rec.sessionId).toBe('sess-1')
+    expect(rec.source).toEqual({ filePath: 'runtime-state.sqlite', line: 9 })
+    expect('requestId' in rec.source).toBe(false)
+  })
+
+  it('toUsageRecord：身份不完整时不产出 sessionId/requestId，line 仍取 rowid', () => {
     const rec = toUsageRecord(
       {
         id: 3,

@@ -14,13 +14,16 @@ export { statMtimeMs, maxMtime } from './_lib/opencode-shared'
 
 export const DB_SOURCE_SUFFIX = 'opencode.db'
 
+export const CHANNEL_DB_NAMES = ['opencode-prod.db']
+
 export const EXTERNAL_DB_BUSY_TIMEOUT_MS = OPENCODE_LIKE_DB_BUSY_TIMEOUT_MS
 
 const core = createOpencodeLikePluginCore({
   appType: 'opencode',
   dbName: DB_SOURCE_SUFFIX,
+  channelVariants: CHANNEL_DB_NAMES,
   detectMissingRootReason: () => '未找到数据根（默认 ~/.local/share/opencode，可用 $OPENCODE_HOME 覆盖）',
-  detectUnavailableReason: () => '数据根下未发现 opencode.db 或 storage/message（OpenCode 未安装或尚未产生会话）'
+  detectUnavailableReason: () => '数据根下未发现 opencode.db、opencode-prod.db 或 storage/message（OpenCode 未安装或尚未产生会话）'
 })
 
 export function dataRoot(): string {
@@ -100,7 +103,7 @@ async function listFiles(): Promise<FileEntry[]> {
 }
 
 async function parseFile(_ctx: PluginContext, filePath: string, fromLine: number): Promise<ParsedResult> {
-  if (filePath.endsWith(DB_SOURCE_SUFFIX)) return parseDbFile(filePath, fromLine)
+  if (core.dbNames.includes(path.basename(filePath))) return parseDbFile(filePath, fromLine)
   return parseJsonFile(filePath, fromLine)
 }
 

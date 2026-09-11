@@ -76,15 +76,18 @@ const PLUGIN_ISOLATION_ENV_KEYS = [
   'CLINE_DIR',
   'ROO_CODE_DIR',
   'KILO_CODE_DIR',
+  'KILO_DATA_HOME',
   'QWEN_RUNTIME_DIR',
   'QODER_DIR',
   'QODER_CN_DIR',
   'KIMI_CODE_HOME',
   'ZED_DIR',
   'KIRO_DIR',
+  'KIRO_DATA_DIR',
   'REASONIX_STATE_HOME',
   'COMMANDCODE_DIR',
-  'COPILOT_CHAT_DIR'
+  'COPILOT_CHAT_DIR',
+  'TRAE_TRAJECTORY_DIR'
 ]
 
 beforeEach(() => {
@@ -194,6 +197,96 @@ describe('createHost 装配', () => {
       expect(over.dailyExceeded).toBe(true)
       expect(over.dailyUsageRatio).toBeCloseTo(1.5, 10)
       expect(over.monthlyExceeded).toBe(false)
+    } finally {
+      host.dispose()
+    }
+  })
+})
+
+describe('Trae Agent 多根目录设置', () => {
+  it('保存时规范化去重并在重启后恢复', async () => {
+    const dataDir = path.join(tempHome, 'app-data')
+    const firstRoot = path.join(tempHome, 'trae-first')
+    const secondRoot = path.join(tempHome, 'trae-second')
+    mkdirSync(firstRoot, { recursive: true })
+    mkdirSync(secondRoot, { recursive: true })
+
+    const firstHost = await createHost({ dataDir })
+    try {
+      firstHost.updateSettings({
+        traeTrajectoryRoots: ['  ' + firstRoot + '  ', firstRoot + path.sep + '.', secondRoot, '']
+      })
+      expect(firstHost.getSettings().traeTrajectoryRoots).toEqual([firstRoot, secondRoot])
+    } finally {
+      firstHost.dispose()
+    }
+
+    const restartedHost = await createHost({ dataDir })
+    try {
+      expect(restartedHost.getSettings().traeTrajectoryRoots).toEqual([firstRoot, secondRoot])
+    } finally {
+      restartedHost.dispose()
+    }
+  })
+
+  it('拒绝不存在路径、文件路径和相对路径，失败后保留原设置', async () => {
+    const host = await createHost({ dataDir: ':memory:' })
+    const validRoot = path.join(tempHome, 'trae-valid')
+    const filePath = path.join(tempHome, 'trajectory-file')
+    mkdirSync(validRoot, { recursive: true })
+    writeFileSync(filePath, 'x', 'utf8')
+    try {
+      host.updateSettings({ traeTrajectoryRoots: [validRoot] })
+      expect(() => host.updateSettings({
+        traeTrajectoryRoots: [path.join(tempHome, 'missing')]
+      })).toThrow('不存在')
+      expect(() => host.updateSettings({ traeTrajectoryRoots: [filePath] })).toThrow('不是目录')
+      expect(() => host.updateSettings({ traeTrajectoryRoots: ['relative/trajectories'] })).toThrow(
+        '绝对路径'
+      )
+      expect(host.getSettings().traeTrajectoryRoots).toEqual([validRoot])
+    } finally {
+      host.dispose()
+    }
+  })
+
+  it('持久化后 Trae 插件 detect/listFiles 立即读取最新配置', async () => {
+    const firstRoot = path.join(tempHome, 'trae-live-first')
+    const secondRoot = path.join(tempHome, 'trae-live-second')
+    mkdirSync(firstRoot, { recursive: true })
+    mkdirSync(secondRoot, { recursive: true })
+    writeFileSync(path.join(firstRoot, 'trajectory_first.json'), '{"llm_interactions":[]}', 'utf8')
+    writeFileSync(path.join(secondRoot, 'trajectory_second.json'), '{"llm_interactions":[]}', 'utf8')
+
+    const host = await createHost({ dataDir: ':memory:' })
+    try {
+      const plugin = host.registry.get('trae-agent')
+      expect(plugin).toBeDefined()
+
+      host.updateSettings({ traeTrajectoryRoots: [firstRoot] })
+      expect((await plugin!.detect(host.ctx)).sessionDir).toBe(firstRoot)
+      expect((await plugin!.listFiles(host.ctx)).map((entry) => path.basename(entry.path))).toEqual([
+        'trajectory_first.json'
+      ])
+
+      host.updateSettings({ traeTrajectoryRoots: [secondRoot] })
+      expect((await plugin!.detect(host.ctx)).sessionDir).toBe(secondRoot)
+      expect((await plugin!.listFiles(host.ctx)).map((entry) => path.basename(entry.path))).toEqual([
+        'trajectory_second.json'
+      ])
+    } finally {
+      host.dispose()
+    }
+  })
+
+  it('IPC 保存非法根目录时返回明确错误', async () => {
+    const host = await createHost({ dataDir: ':memory:' })
+    const ipc = makeFakeIpcMain()
+    registerIpcHandlers(ipc, host, () => null)
+    try {
+      await expect(ipc.invoke('settings:update', {
+        traeTrajectoryRoots: [path.join(tempHome, 'missing')]
+      })).rejects.toThrow('不存在')
     } finally {
       host.dispose()
     }

@@ -8,11 +8,91 @@ import { ERROR_MESSAGE_MAX_LENGTH, isIgnoredFailureReason } from '../../../../sh
 export const OPENCODE_LIKE_DB_BUSY_TIMEOUT_MS = 250
 
 export const OPENCODE_LIKE_MESSAGE_SELECT_SQL = `
-  SELECT m.*, s.directory AS project_dir
+  SELECT m.rowid AS token_monitor_rowid, m.*, s.directory AS project_dir
   FROM message m
   LEFT JOIN session s ON s.id = m.session_id
-  WHERE m.time_created > ?
-  ORDER BY m.time_created ASC, m.id ASC`
+  WHERE m.rowid > ?
+  ORDER BY m.rowid ASC`
+
+const OPENCODE_LIKE_CURSOR_MARKER = 2 ** 52
+const OPENCODE_LIKE_CURSOR_ROWID_BASE = 2 ** 32
+const OPENCODE_LIKE_CURSOR_FINGERPRINT_MOD = 2 ** 20
+const OPENCODE_LIKE_CURSOR_MAX_ROWID = OPENCODE_LIKE_CURSOR_ROWID_BASE - 1
+const OPENCODE_LIKE_CURSOR_ANCHOR_LIMIT = 1
+
+interface OpencodeLikeCursor {
+  fingerprint: number
+  rowid: number
+}
+
+function hashCursorIdentity(value: string): number {
+  let hash = 2_166_136_261
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i)
+    hash = Math.imul(hash, 16_777_619)
+  }
+  return (hash >>> 0) % OPENCODE_LIKE_CURSOR_FINGERPRINT_MOD
+}
+
+function encodeDbCursor(cursor: OpencodeLikeCursor): number {
+  if (!Number.isSafeInteger(cursor.rowid) || cursor.rowid < 0 || cursor.rowid > OPENCODE_LIKE_CURSOR_MAX_ROWID) {
+    throw new Error(`OpenCode-like 数据库 rowid 超出支持范围：${cursor.rowid}`)
+  }
+  return OPENCODE_LIKE_CURSOR_MARKER + cursor.fingerprint * OPENCODE_LIKE_CURSOR_ROWID_BASE + cursor.rowid
+}
+
+function decodeDbCursor(value: number): OpencodeLikeCursor | null {
+  if (!Number.isSafeInteger(value) || value < OPENCODE_LIKE_CURSOR_MARKER) return null
+  const payload = value - OPENCODE_LIKE_CURSOR_MARKER
+  const fingerprint = Math.floor(payload / OPENCODE_LIKE_CURSOR_ROWID_BASE)
+  const rowid = payload % OPENCODE_LIKE_CURSOR_ROWID_BASE
+  if (fingerprint < 0 || fingerprint >= OPENCODE_LIKE_CURSOR_FINGERPRINT_MOD) return null
+  if (!Number.isSafeInteger(rowid) || rowid < 0 || rowid > OPENCODE_LIKE_CURSOR_MAX_ROWID) return null
+  return { fingerprint, rowid }
+}
+
+function tableColumns(db: Database.Database, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>
+  return new Set(rows.map((row) => row.name).filter((name): name is string => typeof name === 'string'))
+}
+
+function assertRequiredColumns(db: Database.Database, table: string, required: string[]): void {
+  const columns = tableColumns(db, table)
+  if (columns.size === 0) throw new Error(`OpenCode-like 数据库缺少 ${table} 表`)
+  const missing = required.filter((column) => !columns.has(column))
+  if (missing.length > 0) {
+    throw new Error(`OpenCode-like 数据库 ${table} 表缺少必要列：${missing.join(', ')}`)
+  }
+}
+
+function readDbFingerprint(db: Database.Database): number {
+  const schemaVersion = db.pragma('schema_version', { simple: true })
+  const schemaRows = db
+    .prepare(`SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name IN ('message', 'session') ORDER BY name`)
+    .all() as Array<{ name: unknown; sql: unknown }>
+  const anchors = db
+    .prepare(`SELECT rowid, id, time_created FROM message ORDER BY rowid ASC LIMIT ?`)
+    .all(OPENCODE_LIKE_CURSOR_ANCHOR_LIMIT) as Array<Record<string, unknown>>
+  return hashCursorIdentity(JSON.stringify({ schemaVersion, schemaRows, anchors }))
+}
+
+function readMaxRowid(db: Database.Database): number {
+  const row = db.prepare('SELECT MAX(rowid) AS max_rowid FROM message').get() as { max_rowid?: unknown } | undefined
+  if (row?.max_rowid === null || row?.max_rowid === undefined) return 0
+  const value = row.max_rowid
+  if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > OPENCODE_LIKE_CURSOR_MAX_ROWID) {
+    throw new Error(`OpenCode-like 数据库 rowid 超出支持范围：${String(value)}`)
+  }
+  return value as number
+}
+
+function resolveDbRowidCursor(fromLine: number, fingerprint: number, maxRowid: number): number {
+  const decoded = decodeDbCursor(fromLine)
+  if (!decoded) return 0
+  if (decoded.fingerprint !== fingerprint) return 0
+  if (decoded.rowid > maxRowid) return 0
+  return decoded.rowid
+}
 
 export function statMtimeMs(p: string): number {
   try {
@@ -279,14 +359,23 @@ export function createOpencodeLikeDbFileParser(
 ): (dbPath: string, fromLine: number) => ParsedResult {
   const toRecord = createOpencodeLikeRecordMapper(core)
   return (dbPath, fromLine) => {
-    const base = typeof fromLine === 'number' && Number.isFinite(fromLine) && fromLine > 0 ? fromLine : 0
-    let db: Database.Database | null = null
+    let db: Database.Database
     try {
       db = new Database(dbPath, { readonly: true, timeout: OPENCODE_LIKE_DB_BUSY_TIMEOUT_MS })
-      const rows = db
-        .prepare(OPENCODE_LIKE_MESSAGE_SELECT_SQL)
-        .all(base) as Array<
+    } catch {
+      throw new Error(`无法以只读模式打开 OpenCode-like 数据库 ${core.dbName}`)
+    }
+
+    try {
+      assertRequiredColumns(db, 'message', ['id', 'session_id', 'time_created', 'data'])
+      assertRequiredColumns(db, 'session', ['id', 'directory'])
+
+      const fingerprint = readDbFingerprint(db)
+      const maxRowid = readMaxRowid(db)
+      const baseRowid = resolveDbRowidCursor(fromLine, fingerprint, maxRowid)
+      const rows = db.prepare(OPENCODE_LIKE_MESSAGE_SELECT_SQL).all(baseRowid) as Array<
         Record<string, unknown> & {
+          token_monitor_rowid: number
           id: string
           session_id: string | null
           time_created: number
@@ -296,29 +385,44 @@ export function createOpencodeLikeDbFileParser(
       >
 
       const records: UsageRecord[] = []
-      let watermark = base
-      let seq = base
       for (const row of rows) {
-        watermark = Math.max(watermark, row.time_created)
-        const line = Math.max(seq + 1, row.time_created)
-        seq = line
-
-        let parsed: unknown = null
-        try {
-          parsed = JSON.parse(String(row.data))
-        } catch {
-          parsed = null
+        const rowid = row.token_monitor_rowid
+        if (!Number.isSafeInteger(rowid) || rowid <= 0 || rowid > OPENCODE_LIKE_CURSOR_MAX_ROWID) {
+          throw new Error(`OpenCode-like 数据库包含不受支持的 rowid：${String(rowid)}`)
         }
+        if (typeof row.data !== 'string') {
+          throw new Error(`OpenCode-like 数据库 message.data 不是文本（rowid=${rowid}）`)
+        }
+
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(row.data)
+        } catch {
+          throw new Error(`OpenCode-like 数据库 message.data 不是合法 JSON（rowid=${rowid}）`)
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error(`OpenCode-like 数据库 message.data 不是消息对象（rowid=${rowid}）`)
+        }
+
         const dbExtra: Record<string, unknown> = {}
-        for (const k of ['error', 'error_message', 'errorMessage', 'status', 'state', 'http_status', 'httpStatus', 'status_code', 'statusCode', 'code']) {
-          if (k in row && (row as Record<string, unknown>)[k] !== undefined) {
-            dbExtra[k] = (row as Record<string, unknown>)[k]
-          }
+        for (const key of [
+          'error',
+          'error_message',
+          'errorMessage',
+          'status',
+          'state',
+          'http_status',
+          'httpStatus',
+          'status_code',
+          'statusCode',
+          'code'
+        ]) {
+          if (key in row && row[key] !== undefined) dbExtra[key] = row[key]
         }
         const hasDbExtra = Object.keys(dbExtra).length > 0 ? dbExtra : undefined
         const record = toRecord(parsed, {
           filePath: core.dbName,
-          line,
+          line: encodeDbCursor({ fingerprint, rowid }),
           project: row.project_dir ?? undefined,
           sessionId: row.session_id ?? undefined,
           createdAt: row.time_created,
@@ -327,11 +431,10 @@ export function createOpencodeLikeDbFileParser(
         })
         if (record) records.push(record)
       }
-      return { records, nextLine: watermark, eof: true }
-    } catch {
-      return { records: [], nextLine: base, eof: true }
+
+      return { records, nextLine: encodeDbCursor({ fingerprint, rowid: maxRowid }), eof: true }
     } finally {
-      if (db) db.close()
+      db.close()
     }
   }
 }

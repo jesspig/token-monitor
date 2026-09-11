@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
+import type { AppSettings } from '../../../../shared/query'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 import { Card } from '../components/Card'
@@ -22,6 +23,45 @@ function parseBudgetInput(raw: string): { value: number | null; error: string | 
   return { value: n, error: null }
 }
 
+export function parseTraeTrajectoryRootsInput(raw: string): string[] {
+  const roots: string[] = []
+  const seen = new Set<string>()
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed === '' || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    roots.push(trimmed)
+  }
+  return roots
+}
+
+interface SettingsPayloadInput {
+  syncMin: string
+  statsRefreshSec: string
+  retentionDays: string
+  pricingSyncMin: string
+  dataDir: string
+  currentDataDir: string
+  traeTrajectoryRoots: string
+  dailyBudgetUsd: number | null
+  monthlyBudgetUsd: number | null
+  closeToTray: boolean
+}
+
+export function buildSettingsPayload(input: SettingsPayloadInput): AppSettings {
+  return {
+    syncIntervalMs: Math.max(1, Number(input.syncMin) || 5) * 60_000,
+    statsRefreshIntervalMs: Math.max(1, Number(input.statsRefreshSec) || 30) * 1000,
+    retentionDays: Math.max(1, Number(input.retentionDays) || 30),
+    pricingSyncIntervalMs: Math.max(1, Number(input.pricingSyncMin) || 5) * 60_000,
+    dataDir: input.dataDir.trim() || input.currentDataDir,
+    traeTrajectoryRoots: parseTraeTrajectoryRootsInput(input.traeTrajectoryRoots),
+    dailyBudgetUsd: input.dailyBudgetUsd,
+    monthlyBudgetUsd: input.monthlyBudgetUsd,
+    closeToTray: input.closeToTray
+  }
+}
+
 export default function SettingsPage(): ReactElement {
   const { data, isPending, isFetching, error, refetch } = useSettings()
   const toast = useToast()
@@ -32,9 +72,11 @@ export default function SettingsPage(): ReactElement {
   const [retentionDays, setRetentionDays] = useState('')
   const [pricingSyncMin, setPricingSyncMin] = useState('')
   const [dataDir, setDataDir] = useState('')
+  const [traeTrajectoryRoots, setTraeTrajectoryRoots] = useState('')
   const [dailyBudget, setDailyBudget] = useState('')
   const [monthlyBudget, setMonthlyBudget] = useState('')
   const [budgetError, setBudgetError] = useState('')
+  const [traeRootsError, setTraeRootsError] = useState('')
   const [closeToTray, setCloseToTray] = useState(false)
   const [saving, setSaving] = useState(false)
 
@@ -47,6 +89,7 @@ export default function SettingsPage(): ReactElement {
     setRetentionDays(String(data.retentionDays))
     setPricingSyncMin(String((data.pricingSyncIntervalMs ?? 300_000) / 60_000))
     setDataDir(data.dataDir)
+    setTraeTrajectoryRoots((data.traeTrajectoryRoots ?? []).join('\n'))
     setDailyBudget(data.dailyBudgetUsd != null ? String(data.dailyBudgetUsd) : '')
     setMonthlyBudget(data.monthlyBudgetUsd != null ? String(data.monthlyBudgetUsd) : '')
     setCloseToTray(data.closeToTray ?? true)
@@ -61,24 +104,29 @@ export default function SettingsPage(): ReactElement {
       return
     }
     setBudgetError('')
-    const payload = {
-      syncIntervalMs: (Math.max(1, Number(syncMin) || 5) * 60_000),
-      statsRefreshIntervalMs: Math.max(1, Number(statsRefreshSec) || 30) * 1000,
-      retentionDays: Math.max(1, Number(retentionDays) || 30),
-      pricingSyncIntervalMs: Math.max(1, Number(pricingSyncMin) || 5) * 60_000,
-      dataDir: dataDir.trim() || data?.dataDir || '',
+    const payload = buildSettingsPayload({
+      syncMin,
+      statsRefreshSec,
+      retentionDays,
+      pricingSyncMin,
+      dataDir,
+      currentDataDir: data?.dataDir ?? '',
+      traeTrajectoryRoots,
       dailyBudgetUsd: daily.value,
       monthlyBudgetUsd: monthly.value,
       closeToTray
-    }
+    })
+    setTraeRootsError('')
     setSaving(true)
     try {
       await api.updateSettings(payload)
       setCachedSettings(payload)
       await qc.invalidateQueries({ queryKey: ['settings'] })
       toast.success('设置已保存')
-    } catch {
-      toast.error('保存失败，请重试')
+    } catch (saveError) {
+      const message = saveError instanceof Error ? saveError.message : '保存失败，请重试'
+      setTraeRootsError(message)
+      toast.error(message)
     } finally {
       setSaving(false)
     }
@@ -86,7 +134,7 @@ export default function SettingsPage(): ReactElement {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="设置" description="同步间隔、数据保留策略、数据目录与预算上限" />
+      <PageHeader title="设置" description="同步间隔、数据保留策略、监控目录与预算上限" />
 
       <QueryState
         isPending={isPending}
@@ -177,6 +225,28 @@ export default function SettingsPage(): ReactElement {
                 placeholder="~/.config/token-monitor"
                 className={INPUT_CLS}
               />
+            </div>
+            <div className="md:col-span-2">
+              <label className={LABEL_CLS} htmlFor="trae-trajectory-roots">
+                Trae Agent trajectory 根目录
+              </label>
+              <textarea
+                id="trae-trajectory-roots"
+                rows={4}
+                value={traeTrajectoryRoots}
+                onChange={(e) => {
+                  setTraeTrajectoryRoots(e.target.value)
+                  setTraeRootsError('')
+                }}
+                placeholder="每行一个 trajectories 目录的绝对路径；留空时兼容 TRAE_TRAJECTORY_DIR 和旧默认候选"
+                aria-describedby="trae-trajectory-roots-help"
+                aria-invalid={traeRootsError !== ''}
+                className={INPUT_CLS}
+              />
+              <p id="trae-trajectory-roots-help" className="mt-1 text-xs text-neutral-500">
+                保存时会去除空行和重复项；路径必须存在且必须是目录。
+              </p>
+              {traeRootsError && <p className="mt-1 text-sm text-red-400">{traeRootsError}</p>}
             </div>
             <div className="md:col-span-2 flex items-center">
               <Toggle

@@ -27,6 +27,12 @@ const lineNew = (u: Record<string, unknown> = usage(), ts = '2025-12-25T22:47:40
 const lineOld = (u: Record<string, unknown> = usage(), ts = '2025-12-25T22:47:40.922775'): string =>
   JSON.stringify({ role: 'assistant', content: 'ok', timestamp: ts, metadata: { ...u } })
 
+const lineWithId = (
+  id: string,
+  u: Record<string, unknown> = usage(),
+  ts = '2025-12-25T22:47:40.922775'
+): string => JSON.stringify({ id, role: 'assistant', content: 'ok', timestamp: ts, metadata: { usage: u } })
+
 let tmpDir = ''
 
 const envKeys = ['GPTME_DIR', 'GPTME_LOGS_HOME'] as const
@@ -120,29 +126,26 @@ describe('detect', () => {
 })
 
 describe('listFilesFromRoot', () => {
-  it('只收一级子目录的 conversation.jsonl；branches 内文件、临时/隐藏目录、根散文件不收', () => {
+  it('收集普通会话及 branches 下的多分支和嵌套分支，过滤临时、隐藏目录与根散文件', () => {
     const root = path.join(tmpDir, 'logs')
-    fs.mkdirSync(path.join(root, 'conv-a'), { recursive: true })
-    fs.mkdirSync(path.join(root, 'conv-b'), { recursive: true })
-    fs.mkdirSync(path.join(root, 'conv-b', 'branches'), { recursive: true })
-    fs.mkdirSync(path.join(root, '.hidden'), { recursive: true })
-    fs.mkdirSync(path.join(root, 'conv-tmp~'), { recursive: true })
-    fs.mkdirSync(path.join(root, 'conv.swp'), { recursive: true })
+    const normal = path.join(root, 'conv-a', 'conversation.jsonl')
+    const parent = path.join(root, 'conv-b', 'conversation.jsonl')
+    const branchA = path.join(root, 'conv-b', 'branches', 'branch-a', 'conversation.jsonl')
+    const branchB = path.join(root, 'conv-b', 'branches', 'branch-b', 'conversation.jsonl')
+    const nested = path.join(root, 'conv-b', 'branches', 'branch-a', 'branches', 'nested', 'conversation.jsonl')
+    const hidden = path.join(root, 'conv-b', 'branches', '.hidden', 'conversation.jsonl')
+    const temporary = path.join(root, 'conv-b', 'branches', 'draft.tmp', 'conversation.jsonl')
 
-    fs.writeFileSync(path.join(root, 'conv-a', 'conversation.jsonl'), lineNew(), 'utf8')
-    fs.writeFileSync(path.join(root, 'conv-b', 'conversation.jsonl'), lineNew(), 'utf8')
-    fs.writeFileSync(path.join(root, 'conv-b', 'branches', 'conversation.jsonl'), lineNew(), 'utf8')
+    for (const file of [normal, parent, branchA, branchB, nested, hidden, temporary]) {
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.writeFileSync(file, lineNew(), 'utf8')
+    }
     fs.writeFileSync(path.join(root, 'conv-b', 'other.jsonl'), lineNew(), 'utf8')
-    fs.writeFileSync(path.join(root, '.hidden', 'conversation.jsonl'), lineNew(), 'utf8')
-    fs.writeFileSync(path.join(root, 'conv-tmp~', 'conversation.jsonl'), lineNew(), 'utf8')
-    fs.writeFileSync(path.join(root, 'conv.swp', 'conversation.jsonl'), lineNew(), 'utf8')
     fs.writeFileSync(path.join(root, 'conversation.jsonl'), lineNew(), 'utf8')
 
     const entries = listFilesFromRoot(root)
-    expect(entries.map((e) => path.basename(path.dirname(e.path)))).toEqual(['conv-a', 'conv-b'])
-    for (const e of entries) {
-      expect(e.mtime).toBeGreaterThan(0)
-    }
+    expect(entries.map((entry) => entry.path)).toEqual([normal, parent, branchA, branchB, nested])
+    for (const entry of entries) expect(entry.mtime).toBeGreaterThan(0)
   })
 })
 
@@ -397,5 +400,115 @@ describe('parseConversationFile 游标增量与容错', () => {
     expect(r3.records).toHaveLength(0)
     expect(r3.nextLine).toBe(7)
     expect(r3.eof).toBe(true)
+  })
+})
+
+describe('fork 与 branch 语义身份', () => {
+  it('显式消息 id 跨文件生成相同 requestId，metadata.message_id 作为兼容回退', async () => {
+    const directFile = path.join(tmpDir, 'direct.jsonl')
+    const metadataFile = path.join(tmpDir, 'metadata.jsonl')
+    fs.writeFileSync(directFile, lineWithId('message-direct'), 'utf8')
+    fs.writeFileSync(
+      metadataFile,
+      JSON.stringify({
+        role: 'assistant',
+        content: 'ok',
+        timestamp: '2025-12-25T22:47:40Z',
+        metadata: { message_id: 'message-metadata', usage: usage() }
+      }),
+      'utf8'
+    )
+
+    const direct = await gptmePlugin.parseFile(ctx, directFile, 0)
+    const metadata = await gptmePlugin.parseFile(ctx, metadataFile, 0)
+    expect(direct.records[0].source.requestId).toBe('message-direct')
+    expect(metadata.records[0].source.requestId).toBe('message-metadata')
+  })
+
+  it('fork 复制前缀保留稳定消息 id，仅新增后缀形成新语义记录', async () => {
+    const parent = path.join(tmpDir, 'logs', 'parent', 'conversation.jsonl')
+    const fork = path.join(tmpDir, 'logs', 'fork', 'conversation.jsonl')
+    fs.mkdirSync(path.dirname(parent), { recursive: true })
+    fs.mkdirSync(path.dirname(fork), { recursive: true })
+    fs.writeFileSync(
+      parent,
+      [lineWithId('shared-1'), lineWithId('shared-2'), lineWithId('parent-only')].join('\n'),
+      'utf8'
+    )
+    fs.writeFileSync(
+      fork,
+      [lineWithId('shared-1'), lineWithId('shared-2'), lineWithId('fork-only')].join('\n'),
+      'utf8'
+    )
+
+    const parentResult = await gptmePlugin.parseFile(ctx, parent, 0)
+    const forkResult = await gptmePlugin.parseFile(ctx, fork, 0)
+    expect(parentResult.records.map((record) => record.source.requestId)).toEqual(['shared-1', 'shared-2', 'parent-only'])
+    expect(forkResult.records.map((record) => record.source.requestId)).toEqual(['shared-1', 'shared-2', 'fork-only'])
+    const semanticRequests = new Set(
+      [...parentResult.records, ...forkResult.records].map((record) => record.source.requestId)
+    )
+    expect([...semanticRequests].sort()).toEqual(['fork-only', 'parent-only', 'shared-1', 'shared-2'])
+  })
+
+  it('普通独立会话缺少稳定 id 时不使用内容或时间戳猜测合并', async () => {
+    const first = path.join(tmpDir, 'logs', 'first', 'conversation.jsonl')
+    const second = path.join(tmpDir, 'logs', 'second', 'conversation.jsonl')
+    fs.mkdirSync(path.dirname(first), { recursive: true })
+    fs.mkdirSync(path.dirname(second), { recursive: true })
+    const sameContent = lineNew(usage(), '2025-12-25T22:47:40Z')
+    fs.writeFileSync(first, sameContent, 'utf8')
+    fs.writeFileSync(second, sameContent, 'utf8')
+
+    const firstResult = await gptmePlugin.parseFile(ctx, first, 0)
+    const secondResult = await gptmePlugin.parseFile(ctx, second, 0)
+    expect(firstResult.records[0].source.requestId).toBeUndefined()
+    expect(secondResult.records[0].source.requestId).toBeUndefined()
+    expect(firstResult.records[0].source.filePath).not.toBe(secondResult.records[0].source.filePath)
+  })
+
+  it('父会话、多分支与嵌套分支的共享前缀保持同一身份，分支独占消息各计一次', async () => {
+    const root = path.join(tmpDir, 'logs')
+    const parent = path.join(root, 'session', 'conversation.jsonl')
+    const branchA = path.join(root, 'session', 'branches', 'a', 'conversation.jsonl')
+    const branchB = path.join(root, 'session', 'branches', 'b', 'conversation.jsonl')
+    const nested = path.join(root, 'session', 'branches', 'a', 'branches', 'nested', 'conversation.jsonl')
+    const fixtures = new Map<string, string[]>([
+      [parent, ['root-1', 'root-2']],
+      [branchA, ['root-1', 'root-2', 'branch-a']],
+      [branchB, ['root-1', 'branch-b']],
+      [nested, ['root-1', 'root-2', 'branch-a', 'nested-only']]
+    ])
+    for (const [file, ids] of fixtures) {
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.writeFileSync(file, ids.map((id) => lineWithId(id)).join('\n'), 'utf8')
+    }
+
+    const files = listFilesFromRoot(root)
+    const results = await Promise.all(files.map((entry) => gptmePlugin.parseFile(ctx, entry.path, 0)))
+    const semanticRequests = new Set(
+      results.flatMap((result) => result.records.map((record) => record.source.requestId))
+    )
+    expect([...semanticRequests].sort()).toEqual([
+      'branch-a',
+      'branch-b',
+      'nested-only',
+      'root-1',
+      'root-2'
+    ])
+  })
+
+  it('重启续读与重复全量扫描保持稳定 requestId，尾部新增消息只产生新身份', async () => {
+    const file = path.join(tmpDir, 'conversation.jsonl')
+    fs.writeFileSync(file, [lineWithId('message-1'), lineWithId('message-2')].join('\n'), 'utf8')
+
+    const initial = await gptmePlugin.parseFile(ctx, file, 0)
+    fs.appendFileSync(file, `\n${lineWithId('message-3')}`, 'utf8')
+    const resumed = await gptmePlugin.parseFile(ctx, file, initial.nextLine)
+    const replayed = await gptmePlugin.parseFile(ctx, file, 0)
+
+    expect(initial.records.map((record) => record.source.requestId)).toEqual(['message-1', 'message-2'])
+    expect(resumed.records.map((record) => record.source.requestId)).toEqual(['message-3'])
+    expect(replayed.records.map((record) => record.source.requestId)).toEqual(['message-1', 'message-2', 'message-3'])
   })
 })

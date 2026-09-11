@@ -1,86 +1,62 @@
-import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
 import type { MonitorPlugin } from '../../../shared/plugin'
 import type { PluginContext } from '../../../shared/context'
 import type { Detection, FileEntry, ParsedResult, UsageRecord } from '../../../shared/dto'
+import {
+  detectTasksFromRoots,
+  editorGlobalStorageRoots,
+  listTaskFilesFromRoots
+} from './_lib/cline-roots'
 
 const EXTENSION_ID = 'saoudrizwan.claude-dev'
-const UI_MESSAGES_FILE = 'ui_messages.json'
 const HISTORY_FILE = 'api_conversation_history.json'
 const API_REQ_STARTED = 'api_req_started'
+const HASH_OFFSET = 14695981039346656037n
+const HASH_PRIME = 1099511628211n
+const HASH_MASK = (1n << 53n) - 1n
 
-function globalStorageRoot(): string {
-  const override = process.env.CLINE_DIR
-  if (override && override.trim() !== '') return override.trim()
-  if (process.platform === 'win32') {
-    const appData = process.env.APPDATA
-    if (appData) return path.join(appData, 'Code', 'User', 'globalStorage')
-  }
-  if (process.platform === 'darwin') {
-    return path.join(os.homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage')
-  }
-  return path.join(os.homedir(), '.config', 'Code', 'User', 'globalStorage')
-}
-
-function safeReaddir(dir: string): fs.Dirent[] {
-  try {
-    return fs.readdirSync(dir, { withFileTypes: true })
-  } catch {
-    return []
-  }
-}
-
-function toEntry(p: string): FileEntry | null {
-  try {
-    const mtime = Math.round(fs.statSync(p).mtimeMs)
-    if (!Number.isFinite(mtime) || mtime <= 0) return null
-    return { path: p, mtime }
-  } catch {
-    return null
-  }
+export function clineGlobalStorageRoots(): string[] {
+  return editorGlobalStorageRoots(process.env.CLINE_DIR)
 }
 
 export function listClineLikeTaskFiles(globalStorageDir: string, extensionId: string): FileEntry[] {
-  const tasksDir = path.join(globalStorageDir, extensionId, 'tasks')
-  const out: FileEntry[] = []
-  for (const ent of safeReaddir(tasksDir)) {
-    if (!ent.isDirectory()) continue
-    const entry = toEntry(path.join(tasksDir, ent.name, UI_MESSAGES_FILE))
-    if (entry) out.push(entry)
-  }
-  return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  return listTaskFilesFromRoots([globalStorageDir], extensionId)
 }
 
-function hasAnyTaskFile(tasksDir: string): boolean {
-  for (const ent of safeReaddir(tasksDir)) {
-    if (!ent.isDirectory()) continue
-    try {
-      if (fs.statSync(path.join(tasksDir, ent.name, UI_MESSAGES_FILE)).isFile()) return true
-    } catch {
-      continue
-    }
-  }
-  return false
+export function listClineLikeTaskFilesFromRoots(
+  globalStorageDirs: string[],
+  extensionId: string
+): FileEntry[] {
+  return listTaskFilesFromRoots(globalStorageDirs, extensionId)
 }
 
 export function detectClineLikeTasks(globalStorageDir: string, extensionId: string): Detection {
-  const tasksDir = path.join(globalStorageDir, extensionId, 'tasks')
-  if (hasAnyTaskFile(tasksDir)) return { available: true, sessionDir: tasksDir }
-  return {
-    available: false,
-    reason: `未找到扩展 ${extensionId} 的任务数据（扩展未安装或尚未产生任务）`,
-    sessionDir: tasksDir
+  return detectTasksFromRoots([globalStorageDir], extensionId)
+}
+
+export function detectClineLikeTasksFromRoots(
+  globalStorageDirs: string[],
+  extensionId: string
+): Detection {
+  return detectTasksFromRoots(globalStorageDirs, extensionId)
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
+
+function toFinite(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function toRequestId(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed === '' ? undefined : trimmed
   }
-}
-
-function asRecord(v: unknown): Record<string, unknown> | null {
-  if (!v || typeof v !== 'object' || Array.isArray(v)) return null
-  return v as Record<string, unknown>
-}
-
-function toFinite(v: unknown): number | undefined {
-  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+  return typeof value === 'number' && Number.isFinite(value) ? String(value) : undefined
 }
 
 function parseTextJson(text: unknown): Record<string, unknown> | null {
@@ -93,12 +69,37 @@ function parseTextJson(text: unknown): Record<string, unknown> | null {
 }
 
 function extractModelId(info: unknown): string | undefined {
-  const rec = asRecord(info)
-  if (!rec) return undefined
-  const modelId = rec.modelId
+  const record = asRecord(info)
+  if (!record) return undefined
+  const modelId = record.modelId
   if (typeof modelId !== 'string') return undefined
   const trimmed = modelId.trim()
   return trimmed === '' ? undefined : trimmed
+}
+
+function stableLine(requestId: string, fallback: number): number {
+  if (/^(0|[1-9]\d*)$/.test(requestId)) {
+    const numeric = Number(requestId)
+    if (Number.isSafeInteger(numeric)) return numeric
+  }
+  let hash = HASH_OFFSET
+  for (let index = 0; index < requestId.length; index++) {
+    hash ^= BigInt(requestId.charCodeAt(index))
+    hash = BigInt.asUintN(64, hash * HASH_PRIME)
+  }
+  const value = Number(hash & HASH_MASK)
+  return value === 0 ? fallback + 1 : value
+}
+
+function parseUiMessageArray(raw: string): unknown[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('ui_messages.json 不是合法 JSON')
+  }
+  if (!Array.isArray(parsed)) throw new Error('ui_messages.json schema 不兼容：顶层必须是数组')
+  return parsed
 }
 
 export async function loadHistoryModel(historyPath: string): Promise<string | undefined> {
@@ -112,38 +113,40 @@ export async function loadHistoryModel(historyPath: string): Promise<string | un
   try {
     parsed = JSON.parse(raw)
   } catch {
-    return undefined
+    throw new Error('api_conversation_history.json 不是合法 JSON')
   }
-  if (!Array.isArray(parsed)) return undefined
-  for (let i = parsed.length - 1; i >= 0; i--) {
-    const msg = asRecord(parsed[i])
-    if (!msg) continue
-    const modelId = extractModelId(msg.modelInfo)
+  if (!Array.isArray(parsed)) {
+    throw new Error('api_conversation_history.json schema 不兼容：顶层必须是数组')
+  }
+  for (let index = parsed.length - 1; index >= 0; index--) {
+    const message = asRecord(parsed[index])
+    if (!message) continue
+    const modelId = extractModelId(message.modelInfo)
     if (modelId) return modelId
   }
   return undefined
 }
 
 export function parseUiMessages(filePath: string, raw: string, fallbackModel?: string): ParsedResult {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return { records: [], nextLine: 0, eof: true }
-  }
-  if (!Array.isArray(parsed)) return { records: [], nextLine: 0, eof: true }
-
+  const parsed = parseUiMessageArray(raw)
   const records: UsageRecord[] = []
   let pendingBackfill = false
 
-  for (let i = 0; i < parsed.length; i++) {
-    const row = asRecord(parsed[i])
-    if (!row) continue
-    if (row.say !== API_REQ_STARTED) continue
+  for (let index = 0; index < parsed.length; index++) {
+    const row = asRecord(parsed[index])
+    if (!row || row.say !== API_REQ_STARTED) continue
 
+    if (typeof row.text !== 'string') {
+      throw new Error(`ui_messages.json 第 ${index + 1} 项 api_req_started.text 必须是字符串`)
+    }
+    if (row.text.trim() === '') {
+      pendingBackfill = true
+      continue
+    }
     const info = parseTextJson(row.text)
-    const tokensIn = info ? toFinite(info.tokensIn) : undefined
-    const tokensOut = info ? toFinite(info.tokensOut) : undefined
+    if (!info) throw new Error(`ui_messages.json 第 ${index + 1} 项 api_req_started.text 不是合法 JSON 对象`)
+    const tokensIn = toFinite(info.tokensIn)
+    const tokensOut = toFinite(info.tokensOut)
     if (tokensIn === undefined && tokensOut === undefined) {
       pendingBackfill = true
       continue
@@ -152,22 +155,23 @@ export function parseUiMessages(filePath: string, raw: string, fallbackModel?: s
     const model = extractModelId(row.modelInfo) ?? fallbackModel
     if (!model) continue
 
-    const ts = toFinite(row.ts)
+    const timestamp = toFinite(row.ts)
+    const requestId = toRequestId(row.requestId) ?? toRequestId(info.requestId) ?? toRequestId(timestamp)
     records.push({
       appType: 'cline',
       model,
       rawModel: model,
       inputTokens: tokensIn ?? 0,
       outputTokens: tokensOut ?? 0,
-      cacheReadTokens: toFinite(info?.cacheReads) ?? 0,
-      cacheCreationTokens: toFinite(info?.cacheWrites) ?? 0,
+      cacheReadTokens: toFinite(info.cacheReads) ?? 0,
+      cacheCreationTokens: toFinite(info.cacheWrites) ?? 0,
       inputSemantics: 2,
       status: 'success',
-      createdAt: ts ?? Date.now(),
+      createdAt: timestamp ?? Date.now(),
       source: {
         filePath,
-        line: i,
-        ...(ts !== undefined ? { requestId: String(ts) } : {})
+        line: requestId ? stableLine(requestId, index) : index,
+        ...(requestId ? { requestId } : {})
       }
     })
   }
@@ -195,7 +199,7 @@ export const clinePlugin: MonitorPlugin = {
   name: 'Cline',
   version: '1.0.0',
   deps: ['storage', 'pricing', 'events'],
-  detect: async () => detectClineLikeTasks(globalStorageRoot(), EXTENSION_ID),
-  listFiles: async () => listClineLikeTaskFiles(globalStorageRoot(), EXTENSION_ID),
+  detect: async () => detectClineLikeTasksFromRoots(clineGlobalStorageRoots(), EXTENSION_ID),
+  listFiles: async () => listClineLikeTaskFilesFromRoots(clineGlobalStorageRoots(), EXTENSION_ID),
   parseFile
 }

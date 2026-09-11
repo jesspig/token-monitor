@@ -30,6 +30,7 @@ export interface UsageRecord {
   status?: RequestStatus
   httpStatus?: number
   errorMessage?: string
+  isReplaceableSnapshot?: boolean
   createdAt: number
   source: {
     filePath: string

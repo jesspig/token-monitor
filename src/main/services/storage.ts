@@ -5,7 +5,6 @@ import type {
   ModelPricingRow,
   PricingSource,
   SyncCursorRow,
-  UsageDailyRollupRow,
   UsageRecordRow
 } from '../../../shared/tables'
 import { ERROR_MESSAGE_MAX_LENGTH } from '../../../shared/failure'
@@ -38,10 +37,7 @@ function toDateKey(ms: number): string {
   return `${y}-${m}-${day}`
 }
 
-interface RollupBucket {
-  date: string
-  appType: string
-  model: string
+interface RollupSummary {
   requestCount: number
   successCount: number
   errorCount: number
@@ -51,24 +47,6 @@ interface RollupBucket {
   cacheCreationTokens: number
   costMicroUsd: number
   latencyMsTotal: number
-  updatedAt: number
-}
-
-interface HourlyRollupBucket {
-  date: string
-  hour: number
-  appType: string
-  model: string
-  requestCount: number
-  successCount: number
-  errorCount: number
-  inputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  cacheCreationTokens: number
-  costMicroUsd: number
-  latencyMsTotal: number
-  updatedAt: number
 }
 
 function toUsageRecordRow(r: UsageRecord, dataSource: string, id: string): UsageRecordRow {
@@ -95,20 +73,107 @@ function toUsageRecordRow(r: UsageRecord, dataSource: string, id: string): Usage
     status: r.status ?? 'success',
     http_status: r.httpStatus ?? null,
     error_message: truncatedMessage,
+    request_id: r.source.requestId ?? null,
+    is_replaceable_snapshot: r.isReplaceableSnapshot === true ? 1 : 0,
     file_path: r.source.filePath,
     line: r.source.line,
     created_at: r.createdAt
   }
 }
 
+function storedRecordEquals(a: UsageRecordRow, b: UsageRecordRow): boolean {
+  return (
+    a.data_source === b.data_source &&
+    a.app_type === b.app_type &&
+    a.model === b.model &&
+    a.raw_model === b.raw_model &&
+    a.input_tokens === b.input_tokens &&
+    a.output_tokens === b.output_tokens &&
+    a.cache_read_tokens === b.cache_read_tokens &&
+    a.cache_creation_tokens === b.cache_creation_tokens &&
+    a.input_semantics === b.input_semantics &&
+    a.cost_usd === b.cost_usd &&
+    a.currency === b.currency &&
+    a.latency_ms === b.latency_ms &&
+    a.project === b.project &&
+    a.session_id === b.session_id &&
+    a.status === b.status &&
+    a.http_status === b.http_status &&
+    a.error_message === b.error_message &&
+    a.request_id === b.request_id &&
+    a.is_replaceable_snapshot === b.is_replaceable_snapshot &&
+    a.file_path === b.file_path &&
+    a.line === b.line &&
+    a.created_at === b.created_at
+  )
+}
+
+interface DailyBucketRef {
+  date: string
+  appType: string
+  model: string
+  startMs: number
+  endMs: number
+}
+
+interface HourlyBucketRef extends DailyBucketRef {
+  hour: number
+}
+
+function dailyBucketRef(row: UsageRecordRow): DailyBucketRef {
+  const createdAt = new Date(row.created_at)
+  const startMs = new Date(createdAt.getFullYear(), createdAt.getMonth(), createdAt.getDate()).getTime()
+  return {
+    date: toDateKey(row.created_at),
+    appType: row.app_type,
+    model: row.model,
+    startMs,
+    endMs: new Date(createdAt.getFullYear(), createdAt.getMonth(), createdAt.getDate() + 1).getTime()
+  }
+}
+
+function hourlyBucketRef(row: UsageRecordRow): HourlyBucketRef {
+  const createdAt = new Date(row.created_at)
+  const startMs = new Date(
+    createdAt.getFullYear(),
+    createdAt.getMonth(),
+    createdAt.getDate(),
+    createdAt.getHours()
+  ).getTime()
+  return {
+    date: toDateKey(row.created_at),
+    hour: createdAt.getHours(),
+    appType: row.app_type,
+    model: row.model,
+    startMs,
+    endMs: new Date(
+      createdAt.getFullYear(),
+      createdAt.getMonth(),
+      createdAt.getDate(),
+      createdAt.getHours() + 1
+    ).getTime()
+  }
+}
+
+function dailyBucketKey(ref: DailyBucketRef): string {
+  return [ref.appType, ref.date, ref.model].join(String.fromCharCode(0))
+}
+
+function hourlyBucketKey(ref: HourlyBucketRef): string {
+  return [ref.appType, ref.date, ref.hour, ref.model].join(String.fromCharCode(0))
+}
+
 export class SqliteStorage implements StorageService {
   private readonly insertRecordStmt: Database.Statement
+  private readonly getRecordByRequestStmt: Database.Statement
+  private readonly updateRecordStmt: Database.Statement
   private readonly getDedupStmt: Database.Statement
-  private readonly insertDedupStmt: Database.Statement
-  private readonly getRollupStmt: Database.Statement
+  private readonly upsertDedupStmt: Database.Statement
+  private readonly listBucketRecordsStmt: Database.Statement
   private readonly upsertRollupStmt: Database.Statement
-  private readonly getHourlyRollupStmt: Database.Statement
+  private readonly deleteRollupStmt: Database.Statement
   private readonly upsertHourlyRollupStmt: Database.Statement
+  private readonly deleteHourlyRollupStmt: Database.Statement
   private readonly getCursorStmt: Database.Statement
   private readonly getCursorRowStmt: Database.Statement
   private readonly upsertCursorStmt: Database.Statement
@@ -122,27 +187,61 @@ export class SqliteStorage implements StorageService {
         id, data_source, app_type, model, raw_model,
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
         input_semantics, cost_usd, currency, latency_ms, project, session_id,
-        status, http_status, error_message, file_path, line, created_at
+        status, http_status, error_message, request_id, is_replaceable_snapshot,
+        file_path, line, created_at
       ) VALUES (
         @id, @data_source, @app_type, @model, @raw_model,
         @input_tokens, @output_tokens, @cache_read_tokens, @cache_creation_tokens,
         @input_semantics, @cost_usd, @currency, @latency_ms, @project, @session_id,
-        @status, @http_status, @error_message, @file_path, @line, @created_at
+        @status, @http_status, @error_message, @request_id, @is_replaceable_snapshot,
+        @file_path, @line, @created_at
       )
+    `)
+
+    this.getRecordByRequestStmt = db.prepare(
+      'SELECT * FROM usage_records WHERE data_source = ? AND request_id = ?'
+    )
+
+    this.updateRecordStmt = db.prepare(`
+      UPDATE usage_records SET
+        app_type = @app_type,
+        model = @model,
+        raw_model = @raw_model,
+        input_tokens = @input_tokens,
+        output_tokens = @output_tokens,
+        cache_read_tokens = @cache_read_tokens,
+        cache_creation_tokens = @cache_creation_tokens,
+        input_semantics = @input_semantics,
+        cost_usd = @cost_usd,
+        currency = @currency,
+        latency_ms = @latency_ms,
+        project = @project,
+        session_id = @session_id,
+        status = @status,
+        http_status = @http_status,
+        error_message = @error_message,
+        request_id = @request_id,
+        is_replaceable_snapshot = @is_replaceable_snapshot,
+        file_path = @file_path,
+        line = @line,
+        created_at = @created_at
+      WHERE id = @id
     `)
 
     this.getDedupStmt = db.prepare(
       'SELECT semantic_id FROM dedup_ledger WHERE data_source = ? AND request_id = ?'
     )
 
-    this.insertDedupStmt = db.prepare(
-      `INSERT OR IGNORE INTO dedup_ledger (data_source, request_id, semantic_id, created_at)
-       VALUES (?, ?, ?, ?)`
-    )
+    this.upsertDedupStmt = db.prepare(`
+      INSERT INTO dedup_ledger (data_source, request_id, semantic_id, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(data_source, request_id) DO UPDATE SET
+        semantic_id = excluded.semantic_id
+    `)
 
-    this.getRollupStmt = db.prepare(`
-      SELECT * FROM usage_daily_rollups
-      WHERE date = ? AND app_type = ? AND model = ?
+    this.listBucketRecordsStmt = db.prepare(`
+      SELECT * FROM usage_records
+      WHERE app_type = ? AND model = ? AND created_at >= ? AND created_at < ?
     `)
 
     this.upsertRollupStmt = db.prepare(`
@@ -168,12 +267,11 @@ export class SqliteStorage implements StorageService {
         updated_at            = excluded.updated_at
     `)
 
-    this.getHourlyRollupStmt = db.prepare(
-      `SELECT request_count, success_count, error_count, input_tokens, output_tokens,
-              cache_read_tokens, cache_creation_tokens, cost_usd, latency_ms_total
-       FROM usage_hourly_rollups
-       WHERE date = ? AND hour = ? AND app_type = ? AND model = ?`
-    )
+    this.deleteRollupStmt = db.prepare(`
+      DELETE FROM usage_daily_rollups
+      WHERE date = ? AND app_type = ? AND model = ?
+    `)
+
     this.upsertHourlyRollupStmt = db.prepare(
       `INSERT INTO usage_hourly_rollups
          (date, hour, app_type, model, request_count, success_count, error_count,
@@ -186,6 +284,11 @@ export class SqliteStorage implements StorageService {
          cache_read_tokens = @cache_read_tokens, cache_creation_tokens = @cache_creation_tokens,
          cost_usd = @cost_usd, latency_ms_total = @latency_ms_total, updated_at = @updated_at`
     )
+
+    this.deleteHourlyRollupStmt = db.prepare(`
+      DELETE FROM usage_hourly_rollups
+      WHERE date = ? AND hour = ? AND app_type = ? AND model = ?
+    `)
 
     this.getCursorStmt = db.prepare(`
       SELECT line_offset FROM sync_cursors WHERE file_path = ?
@@ -242,142 +345,143 @@ export class SqliteStorage implements StorageService {
 
   recordUsage(records: UsageRecord[]): Promise<number> {
     const runTx = this.db.transaction((items: UsageRecord[]): number => {
-      const buckets = new Map<string, RollupBucket>()
-      const hourlyBuckets = new Map<string, HourlyRollupBucket>()
+      const dailyBuckets = new Map<string, DailyBucketRef>()
+      const hourlyBuckets = new Map<string, HourlyBucketRef>()
       const now = Date.now()
-      let added = 0
+      let changed = 0
 
-      for (const r of items) {
-        const dataSource = r.appType
-        const id = `${dataSource}:${r.source.filePath}:${r.source.line}`
-        const reqId = r.source.requestId
-        if (reqId != null && this.getDedupStmt.get(dataSource, reqId) != null) {
+      const markAffectedBuckets = (row: UsageRecordRow): void => {
+        const daily = dailyBucketRef(row)
+        const hourly = hourlyBucketRef(row)
+        dailyBuckets.set(dailyBucketKey(daily), daily)
+        hourlyBuckets.set(hourlyBucketKey(hourly), hourly)
+      }
+
+      for (const record of items) {
+        const dataSource = record.appType
+        const id = `${dataSource}:${record.source.filePath}:${record.source.line}`
+        const incoming = toUsageRecordRow(record, dataSource, id)
+        const requestId = incoming.request_id
+
+        if (requestId != null) {
+          const ledger = this.getDedupStmt.get(dataSource, requestId) as { semantic_id: string } | undefined
+          const existing = this.getRecordByRequestStmt.get(dataSource, requestId) as UsageRecordRow | undefined
+          if (ledger != null && existing == null) continue
+          if (existing != null) {
+            if (
+              existing.is_replaceable_snapshot !== 1 ||
+              incoming.is_replaceable_snapshot !== 1 ||
+              existing.status !== 'success' ||
+              incoming.status !== 'success'
+            ) {
+              continue
+            }
+            incoming.id = existing.id
+            if (storedRecordEquals(existing, incoming)) continue
+            const info = this.updateRecordStmt.run(incoming)
+            if (info.changes !== 1) throw new Error('可替换快照更新失败')
+            this.upsertDedupStmt.run(dataSource, requestId, semanticFingerprint(record), now)
+            markAffectedBuckets(existing)
+            markAffectedBuckets(incoming)
+            changed++
+            continue
+          }
+        }
+
+        const info = this.insertRecordStmt.run(incoming)
+        if (info.changes === 0) continue
+        if (requestId != null) {
+          this.upsertDedupStmt.run(dataSource, requestId, semanticFingerprint(record), now)
+        }
+        markAffectedBuckets(incoming)
+        changed++
+      }
+
+      const summarize = (rows: UsageRecordRow[]): RollupSummary => {
+        const summary: RollupSummary = {
+          requestCount: rows.length,
+          successCount: 0,
+          errorCount: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          costMicroUsd: 0,
+          latencyMsTotal: 0
+        }
+        for (const row of rows) {
+          if (row.status === 'error') summary.errorCount++
+          else summary.successCount++
+          summary.inputTokens += row.input_tokens
+          summary.outputTokens += row.output_tokens
+          summary.cacheReadTokens += row.cache_read_tokens
+          summary.cacheCreationTokens += row.cache_creation_tokens
+          summary.costMicroUsd += toMicroUsd(row.cost_usd)
+          summary.latencyMsTotal += row.latency_ms ?? 0
+        }
+        return summary
+      }
+
+      for (const bucket of dailyBuckets.values()) {
+        const rows = this.listBucketRecordsStmt.all(
+          bucket.appType,
+          bucket.model,
+          bucket.startMs,
+          bucket.endMs
+        ) as UsageRecordRow[]
+        if (rows.length === 0) {
+          this.deleteRollupStmt.run(bucket.date, bucket.appType, bucket.model)
           continue
         }
-        const info = this.insertRecordStmt.run(toUsageRecordRow(r, dataSource, id))
-        if (info.changes === 0) continue
-        if (reqId != null) {
-          this.insertDedupStmt.run(dataSource, reqId, semanticFingerprint(r), now)
-        }
-
-        added++
-        const date = toDateKey(r.createdAt)
-        const hour = new Date(r.createdAt).getHours()
-        const key = `${r.appType}\u0000${date}\u0000${r.model}`
-        let b = buckets.get(key)
-        if (!b) {
-          b = {
-            date,
-            appType: r.appType,
-            model: r.model,
-            requestCount: 0,
-            successCount: 0,
-            errorCount: 0,
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheReadTokens: 0,
-            cacheCreationTokens: 0,
-            costMicroUsd: 0,
-            latencyMsTotal: 0,
-            updatedAt: now
-          }
-          buckets.set(key, b)
-        }
-        b.requestCount++
-        if (r.status === 'error') b.errorCount++
-        else b.successCount++
-        b.inputTokens += r.inputTokens
-        b.outputTokens += r.outputTokens
-        b.cacheReadTokens += r.cacheReadTokens
-        b.cacheCreationTokens += r.cacheCreationTokens
-        b.costMicroUsd += toMicroUsd(r.costUsd)
-        b.latencyMsTotal += r.latencyMs ?? 0
-
-        const hKey = `${r.appType}\u0000${date}\u0000${hour}\u0000${r.model}`
-        let hb = hourlyBuckets.get(hKey)
-        if (!hb) {
-          hb = {
-            date, hour, appType: r.appType, model: r.model,
-            requestCount: 0, successCount: 0, errorCount: 0,
-            inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
-            cacheCreationTokens: 0, costMicroUsd: 0, latencyMsTotal: 0, updatedAt: now
-          }
-          hourlyBuckets.set(hKey, hb)
-        }
-        hb.requestCount++
-        if (r.status === 'error') hb.errorCount++
-        else hb.successCount++
-        hb.inputTokens += r.inputTokens
-        hb.outputTokens += r.outputTokens
-        hb.cacheReadTokens += r.cacheReadTokens
-        hb.cacheCreationTokens += r.cacheCreationTokens
-        hb.costMicroUsd += toMicroUsd(r.costUsd)
-        hb.latencyMsTotal += r.latencyMs ?? 0
-      }
-
-      for (const b of buckets.values()) {
-        const existing = this.getRollupStmt.get(b.date, b.appType, b.model) as
-          | Pick<
-              UsageDailyRollupRow,
-              | 'cost_usd'
-              | 'request_count'
-              | 'success_count'
-              | 'error_count'
-              | 'input_tokens'
-              | 'output_tokens'
-              | 'cache_read_tokens'
-              | 'cache_creation_tokens'
-              | 'latency_ms_total'
-            >
-          | undefined
+        const summary = summarize(rows)
         this.upsertRollupStmt.run({
-          date: b.date,
-          app_type: b.appType,
-          model: b.model,
-          request_count: b.requestCount + (existing?.request_count ?? 0),
-          success_count: b.successCount + (existing?.success_count ?? 0),
-          error_count: b.errorCount + (existing?.error_count ?? 0),
-          input_tokens: b.inputTokens + (existing?.input_tokens ?? 0),
-          output_tokens: b.outputTokens + (existing?.output_tokens ?? 0),
-          cache_read_tokens: b.cacheReadTokens + (existing?.cache_read_tokens ?? 0),
-          cache_creation_tokens: b.cacheCreationTokens + (existing?.cache_creation_tokens ?? 0),
-          cost_usd: fromMicroUsd(b.costMicroUsd + toMicroUsd(existing?.cost_usd)),
-          latency_ms_total: b.latencyMsTotal + (existing?.latency_ms_total ?? 0),
-          updated_at: b.updatedAt
+          date: bucket.date,
+          app_type: bucket.appType,
+          model: bucket.model,
+          request_count: summary.requestCount,
+          success_count: summary.successCount,
+          error_count: summary.errorCount,
+          input_tokens: summary.inputTokens,
+          output_tokens: summary.outputTokens,
+          cache_read_tokens: summary.cacheReadTokens,
+          cache_creation_tokens: summary.cacheCreationTokens,
+          cost_usd: fromMicroUsd(summary.costMicroUsd),
+          latency_ms_total: summary.latencyMsTotal,
+          updated_at: now
         })
       }
 
-      for (const hb of hourlyBuckets.values()) {
-        const existing = this.getHourlyRollupStmt.get(hb.date, hb.hour, hb.appType, hb.model) as
-          | Pick<
-              UsageDailyRollupRow,
-              | 'cost_usd'
-              | 'request_count'
-              | 'success_count'
-              | 'error_count'
-              | 'input_tokens'
-              | 'output_tokens'
-              | 'cache_read_tokens'
-              | 'cache_creation_tokens'
-              | 'latency_ms_total'
-            >
-          | undefined
+      for (const bucket of hourlyBuckets.values()) {
+        const rows = this.listBucketRecordsStmt.all(
+          bucket.appType,
+          bucket.model,
+          bucket.startMs,
+          bucket.endMs
+        ) as UsageRecordRow[]
+        if (rows.length === 0) {
+          this.deleteHourlyRollupStmt.run(bucket.date, bucket.hour, bucket.appType, bucket.model)
+          continue
+        }
+        const summary = summarize(rows)
         this.upsertHourlyRollupStmt.run({
-          date: hb.date, hour: hb.hour, app_type: hb.appType, model: hb.model,
-          request_count: hb.requestCount + (existing?.request_count ?? 0),
-          success_count: hb.successCount + (existing?.success_count ?? 0),
-          error_count: hb.errorCount + (existing?.error_count ?? 0),
-          input_tokens: hb.inputTokens + (existing?.input_tokens ?? 0),
-          output_tokens: hb.outputTokens + (existing?.output_tokens ?? 0),
-          cache_read_tokens: hb.cacheReadTokens + (existing?.cache_read_tokens ?? 0),
-          cache_creation_tokens: hb.cacheCreationTokens + (existing?.cache_creation_tokens ?? 0),
-          cost_usd: fromMicroUsd(hb.costMicroUsd + toMicroUsd(existing?.cost_usd)),
-          latency_ms_total: hb.latencyMsTotal + (existing?.latency_ms_total ?? 0),
-          updated_at: hb.updatedAt
+          date: bucket.date,
+          hour: bucket.hour,
+          app_type: bucket.appType,
+          model: bucket.model,
+          request_count: summary.requestCount,
+          success_count: summary.successCount,
+          error_count: summary.errorCount,
+          input_tokens: summary.inputTokens,
+          output_tokens: summary.outputTokens,
+          cache_read_tokens: summary.cacheReadTokens,
+          cache_creation_tokens: summary.cacheCreationTokens,
+          cost_usd: fromMicroUsd(summary.costMicroUsd),
+          latency_ms_total: summary.latencyMsTotal,
+          updated_at: now
         })
       }
 
-      return added
+      return changed
     })
 
     return Promise.resolve(runTx(records))

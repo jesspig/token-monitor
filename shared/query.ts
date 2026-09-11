@@ -134,6 +134,7 @@ export interface AppSettings {
   syncIntervalMs: number
   retentionDays: number
   dataDir: string
+  traeTrajectoryRoots?: string[]
   dailyBudgetUsd?: number | null
   monthlyBudgetUsd?: number | null
   statsRefreshIntervalMs?: number
